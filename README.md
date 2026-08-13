@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.1.8
+# BF4 Server Watcher v1.1.9
 
 A self-hosted Dockerized Python Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
 
