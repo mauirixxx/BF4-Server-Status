@@ -1,0 +1,7 @@
+.env
+config.json
+servers.json
+__pycache__/
+*.py[cod]
+*.zip
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "default_server": "aaa",
+  "servers": {
+    "aaa": {
+      "name": "AAA",
+      "guid": "28773abe-e620-4d36-9512-c6f4b128f0ad"
+    }
+  }
+}
