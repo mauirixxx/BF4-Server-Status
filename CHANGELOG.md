@@ -4,6 +4,18 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.2.1] - 2026-08-14
+
+### Fixed
+- Fixed `!help` rendering literal `\n` text instead of real Discord line breaks.
+- Restored line-by-line formatting for user help, management help, current servers, listen channels, and map-role mappings.
+
+### Changed
+- `!version` now performs a fresh GitHub version check every time the command is invoked.
+- The automatic background version check remains once every 24 hours.
+- A failed fresh version check now preserves the last successful cached version result and reports that the cached result is being shown.
+- Docker image tag and application version updated to v1.2.1.
+
 ## [v1.2.0] - 2026-08-13
 
 ### Added

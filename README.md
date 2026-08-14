@@ -1,6 +1,4 @@
-# BF4 Server Watcher v1.2.0
-
-A self-hosted Dockerized Python Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
+# BF4 Server Watcher v1.2.1n Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
 
 ## Setup
 
@@ -124,7 +122,7 @@ ServerWatcher checks the BF4 Server Status GitHub repository for a newer release
 
 When a newer version is found, automatic map-change announcements include the installed and available versions. If the GitHub version check fails, normal BF4 monitoring and Discord announcements continue.
 
-`!version` shows the installed version plus the cached latest-version status.
+`!version` performs an immediate fresh GitHub version check, then shows the installed version, latest known version, and update status. If the refresh fails, the last successful cached result is retained and identified as cached.
 
 ## User commands
 

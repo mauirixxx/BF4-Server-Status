@@ -10,7 +10,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.2.0"
+BOT_VERSION = "v1.2.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -168,6 +168,8 @@ def version_command_text():
             lines.append("⬆️ **Update available!**")
         else:
             lines.append("✅ You're up to date.")
+        if VERSION_CHECK_ERROR:
+            lines.append("⚠️ Fresh version check failed; showing the last successful cached result.")
     elif VERSION_CHECK_COMPLETED:
         lines.append("Latest version: **Unable to check**")
     else:
@@ -193,7 +195,6 @@ async def refresh_version_info():
                 flush=True,
             )
     except Exception as error:
-        LATEST_VERSION = None
         VERSION_CHECK_ERROR = f"{type(error).__name__}: {error}"
         VERSION_CHECK_COMPLETED = True
         print(f"WARNING: GitHub version check failed: {VERSION_CHECK_ERROR}", flush=True)
@@ -950,7 +951,7 @@ def build_help_message(member):
             "`/cancel` — discard your pending administrative change.",
         ])
 
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def split_discord_message(text, limit=1900):
@@ -1823,8 +1824,7 @@ async def on_message(message):
             return
 
         if command == "!version":
-            if not VERSION_CHECK_COMPLETED:
-                await refresh_version_info()
+            await refresh_version_info()
             await message.channel.send(version_command_text())
             return
 
