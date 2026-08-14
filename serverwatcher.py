@@ -10,7 +10,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.2.1"
+BOT_VERSION = "v1.2.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -899,7 +899,7 @@ def configured_map_role_matches(query):
     return sorted(name for name in names if query in name.lower())
 
 
-def build_help_message(member):
+def build_help_messages(member):
     guild = member.guild if isinstance(member, discord.Member) else None
 
     def safe(label, func, fallback="Unavailable"):
@@ -907,10 +907,14 @@ def build_help_message(member):
             value = func()
             return f"{label}{value}"
         except Exception as error:
-            print(f"HELP DISPLAY WARNING: {label.strip()} {type(error).__name__}: {error}", flush=True)
+            print(
+                f"HELP DISPLAY WARNING: {label.strip()} "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
             return f"{label}{fallback}"
 
-    lines = [
+    user_help = "\n".join([
         f"🤖 **BF4 Server Watcher Help — {BOT_VERSION}**",
         "",
         "**User commands**",
@@ -918,40 +922,76 @@ def build_help_message(member):
         "`!list` — list configured server names.",
         "`!status [server-name]` — show the default server, or a saved server by exact/partial name.",
         "`!version` — show the bot version and update status.",
-    ]
+    ])
 
-    if can_manage(member):
-        lines.extend([
-            "",
-            "**Management slash commands**",
-            "`/status all` — show status for every configured server.",
-            "`/announce` or `!announce` — manually post the current map-change style status to the announcement channel.",
-            "`/debug` — show Keeper diagnostic information.",
-            "`/reload` — reload `config.json` and `servers.json`.",
-            "`/addserverguid` — add a server; optional `make_default` makes it the watched server.",
-            safe("Current servers:\n", current_server_list_text),
-            "`/delserverguid` — remove a non-default server.",
-            "`/setdefaultserver` — choose the default watched server.",
-            safe("Current default: ", current_default_server_text),
-            "`/setannouncementchannel` — change the announcement channel.",
-            safe("Current: ", lambda: format_channel_setting(guild, CONFIG.get("announcement_channel_id", 0))),
-            "`/addlistenchannel` — add one or more regular-user command channels.",
-            "`/dellistenchannel` — stage removal of one or more regular-user command channels.",
-            safe("Current listen channels:\n", lambda: current_listen_channel_text(guild)),
-            "`/setmanagementrole` — change the management minimum role.",
-            safe("Current: ", lambda: format_role_setting(guild, CONFIG.get("management_min_role_id", 0))),
-            "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
-            safe("Current: ", lambda: format_role_setting(guild, CONFIG.get("status_min_role_id", 0))),
-            "`/setinterval` — change the polling interval (minimum 10 seconds).",
-            safe("Current: ", lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds"),
-            "`/setmaprole` — stage a map-specific role/message change.",
-            safe("Current map role pings:\n", lambda: current_map_role_list_text(guild)),
-            "`/delmaprole` — stage deletion of a configured map role ping.",
-            "`/confirm` — apply your pending administrative change.",
-            "`/cancel` — discard your pending administrative change.",
-        ])
+    messages = [user_help]
 
-    return "\n".join(lines)
+    if not can_manage(member):
+        return messages
+
+    management_help = "\n".join([
+        "**Management slash commands**",
+        "`/status all` — show status for every configured server.",
+        "`/announce` or `!announce` — manually post the current map-change style status to the announcement channel.",
+        "`/debug` — show Keeper diagnostic information.",
+        "`/reload` — reload `config.json` and `servers.json`.",
+        "`/addserverguid` — add a server; optional `make_default` makes it the watched server.",
+        "`/delserverguid` — remove a non-default server.",
+        "`/setdefaultserver` — choose the default watched server.",
+        "`/setannouncementchannel` — change the announcement channel.",
+        "`/addlistenchannel` — add one or more regular-user command channels.",
+        "`/dellistenchannel` — stage removal of one or more regular-user command channels.",
+        "`/setmanagementrole` — change the management minimum role.",
+        "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
+        "`/setinterval` — change the polling interval (minimum 10 seconds).",
+        "`/setmaprole` — stage a map-specific role/message change.",
+        "`/delmaprole` — stage deletion of a configured map role ping.",
+        "`/confirm` — apply your pending administrative change.",
+        "`/cancel` — discard your pending administrative change.",
+    ])
+
+    current_config = "\n\n".join([
+        "**Current configuration**",
+        safe("**Servers:**\n", current_server_list_text),
+        safe("**Default server:**\n", current_default_server_text),
+        safe(
+            "**Announcement channel:**\n",
+            lambda: format_channel_setting(
+                guild,
+                CONFIG.get("announcement_channel_id", 0),
+            ),
+        ),
+        safe(
+            "**Listen channels:**\n",
+            lambda: current_listen_channel_text(guild),
+        ),
+        safe(
+            "**Management minimum role:**\n",
+            lambda: format_role_setting(
+                guild,
+                CONFIG.get("management_min_role_id", 0),
+            ),
+        ),
+        safe(
+            "**Status minimum role:**\n",
+            lambda: format_role_setting(
+                guild,
+                CONFIG.get("status_min_role_id", 0),
+            ),
+        ),
+        safe(
+            "**Polling interval:**\n",
+            lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds",
+        ),
+        safe(
+            "**Map role pings:**\n",
+            lambda: current_map_role_list_text(guild),
+        ),
+    ])
+
+    messages.extend([management_help, current_config])
+    return messages
+
 
 
 def split_discord_message(text, limit=1900):
@@ -1458,7 +1498,7 @@ class InteractionMessageProxy:
         self.channel = InteractionChannelProxy(interaction)
 
 
-async def prepare_management_interaction(interaction):
+async def prepare_management_interaction(interaction, ephemeral=False):
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
             "⛔ Management commands can only be used inside a Discord server.",
@@ -1486,7 +1526,7 @@ async def prepare_management_interaction(interaction):
         )
         return None
 
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=ephemeral)
     return InteractionMessageProxy(interaction)
 
 
@@ -1511,8 +1551,22 @@ status_group = discord.app_commands.Group(
 
 @status_group.command(name="all", description="Show status for every configured BF4 server")
 async def slash_status_all(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(interaction)
+    proxy = await prepare_management_interaction(interaction, ephemeral=True)
     if proxy is None:
+        return
+
+    server_count = len(SERVERS.get("servers", {}))
+    await interaction.followup.send(
+        f"Fetching status for **{server_count}** configured server(s)...",
+        ephemeral=True,
+    )
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.followup.send(
+            "⚠️ The current Discord channel could not be resolved.",
+            ephemeral=True,
+        )
         return
 
     for key, record in SERVERS.get("servers", {}).items():
@@ -1520,13 +1574,21 @@ async def slash_status_all(interaction: discord.Interaction):
         server_guid = str(record.get("guid", "")).strip()
         marker = " (default)" if key == SERVERS.get("default_server") else ""
         try:
-            status = await asyncio.to_thread(get_server_status, None, server_guid)
-            await interaction.followup.send(
-                build_message(f"BF4 Server Status — {server_name}{marker}", status)
+            status = await asyncio.to_thread(
+                get_server_status,
+                None,
+                server_guid,
+            )
+            await channel.send(
+                build_message(
+                    f"BF4 Server Status — {server_name}{marker}",
+                    status,
+                )
             )
         except Exception as error:
-            await interaction.followup.send(
-                f"⚠️ **{server_name}{marker}** — status lookup failed: `{type(error).__name__}`"
+            await channel.send(
+                f"⚠️ **{server_name}{marker}** — "
+                f"status lookup failed: `{type(error).__name__}`"
             )
 
 
@@ -1724,13 +1786,14 @@ async def on_message(message):
 
         if command == "!help":
             try:
-                help_text = build_help_message(message.author)
-                for chunk in split_discord_message(help_text):
-                    await message.channel.send(chunk)
+                for help_message in build_help_messages(message.author):
+                    for chunk in split_discord_message(help_message):
+                        await message.channel.send(chunk)
             except Exception as error:
                 print(f"HELP ERROR: {type(error).__name__}: {error}", flush=True)
                 await message.channel.send(
-                    f"⚠️ Help rendering failed: `{type(error).__name__}`. Check container logs for details."
+                    f"⚠️ Help rendering failed: `{type(error).__name__}`. "
+                    "Check container logs for details."
                 )
             return
 

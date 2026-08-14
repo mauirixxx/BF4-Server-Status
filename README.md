@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.2.1n Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
+# BF4 Server Watcher v1.2.2
 
 ## Setup
 
@@ -106,6 +106,15 @@ Bot managers may run commands in the announcement channel and in any configured 
 
 Automatic map-change announcements always go to `announcement_channel_id`.
 
+## Tested Battlefield platforms
+
+BF4 Server Watcher has been tested successfully with:
+
+- PC Battlefield 4 servers.
+- PlayStation 4 Battlefield 4 servers.
+
+Both tested platforms use the same saved-server GUID workflow and status fields used by ServerWatcher. Xbox support has not yet been confirmed and should be considered untested until verified with a known Xbox BF4 server.
+
 ## Status role behavior
 
 `status_min_role_id` controls normal `!status` access inside configured listen channels:
@@ -124,6 +133,16 @@ When a newer version is found, automatic map-change announcements include the in
 
 `!version` performs an immediate fresh GitHub version check, then shows the installed version, latest known version, and update status. If the refresh fails, the last successful cached result is retained and identified as cached.
 
+## Help output
+
+`!help` is intentionally sent as separate logical messages:
+
+1. User commands.
+2. Management slash commands (for authorized managers).
+3. Current configuration (for authorized managers).
+
+The normal Discord message splitter remains as a safety net for unusually large configurations.
+
 ## User commands
 
 These remain chat/prefix commands:
@@ -138,7 +157,7 @@ These remain chat/prefix commands:
 
 Management commands are Discord slash commands and require `management_min_role_id` or a higher Discord role. Discord Administrators and the server owner are always allowed. They may be used in the announcement channel or configured listen channels.
 
-- `/status all` — show every configured server's status; one failed lookup does not stop the remaining servers.
+- `/status all` — show every configured server's status as normal channel messages; the slash command itself is acknowledged privately. One failed lookup does not stop the remaining servers.
 - `/announce` — post the default server's map-change-style status to `announcement_channel_id`.
 - `!announce` — retained as a chat-command alias for `/announce`.
 - `/debug` — show Keeper diagnostic information for the default server.

@@ -4,6 +4,18 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.2.2] - 2026-08-14
+
+### Added
+- Documented tested Battlefield 4 platform support for PC and PlayStation 4.
+- Documented Xbox support as currently unconfirmed/untested.
+
+### Changed
+- Redesigned `!help` to send deliberate logical messages for user commands, management slash commands, and current configuration instead of relying on the Discord character-limit splitter for normal layout.
+- `/status all` now acknowledges the slash command privately and posts each configured server status directly to the channel as a normal message, eliminating repeated Discord interaction reply/reference headers.
+- Updated `README.md` and `DISCORD.md` for the v1.2.2 behavior.
+- Docker image tag and application version updated to v1.2.2.
+
 ## [v1.2.1] - 2026-08-14
 
 ### Fixed

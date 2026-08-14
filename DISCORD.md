@@ -200,3 +200,8 @@ Managers can add or remove multiple listen channels in one command. Each argumen
 ```
 
 `!addlistenchannel` applies valid additions immediately. `!dellistenchannel` stages the removals and requires the same initiating administrator to use `!confirm` or `!cancel`. Each administrator can have one pending confirmation-required operation at a time.
+
+
+## Tested BF4 platforms
+
+ServerWatcher has been tested with PC and PlayStation 4 Battlefield 4 servers. Xbox support has not yet been confirmed.
