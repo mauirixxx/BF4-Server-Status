@@ -2,6 +2,8 @@
 
 This guide is for users who have never created a Discord bot before.
 
+The examples assume BF4 Server Watcher is installed at `/opt/bf4-serverstatus`. If you installed it somewhere else, use your installation directory instead.
+
 ## 1. Create a Discord application
 
 1. Sign in to the Discord Developer Portal.
@@ -20,6 +22,7 @@ Treat the token like a password. Do not paste it into Discord, commit it to Git,
 On the Docker host:
 
 ```bash
+cd /opt/bf4-serverstatus
 cp .env.example .env
 ```
 
@@ -102,6 +105,7 @@ ServerWatcher channel-management commands can also resolve channel mentions and 
 On the host:
 
 ```bash
+cd /opt/bf4-serverstatus
 cp config.example.json config.json
 ```
 
@@ -150,6 +154,7 @@ Even if a user can type in the announcement channel because Discord permissions 
 ## 9. Start the bot
 
 ```bash
+cd /opt/bf4-serverstatus
 docker compose build
 docker compose up -d
 docker logs -f BF4_ServerWatcher

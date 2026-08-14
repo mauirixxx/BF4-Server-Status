@@ -1,10 +1,20 @@
-# BF4 Server Watcher v1.1.9
+# BF4 Server Watcher v1.1.10
 
 A self-hosted Dockerized Python Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
 
 ## Setup
 
-Clone or extract the project, then create the two local runtime files from their examples:
+The examples below assume BF4 Server Watcher is installed at `/opt/bf4-serverstatus`. If you install it somewhere else, replace that path with your chosen installation directory.
+
+Clone the repository:
+
+```bash
+cd /opt
+git clone https://github.com/mauirixxx/BF4-Server-Status.git bf4-serverstatus
+cd /opt/bf4-serverstatus
+```
+
+Create the local runtime files from their examples:
 
 ```bash
 cp .env.example .env
@@ -27,7 +37,25 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-`config.json` and `servers.json` are bind-mounted writable so authorized Discord management commands can persist changes. `.env` and `config.json` are intentionally excluded from release bundles and Git.
+`config.json` and `servers.json` are writable runtime files so authorized Discord management commands can persist changes. `.env`, `config.json`, and live `servers.json` are intentionally excluded from release bundles and Git.
+
+### Updating to a new release
+
+Before updating, review `CHANGELOG.md` for release-specific notes. Also compare `config.example.json` and `servers.example.json` for newly introduced settings, but **do not overwrite** your live `.env`, `config.json`, or `servers.json`.
+
+For the standard `/opt/bf4-serverstatus` Git installation:
+
+```bash
+cd /opt/bf4-serverstatus
+git pull
+
+docker compose down
+docker compose build
+docker compose up -d
+docker logs -f BF4_ServerWatcher
+```
+
+If you installed ServerWatcher elsewhere, replace `/opt/bf4-serverstatus` with that directory.
 
 ## Discord requirements
 
@@ -76,12 +104,6 @@ Bot managers may run commands in the announcement channel and in any configured 
 
 Automatic map-change announcements always go to `announcement_channel_id`.
 
-### Upgrading from v1.1.5
-
-v1.1.6 recognizes an existing `notification_channel_id` from v1.1.5 and treats it as `announcement_channel_id` in memory. If `listen_channel_id` is missing, it defaults to `[0]`.
-
-When a v1.1.6 management command saves `config.json`, the new `announcement_channel_id` / `listen_channel_id` schema is written.
-
 ## Status role behavior
 
 `status_min_role_id` controls normal `!status` access inside configured listen channels:
@@ -92,13 +114,21 @@ When a v1.1.6 management command saves `config.json`, the new `announcement_chan
 
 ServerWatcher warns about invalid nonzero role IDs at startup, after `!reload`, and after `!setstatusrole`.
 
+## Version checking
+
+ServerWatcher checks the BF4 Server Status GitHub repository for a newer release/tag at startup and then once every 24 hours. The result is cached so the 69-second BF4 polling loop does not repeatedly query GitHub.
+
+When a newer version is found, automatic map-change announcements include the installed and available versions. If the GitHub version check fails, normal BF4 monitoring and Discord announcements continue.
+
+`!version` shows the installed version plus the cached latest-version status.
+
 ## User commands
 
 - `!help` — show command help. Managers also see management commands/current settings.
 - `!list` — show configured server names only, one per line, with the default identified.
 - `!status` — show the current default server.
 - `!status <server-name>` — exact/partial case-insensitive lookup. Unique partial matches resolve automatically; multiple matches are numbered and selection is tied to the requesting user.
-- `!version` — show the bot version.
+- `!version` — show installed version, latest known version, and update status.
 
 ## Management commands
 
@@ -172,7 +202,6 @@ BF4 Server Watcher is released under the MIT License. See `LICENSE` for the lice
 Release bundles intentionally contain **no `.env`, no `config.json`, and no live `servers.json`**. `.gitignore` excludes those live files, Python cache files, and release ZIPs.
 
 This project is licensed under the MIT License. See `LICENSE`.
-
 
 ## Server registry bootstrap
 

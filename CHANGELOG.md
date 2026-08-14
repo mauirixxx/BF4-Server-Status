@@ -4,6 +4,24 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.1.10] - 2026-08-13
+
+### Added
+- Added the configured default server name to automatic map-change announcements and manual `!announce` output.
+- Added a GitHub version checker that checks once at startup, caches the result, and rechecks every 24 hours.
+- Added update notices to automatic map-change announcements when a newer semantic-version release/tag is detected.
+- Enhanced `!version` to show the installed version, latest known version, and whether an update is available.
+- Added generic update instructions to `README.md` using `/opt/bf4-serverstatus` as the documented example installation directory.
+
+### Changed
+- GitHub release lookup prefers the latest published release and falls back to semantic-version repository tags when needed.
+- GitHub version-check failures are logged but do not interrupt BF4 polling or Discord announcements.
+- Standardized README and Discord setup examples around `/opt/bf4-serverstatus`, with guidance to substitute a different installation directory when applicable.
+- Removed the obsolete README section describing upgrades from unpublished v1.1.5.
+- Removed the obsolete v1.1.5 configuration-schema compatibility code.
+- Updated README guidance to preserve live `.env`, `config.json`, and `servers.json` during upgrades and review example/config changes before restarting.
+- Docker image tag and application version updated to v1.1.10.
+
 ## [v1.1.9] - 2026-08-13
 
 ### Changed

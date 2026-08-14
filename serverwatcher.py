@@ -10,7 +10,12 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.1.9"
+BOT_VERSION = "v1.1.10"
+GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
+VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+LATEST_VERSION = None
+VERSION_CHECK_ERROR = None
+VERSION_CHECK_COMPLETED = False
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.environ.get("SERVERWATCHER_RUNTIME_DIR", str(BASE_DIR))).resolve()
 CONFIG_PATH = RUNTIME_DIR / "config.json"
@@ -84,6 +89,123 @@ def validate_servers(servers):
     return servers
 
 
+def parse_semantic_version(value):
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value).strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def normalized_version(value):
+    parsed = parse_semantic_version(value)
+    if parsed is None:
+        return None
+    return f"v{parsed[0]}.{parsed[1]}.{parsed[2]}"
+
+
+def discover_latest_version():
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}",
+    }
+    api_root = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+
+    release_response = requests.get(
+        f"{api_root}/releases/latest",
+        headers=headers,
+        timeout=10,
+    )
+    if release_response.status_code == 200:
+        release_tag = normalized_version(release_response.json().get("tag_name", ""))
+        if release_tag:
+            return release_tag
+    elif release_response.status_code != 404:
+        release_response.raise_for_status()
+
+    tags_response = requests.get(
+        f"{api_root}/tags",
+        headers=headers,
+        params={"per_page": 100},
+        timeout=10,
+    )
+    tags_response.raise_for_status()
+
+    candidates = []
+    for item in tags_response.json():
+        if not isinstance(item, dict):
+            continue
+        name = normalized_version(item.get("name", ""))
+        parsed = parse_semantic_version(name)
+        if parsed is not None:
+            candidates.append((parsed, name))
+
+    if not candidates:
+        raise RuntimeError("No semantic-version GitHub release or tag was found")
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def is_update_available():
+    current = parse_semantic_version(BOT_VERSION)
+    latest = parse_semantic_version(LATEST_VERSION)
+    return current is not None and latest is not None and latest > current
+
+
+def version_update_notice():
+    if not is_update_available():
+        return ""
+    return (
+        f"\n\n⬆️ New version available: **{LATEST_VERSION}** — "
+        f"Current version installed: **{BOT_VERSION}**"
+    )
+
+
+def version_command_text():
+    lines = [f"BF4 Server Watcher **{BOT_VERSION}**"]
+    if LATEST_VERSION:
+        lines.append(f"Latest version: **{LATEST_VERSION}**")
+        if is_update_available():
+            lines.append("⬆️ **Update available!**")
+        else:
+            lines.append("✅ You're up to date.")
+    elif VERSION_CHECK_COMPLETED:
+        lines.append("Latest version: **Unable to check**")
+    else:
+        lines.append("Latest version: **Checking...**")
+    return "\n".join(lines)
+
+
+async def refresh_version_info():
+    global LATEST_VERSION, VERSION_CHECK_ERROR, VERSION_CHECK_COMPLETED
+    try:
+        latest = await asyncio.to_thread(discover_latest_version)
+        LATEST_VERSION = latest
+        VERSION_CHECK_ERROR = None
+        VERSION_CHECK_COMPLETED = True
+        if is_update_available():
+            print(
+                f"UPDATE AVAILABLE: {LATEST_VERSION} (installed: {BOT_VERSION})",
+                flush=True,
+            )
+        else:
+            print(
+                f"Version check: installed {BOT_VERSION}; latest {LATEST_VERSION}",
+                flush=True,
+            )
+    except Exception as error:
+        LATEST_VERSION = None
+        VERSION_CHECK_ERROR = f"{type(error).__name__}: {error}"
+        VERSION_CHECK_COMPLETED = True
+        print(f"WARNING: GitHub version check failed: {VERSION_CHECK_ERROR}", flush=True)
+
+
+async def version_check_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await refresh_version_info()
+        await asyncio.sleep(VERSION_CHECK_INTERVAL_SECONDS)
+
+
 def ensure_servers_file():
     if SERVERS_PATH.exists():
         if SERVERS_PATH.is_dir():
@@ -100,13 +222,7 @@ def ensure_servers_file():
 
 def reload_runtime_config():
     global CONFIG, SERVERS
-    new_config = load_json(CONFIG_PATH)
-    # v1.1.5 compatibility: migrate the former channel key in memory.
-    if "announcement_channel_id" not in new_config and "notification_channel_id" in new_config:
-        new_config["announcement_channel_id"] = new_config.pop("notification_channel_id")
-    if "listen_channel_id" not in new_config:
-        new_config["listen_channel_id"] = [0]
-    new_config = validate_config(new_config)
+    new_config = validate_config(load_json(CONFIG_PATH))
     new_servers = validate_servers(load_json(SERVERS_PATH))
     CONFIG = new_config
     SERVERS = new_servers
@@ -334,16 +450,20 @@ def display_value(value):
     return str(value) if value is not None else "Unavailable"
 
 
-def build_message(title, status):
-    message = (
-        f"🎮 **{title}**\n"
-        f"🗺️ {'Now Playing' if title == 'BF4 Map Change' else 'Current Map'}: "
-        f"**{status['map_name']}**\n"
-        f"👥 Players: **{status['players']}/{status['max_players']}**"
-    )
-
-    if title != "BF4 Map Change":
-        message += (
+def build_message(title, status, server_name=None):
+    if title == "BF4 Map Change":
+        display_server = server_name or get_default_server_name()
+        message = (
+            f"🎮 **{title}**\n"
+            f"🖥️ Server: **{display_server}**\n"
+            f"🗺️ Now Playing: **{status['map_name']}**\n"
+            f"👥 Players: **{status['players']}/{status['max_players']}**"
+        )
+    else:
+        message = (
+            f"🎮 **{title}**\n"
+            f"🗺️ Current Map: **{status['map_name']}**\n"
+            f"👥 Players: **{status['players']}/{status['max_players']}**"
             f"\n⏳ Queue: **{display_value(status.get('queue'))}**"
             f"\n🎖️ Commanders: **{display_value(status.get('commanders'))}**"
             f"\n🎟️ Minimum tickets remaining: "
@@ -503,7 +623,12 @@ async def map_check_loop():
                         ping_text, allowed_mentions = build_map_role_ping(status["map_name"])
                         announcement = (
                             ping_text
-                            + build_message("BF4 Map Change", status)
+                            + build_message(
+                                "BF4 Map Change",
+                                status,
+                                server_name=get_default_server_name(),
+                            )
+                            + version_update_notice()
                             + AUTO_ANNOUNCEMENT_MARKER
                         )
                         await channel.send(announcement, allowed_mentions=allowed_mentions)
@@ -525,6 +650,7 @@ async def on_ready():
         return
     watcher_started = True
     asyncio.create_task(map_check_loop())
+    asyncio.create_task(version_check_loop())
 
 
 def has_role_or_higher(member, required_role_id, zero_allows=False):
@@ -1406,7 +1532,9 @@ async def on_message(message):
             await message.channel.send(build_debug_report(get_server()))
 
         elif command == "!version":
-            await message.channel.send(f"BF4 Server Watcher **{BOT_VERSION}**")
+            if not VERSION_CHECK_COMPLETED:
+                await refresh_version_info()
+            await message.channel.send(version_command_text())
 
     except Exception as error:
         print(f"COMMAND ERROR ({command}): {error}", flush=True)
