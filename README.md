@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.1.10
+# BF4 Server Watcher v1.2.0
 
 A self-hosted Dockerized Python Discord bot that monitors Battlefield 4 servers through the Keeper/Battlelog snapshot endpoint, announces map changes for the configured default server, and provides server-status and management commands in Discord.
 
@@ -74,6 +74,10 @@ The bot itself does not require Administrator permission.
 
 **New to Discord bots? Read `DISCORD.md`.** It provides explicit Developer Portal instructions for creating the application/bot, enabling Message Content Intent, setting permissions, inviting the bot, obtaining channel/role IDs, and configuring ServerWatcher.
 
+ServerWatcher v1.2.0 uses Discord **slash commands (`/`) for management**, while the regular user commands remain traditional `!` commands. `!announce` is intentionally retained alongside `/announce`.
+
+After a fresh install or upgrade, ServerWatcher syncs its slash commands with Discord at startup. Global Discord application commands can take a short time to appear in every client/server after a sync.
+
 ## Announcement and listen channels
 
 `announcement_channel_id` is the protected destination for automatic map-change announcements and manual `!announce` output.
@@ -124,7 +128,9 @@ When a newer version is found, automatic map-change announcements include the in
 
 ## User commands
 
-- `!help` — show command help. Managers also see management commands/current settings.
+These remain chat/prefix commands:
+
+- `!help` — show command help. Managers also see the available management slash commands/current settings.
 - `!list` — show configured server names only, one per line, with the default identified.
 - `!status` — show the current default server.
 - `!status <server-name>` — exact/partial case-insensitive lookup. Unique partial matches resolve automatically; multiple matches are numbered and selection is tied to the requesting user.
@@ -132,48 +138,78 @@ When a newer version is found, automatic map-change announcements include the in
 
 ## Management commands
 
-Management commands require `management_min_role_id` or a higher Discord role. Discord Administrators and the server owner are always allowed.
+Management commands are Discord slash commands and require `management_min_role_id` or a higher Discord role. Discord Administrators and the server owner are always allowed. They may be used in the announcement channel or configured listen channels.
 
-- `!status all` — show every configured server's status; one failed lookup does not stop the remaining servers.
-- `!announce` — post the default server's map-change-style status to `announcement_channel_id`.
-- `!debug` — show Keeper diagnostic information for the default server.
-- `!reload` — reload `config.json` and `servers.json`.
-- `!addserverguid <name> <guid> [default]` — add a server; optional `default` immediately makes it the default watched server.
-- `!delserverguid <name-or-guid>` — remove a server. The current default cannot be deleted.
-- `!setdefaultserver <name-or-guid>` — choose an existing server as the default.
-- `!setannouncementchannel <#channel-or-id-or-name>` — set the announcement channel by mention, numeric ID, or exact case-insensitive name.
-- `!addlistenchannel <channel> [channel...]` — add one or more listen channels immediately. Each argument may be a mention, ID, or exact channel name; quote names containing spaces. The first real channel replaces the `[0]` placeholder.
-- `!dellistenchannel <channel> [channel...]` — stage removal of one or more listen channels; the initiating administrator must use `!confirm` or `!cancel`. Removing the last real channel restores `[0]`.
-- `!setmanagementrole <@role-or-id>` — update the management minimum role.
-- `!setstatusrole <@role-or-id>` — update the minimum role for `!status`; `0` allows everyone in listen channels.
-- `!setinterval <seconds>` — update polling interval; minimum 10 seconds.
-- `!setmaprole <map-search> <@role-or-id> ["optional message"]` — fuzzy-match a map, stage a role/message change, and require `!confirm`.
-- `!delmaprole <map-search>` — stage removal of a configured map-role mapping and require `!confirm`.
-- `!confirm` / `!cancel` — apply/discard the initiating administrator's pending administrative change. Each administrator may have one pending confirmation-required operation at a time.
+- `/status all` — show every configured server's status; one failed lookup does not stop the remaining servers.
+- `/announce` — post the default server's map-change-style status to `announcement_channel_id`.
+- `!announce` — retained as a chat-command alias for `/announce`.
+- `/debug` — show Keeper diagnostic information for the default server.
+- `/reload` — reload `config.json` and `servers.json`.
+- `/addserverguid name:<name> guid:<guid> [make_default:true]` — add a server and optionally make it the default.
+- `/delserverguid server:<name-or-guid>` — remove a server. The current default cannot be deleted.
+- `/setdefaultserver server:<name-or-guid>` — choose an existing server as the default.
+- `/setannouncementchannel channel:<channel>` — set the automatic announcement channel using Discord's channel picker.
+- `/addlistenchannel channels:<channel list>` — add one or more listen channels. The value may contain channel mentions, IDs, or exact names separated by spaces; quote names containing spaces.
+- `/dellistenchannel channels:<channel list>` — stage removal of one or more listen channels and require `/confirm` or `/cancel`.
+- `/setmanagementrole [role:<role>]` — set the management minimum role. Leaving the role blank restricts management to Discord Administrators/server owner.
+- `/setstatusrole [role:<role>]` — set the minimum role for `!status`. Leaving the role blank allows everyone in configured listen channels.
+- `/setinterval seconds:<seconds>` — update the polling interval; minimum 10 seconds.
+- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — fuzzy-match a map and stage a role/message change. Use `disable:true` to set role ID `0`.
+- `/delmaprole map_search:<map>` — stage removal of a configured map-role mapping.
+- `/confirm` — apply the initiating administrator's pending administrative change.
+- `/cancel` — discard the initiating administrator's pending administrative change.
+
+Each administrator may have one pending confirmation-required operation at a time.
+
+## Rotating Discord presence
+
+The bot rotates its Discord custom activity every 30 seconds using the most recently cached default-server status:
+
+```text
+AAA • Hangar 21
+AAA currently has 57 players
+BF4 Server Watcher v1.2.0
+```
+
+The player activity shows only the normal player count. Queue, commanders, tickets, and other status fields are not included in the presence. Presence rotation reuses the cached BF4 status and does not create extra Keeper polling requests.
 
 ## Examples
 
+Regular-user chat commands:
+
 ```text
+!help
 !list
 !status
 !status turtles
 !status turt
-!status all
-
-!addserverguid Flubber 4017883b-6477-49e2-9f85-8b18cd8b40b9
-!addserverguid Flubber 4017883b-6477-49e2-9f85-8b18cd8b40b9 default
-!setdefaultserver AAA
-
-!setannouncementchannel #bf4-announcements
-!addlistenchannel #bf4-commands 222222222222222222
-!dellistenchannel #old-bf4-commands 222222222222222222
-!confirm
-
-!setmaprole locker 123456789012345678
-!setmaprole "Operation Locker" 123456789012345678 "Locker is live — get in here!"
-!delmaprole locker
-!confirm
+!version
+!announce
 ```
+
+Management slash-command examples:
+
+```text
+/status all
+/announce
+/debug
+/reload
+/addserverguid
+/delserverguid
+/setdefaultserver
+/setannouncementchannel
+/addlistenchannel
+/dellistenchannel
+/setmanagementrole
+/setstatusrole
+/setinterval
+/setmaprole
+/delmaprole
+/confirm
+/cancel
+```
+
+Discord presents the slash-command parameters interactively after you select a command.
 
 ## Runtime/configuration files
 

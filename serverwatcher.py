@@ -10,7 +10,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.1.10"
+BOT_VERSION = "v1.2.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -552,9 +552,11 @@ def build_debug_report(data):
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 last_map = None
 watcher_started = False
+LAST_DEFAULT_STATUS = None
 PENDING_ADMIN_CHANGES = {}
 PENDING_STATUS_SELECTIONS = {}
 
@@ -602,7 +604,7 @@ def build_map_role_ping(map_name):
 
 
 async def map_check_loop():
-    global last_map
+    global last_map, LAST_DEFAULT_STATUS
     await client.wait_until_ready()
     print("Server watcher started", flush=True)
 
@@ -614,6 +616,7 @@ async def map_check_loop():
                 print(f"ERROR: Announcement channel {channel_id} not found", flush=True)
             elif channel is not None:
                 status = get_server_status()
+                LAST_DEFAULT_STATUS = status
                 print(f"Current map: {status['map_name']}", flush=True)
                 if status["map_id"] != last_map:
                     old = last_map
@@ -639,6 +642,31 @@ async def map_check_loop():
         await asyncio.sleep(int(CONFIG["check_interval_seconds"]))
 
 
+async def presence_rotation_loop():
+    await client.wait_until_ready()
+    index = 0
+    while not client.is_closed():
+        try:
+            status = LAST_DEFAULT_STATUS
+            server_name = get_default_server_name()
+            if status:
+                activities = [
+                    f"{server_name} • {status['map_name']}",
+                    f"{server_name} currently has {status['players']} players",
+                    f"BF4 Server Watcher {BOT_VERSION}",
+                ]
+            else:
+                activities = [f"BF4 Server Watcher {BOT_VERSION}"]
+
+            activity_text = activities[index % len(activities)]
+            index += 1
+            await client.change_presence(activity=discord.CustomActivity(name=activity_text))
+        except Exception as error:
+            print(f"WARNING: Presence update failed: {type(error).__name__}: {error}", flush=True)
+
+        await asyncio.sleep(30)
+
+
 @client.event
 async def on_ready():
     global watcher_started
@@ -649,8 +677,16 @@ async def on_ready():
     if watcher_started:
         return
     watcher_started = True
+
+    try:
+        synced = await tree.sync()
+        print(f"Slash commands synced: {len(synced)}", flush=True)
+    except Exception as error:
+        print(f"WARNING: Slash command sync failed: {type(error).__name__}: {error}", flush=True)
+
     asyncio.create_task(map_check_loop())
     asyncio.create_task(version_check_loop())
+    asyncio.create_task(presence_rotation_loop())
 
 
 def has_role_or_higher(member, required_role_id, zero_allows=False):
@@ -880,43 +916,41 @@ def build_help_message(member):
         "`!help` — show this help message.",
         "`!list` — list configured server names.",
         "`!status [server-name]` — show the default server, or a saved server by exact/partial name.",
-        "`!version` — show the bot version.",
+        "`!version` — show the bot version and update status.",
     ]
 
     if can_manage(member):
         lines.extend([
             "",
-            "**Management commands**",
-            "`!status all` — show status for every configured server.",
-            "`!announce` — manually post the current map-change style status to the announcement channel.",
-            "`!debug` — show Keeper diagnostic information.",
-            "`!reload` — reload `config.json` and `servers.json`.",
-            "`!addserverguid <name> <guid> [default]` — add a server; optional `default` makes it the watched server.",
+            "**Management slash commands**",
+            "`/status all` — show status for every configured server.",
+            "`/announce` or `!announce` — manually post the current map-change style status to the announcement channel.",
+            "`/debug` — show Keeper diagnostic information.",
+            "`/reload` — reload `config.json` and `servers.json`.",
+            "`/addserverguid` — add a server; optional `make_default` makes it the watched server.",
             safe("Current servers:\n", current_server_list_text),
-            "`!delserverguid <name-or-guid>` — remove a non-default server.",
-            safe("Current servers:\n", current_server_list_text),
-            "`!setdefaultserver <name-or-guid>` — choose the default watched server.",
-            safe("Current: ", current_default_server_text),
-            "`!setannouncementchannel <#channel-or-id-or-name>` — change the announcement channel.",
+            "`/delserverguid` — remove a non-default server.",
+            "`/setdefaultserver` — choose the default watched server.",
+            safe("Current default: ", current_default_server_text),
+            "`/setannouncementchannel` — change the announcement channel.",
             safe("Current: ", lambda: format_channel_setting(guild, CONFIG.get("announcement_channel_id", 0))),
-            "`!addlistenchannel <channel> [channel...]` — add one or more regular-user command channels (mention, ID, or exact name).",
-            "`!dellistenchannel <channel> [channel...]` — stage removal of one or more regular-user command channels.",
+            "`/addlistenchannel` — add one or more regular-user command channels.",
+            "`/dellistenchannel` — stage removal of one or more regular-user command channels.",
             safe("Current listen channels:\n", lambda: current_listen_channel_text(guild)),
-            "`!setmanagementrole <@role-or-id>` — change the management minimum role.",
+            "`/setmanagementrole` — change the management minimum role.",
             safe("Current: ", lambda: format_role_setting(guild, CONFIG.get("management_min_role_id", 0))),
-            "`!setstatusrole <@role-or-id>` — change the minimum role for `!status`; `0` allows everyone in listen channels.",
+            "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
             safe("Current: ", lambda: format_role_setting(guild, CONFIG.get("status_min_role_id", 0))),
-            "`!setinterval <seconds>` — change the polling interval (minimum 10 seconds).",
+            "`/setinterval` — change the polling interval (minimum 10 seconds).",
             safe("Current: ", lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds"),
-            "`!setmaprole <map-search> <@role-or-id> [\"optional message\"]` — stage a map ping update (`0` disables the role ping).",
+            "`/setmaprole` — stage a map-specific role/message change.",
             safe("Current map role pings:\n", lambda: current_map_role_list_text(guild)),
-            "`!delmaprole <map-search>` — stage removal of a configured map role ping.",
-            safe("Current map role pings:\n", lambda: current_map_role_list_text(guild)),
-            "`!confirm` — apply your pending administrative change.",
-            "`!cancel` — discard your pending administrative change.",
+            "`/delmaprole` — stage deletion of a configured map role ping.",
+            "`/confirm` — apply your pending administrative change.",
+            "`/cancel` — discard your pending administrative change.",
         ])
 
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 
 def split_discord_message(text, limit=1900):
@@ -1149,7 +1183,7 @@ async def handle_management_command(message, raw, lowered):
         if existing_pending:
             await message.channel.send(
                 f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `!confirm` or `!cancel` before starting another confirmation-required change."
+                "Use `/confirm` or `/cancel` before starting another confirmation-required change."
             )
             return True
         payload = raw[len("!dellistenchannel"):].strip()
@@ -1186,7 +1220,7 @@ async def handle_management_command(message, raw, lowered):
         report.insert(0, "The following listen channels will be removed:\n" + "\n".join(
             f"#{c.name} (`{c.id}`)" for c in removable
         ))
-        report.append("\nType `!confirm` to remove them.\nType `!cancel` to discard this change.")
+        report.append("\nType `/confirm` to remove them.\nType `/cancel` to discard this change.")
         await message.channel.send("\n".join(report))
         return True
 
@@ -1253,7 +1287,7 @@ async def handle_management_command(message, raw, lowered):
         if existing_pending:
             await message.channel.send(
                 f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `!confirm` or `!cancel` first."
+                "Use `/confirm` or `/cancel` first."
             )
             return True
         payload = raw[len("!setmaprole"):].strip()
@@ -1301,7 +1335,7 @@ async def handle_management_command(message, raw, lowered):
             f"Suggested match: **{map_name}**\n"
             f"Role: **{role_text}**\n"
             f"Message: **{message_text}**" + ("" if custom_message else " *(default)*") + "\n\n"
-            "Type `!confirm` to save this change.\nType `!cancel` to discard it."
+            "Type `/confirm` to save this change.\nType `/cancel` to discard it."
         )
         return True
 
@@ -1312,7 +1346,7 @@ async def handle_management_command(message, raw, lowered):
         if existing_pending:
             await message.channel.send(
                 f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `!confirm` or `!cancel` first."
+                "Use `/confirm` or `/cancel` first."
             )
             return True
         query = raw[len("!delmaprole"):].strip().strip('"').strip("'")
@@ -1339,7 +1373,7 @@ async def handle_management_command(message, raw, lowered):
             f"Suggested match: **{map_name}**\n"
             f"Current role: **{format_role_setting(message.guild, entry.get('role_id', 0))}**\n"
             "This will remove the configured map role ping.\n\n"
-            "Type `!confirm` to remove it.\nType `!cancel` to discard this change."
+            "Type `/confirm` to remove it.\nType `/cancel` to discard this change."
         )
         return True
 
@@ -1406,6 +1440,272 @@ async def handle_management_command(message, raw, lowered):
     return False
 
 
+
+class InteractionChannelProxy:
+    def __init__(self, interaction):
+        self._interaction = interaction
+        self.id = interaction.channel_id
+
+    async def send(self, content, **kwargs):
+        return await self._interaction.followup.send(content, **kwargs)
+
+
+class InteractionMessageProxy:
+    def __init__(self, interaction):
+        self.author = interaction.user
+        self.guild = interaction.guild
+        self.channel = InteractionChannelProxy(interaction)
+
+
+async def prepare_management_interaction(interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "⛔ Management commands can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return None
+
+    if not can_manage(interaction.user):
+        await interaction.response.send_message(
+            "⛔ You do not have permission to use that management command.",
+            ephemeral=True,
+        )
+        return None
+
+    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
+    allowed_ids = listen_channel_ids()
+    if announcement_id:
+        allowed_ids.add(announcement_id)
+
+    if interaction.channel_id not in allowed_ids:
+        await interaction.response.send_message(
+            "⛔ Management commands may only be used in the configured announcement "
+            "channel or a configured listen channel.",
+            ephemeral=True,
+        )
+        return None
+
+    await interaction.response.defer()
+    return InteractionMessageProxy(interaction)
+
+
+async def run_legacy_management_backend(interaction, raw_command):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+    handled = await handle_management_command(
+        proxy,
+        raw_command,
+        raw_command.lower(),
+    )
+    if not handled:
+        await interaction.followup.send("⚠️ Management command backend did not handle that request.")
+
+
+status_group = discord.app_commands.Group(
+    name="status",
+    description="Administrative server status commands",
+)
+
+
+@status_group.command(name="all", description="Show status for every configured BF4 server")
+async def slash_status_all(interaction: discord.Interaction):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    for key, record in SERVERS.get("servers", {}).items():
+        server_name = str(record.get("name", key))
+        server_guid = str(record.get("guid", "")).strip()
+        marker = " (default)" if key == SERVERS.get("default_server") else ""
+        try:
+            status = await asyncio.to_thread(get_server_status, None, server_guid)
+            await interaction.followup.send(
+                build_message(f"BF4 Server Status — {server_name}{marker}", status)
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"⚠️ **{server_name}{marker}** — status lookup failed: `{type(error).__name__}`"
+            )
+
+
+tree.add_command(status_group)
+
+
+@tree.command(name="announce", description="Post the default server's current map announcement")
+async def slash_announce(interaction: discord.Interaction):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
+    channel = client.get_channel(announcement_id) if announcement_id else None
+    if channel is None:
+        await interaction.followup.send("⚠️ Configured announcement channel could not be found.")
+        return
+
+    try:
+        status = await asyncio.to_thread(get_server_status)
+        await channel.send(
+            build_message(
+                "BF4 Map Change",
+                status,
+                server_name=get_default_server_name(),
+            )
+            + version_update_notice()
+        )
+        await interaction.followup.send(
+            f"✅ Announcement posted to **#{getattr(channel, 'name', announcement_id)}**."
+        )
+    except Exception as error:
+        await interaction.followup.send(f"⚠️ Announcement failed: `{type(error).__name__}`")
+
+
+@tree.command(name="debug", description="Show Keeper diagnostic information for the default server")
+async def slash_debug(interaction: discord.Interaction):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+    try:
+        data = await asyncio.to_thread(get_server)
+        await interaction.followup.send(build_debug_report(data))
+    except Exception as error:
+        await interaction.followup.send(f"⚠️ Debug lookup failed: `{type(error).__name__}`")
+
+
+@tree.command(name="reload", description="Reload config.json and servers.json")
+async def slash_reload(interaction: discord.Interaction):
+    await run_legacy_management_backend(interaction, "!reload")
+
+
+@tree.command(name="addserverguid", description="Add a BF4 server to servers.json")
+@discord.app_commands.describe(
+    name="Friendly server name",
+    guid="Battlefield 4 server GUID",
+    make_default="Make this the default watched server",
+)
+async def slash_addserverguid(
+    interaction: discord.Interaction,
+    name: str,
+    guid: str,
+    make_default: bool = False,
+):
+    raw = f'!addserverguid "{name}" {guid}' + (" default" if make_default else "")
+    await run_legacy_management_backend(interaction, raw)
+
+
+@tree.command(name="delserverguid", description="Remove a non-default BF4 server")
+@discord.app_commands.describe(server="Saved server name or GUID")
+async def slash_delserverguid(interaction: discord.Interaction, server: str):
+    await run_legacy_management_backend(interaction, f'!delserverguid "{server}"')
+
+
+@tree.command(name="setdefaultserver", description="Choose the default watched BF4 server")
+@discord.app_commands.describe(server="Saved server name or GUID")
+async def slash_setdefaultserver(interaction: discord.Interaction, server: str):
+    await run_legacy_management_backend(interaction, f'!setdefaultserver "{server}"')
+
+
+@tree.command(name="setannouncementchannel", description="Set the automatic announcement channel")
+async def slash_setannouncementchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await run_legacy_management_backend(
+        interaction,
+        f"!setannouncementchannel <#{channel.id}>",
+    )
+
+
+@tree.command(name="addlistenchannel", description="Add one or more regular-user command channels")
+@discord.app_commands.describe(
+    channels="Channel mentions, IDs, or exact names separated by spaces; quote names containing spaces"
+)
+async def slash_addlistenchannel(interaction: discord.Interaction, channels: str):
+    await run_legacy_management_backend(interaction, f"!addlistenchannel {channels}")
+
+
+@tree.command(name="dellistenchannel", description="Stage removal of one or more listen channels")
+@discord.app_commands.describe(
+    channels="Channel mentions, IDs, or exact names separated by spaces; quote names containing spaces"
+)
+async def slash_dellistenchannel(interaction: discord.Interaction, channels: str):
+    await run_legacy_management_backend(interaction, f"!dellistenchannel {channels}")
+
+
+@tree.command(name="setmanagementrole", description="Set the minimum ServerWatcher management role")
+@discord.app_commands.describe(
+    role="Management role; leave blank to restrict management to Discord Administrators/server owner"
+)
+async def slash_setmanagementrole(
+    interaction: discord.Interaction,
+    role: discord.Role | None = None,
+):
+    value = str(role.id) if role else "0"
+    await run_legacy_management_backend(interaction, f"!setmanagementrole {value}")
+
+
+@tree.command(name="setstatusrole", description="Set the minimum role for normal !status use")
+@discord.app_commands.describe(
+    role="Status role; leave blank to allow everyone in configured listen channels"
+)
+async def slash_setstatusrole(
+    interaction: discord.Interaction,
+    role: discord.Role | None = None,
+):
+    value = str(role.id) if role else "0"
+    await run_legacy_management_backend(interaction, f"!setstatusrole {value}")
+
+
+@tree.command(name="setinterval", description="Set BF4 polling interval in seconds")
+async def slash_setinterval(interaction: discord.Interaction, seconds: int):
+    await run_legacy_management_backend(interaction, f"!setinterval {seconds}")
+
+
+@tree.command(name="setmaprole", description="Stage a map-specific role ping configuration")
+@discord.app_commands.describe(
+    map_search="Full or partial BF4 map name",
+    role="Discord role to ping; leave blank only when disable is true",
+    message="Optional custom map-live message",
+    disable="Disable the map ping by setting role ID to 0",
+)
+async def slash_setmaprole(
+    interaction: discord.Interaction,
+    map_search: str,
+    role: discord.Role | None = None,
+    message: str | None = None,
+    disable: bool = False,
+):
+    if not disable and role is None:
+        await interaction.response.send_message(
+            "⚠️ Select a role, or set `disable` to true.",
+            ephemeral=True,
+        )
+        return
+
+    role_value = "0" if disable else str(role.id)
+    raw = f'!setmaprole "{map_search}" {role_value}'
+    if message:
+        safe_message = message.replace('"', "'")
+        raw += f' "{safe_message}"'
+    await run_legacy_management_backend(interaction, raw)
+
+
+@tree.command(name="delmaprole", description="Stage deletion of a configured map role ping")
+async def slash_delmaprole(interaction: discord.Interaction, map_search: str):
+    await run_legacy_management_backend(interaction, f'!delmaprole "{map_search}"')
+
+
+@tree.command(name="confirm", description="Apply your pending administrative change")
+async def slash_confirm(interaction: discord.Interaction):
+    await run_legacy_management_backend(interaction, "!confirm")
+
+
+@tree.command(name="cancel", description="Discard your pending administrative change")
+async def slash_cancel(interaction: discord.Interaction):
+    await run_legacy_management_backend(interaction, "!cancel")
+
+
 @client.event
 async def on_message(message):
     if message.author.bot:
@@ -1433,7 +1733,23 @@ async def on_message(message):
                 )
             return
 
-        if await handle_management_command(message, raw, command):
+        if command == "!announce":
+            if not await require_management(message, "!announce"):
+                return
+            announcement_id = int(CONFIG.get("announcement_channel_id", 0))
+            channel = client.get_channel(announcement_id)
+            if channel is None:
+                await message.channel.send("⚠️ Configured announcement channel could not be found.")
+                return
+            status = await asyncio.to_thread(get_server_status)
+            await channel.send(
+                build_message(
+                    "BF4 Map Change",
+                    status,
+                    server_name=get_default_server_name(),
+                )
+                + version_update_notice()
+            )
             return
 
         if command == "!list":
@@ -1448,93 +1764,69 @@ async def on_message(message):
         if command == "!status" or command.startswith("!status "):
             selector = raw[len("!status"):].strip()
 
+            # `!status all` was an administrative chat command before v1.2.0.
+            # Management status-all is now `/status all`.
             if selector.lower() == "all":
-                if not can_manage(message.author):
-                    await message.channel.send("⛔ `!status all` is restricted to bot management/admin users.")
-                    return
-                for key, record in SERVERS.get("servers", {}).items():
-                    server_name = str(record.get("name", key))
-                    server_guid = str(record.get("guid", "")).strip()
-                    marker = " (default)" if key == SERVERS.get("default_server") else ""
-                    try:
-                        await send_status(
-                            message.channel,
-                            f"BF4 Server Status — {server_name}{marker}",
-                            server_guid=server_guid,
-                        )
-                    except Exception as error:
-                        await message.channel.send(
-                            f"⚠️ **{server_name}{marker}** — status lookup failed: `{type(error).__name__}`"
-                        )
+                if can_manage(message.author):
+                    await message.channel.send("ℹ️ Use `/status all` for the management all-server status command.")
+                else:
+                    await message.channel.send("⚠️ Server **all** was not found. Use `!list` to see configured servers.")
                 return
 
             if not can_use_status_commands(message):
                 await message.channel.send("⛔ You do not have the required role to use that command.")
                 return
 
-            if selector and selector.isdigit() and message.author.id in PENDING_STATUS_SELECTIONS:
+            if selector.isdigit() and message.author.id in PENDING_STATUS_SELECTIONS:
                 choices = PENDING_STATUS_SELECTIONS[message.author.id]
-                index = int(selector) - 1
-                if index < 0 or index >= len(choices):
-                    await message.channel.send(f"⚠️ Choose a number from 1 to {len(choices)}.")
+                selection = int(selector)
+                if selection < 1 or selection > len(choices):
+                    await message.channel.send(
+                        f"⚠️ Choose a number from **1** to **{len(choices)}**."
+                    )
                     return
-                key, record = choices[index]
-                del PENDING_STATUS_SELECTIONS[message.author.id]
+                key = choices[selection - 1]
+                record = SERVERS["servers"][key]
+                PENDING_STATUS_SELECTIONS.pop(message.author.id, None)
             elif selector:
-                matches = find_server_matches(selector.strip('"').strip("'"))
+                matches = find_server_matches(selector)
                 if not matches:
-                    PENDING_STATUS_SELECTIONS.pop(message.author.id, None)
                     await message.channel.send(
                         f"⚠️ Server **{selector}** was not found in `servers.json`.\n"
-                        "Available servers:\n" + current_server_list_text()
+                        "Use `!list` to see configured server names."
                     )
                     return
                 if len(matches) > 1:
-                    PENDING_STATUS_SELECTIONS[message.author.id] = matches
-                    options = "\n".join(
+                    PENDING_STATUS_SELECTIONS[message.author.id] = [key for key, _ in matches]
+                    lines = [
                         f"{index}. {record.get('name', key)}"
-                        for index, (key, record) in enumerate(matches, 1)
-                    )
+                        for index, (key, record) in enumerate(matches, start=1)
+                    ]
                     await message.channel.send(
-                        f"Multiple servers matched **{selector}**:\n{options}\n\n"
-                        "Use `!status <number>` to select one. This selection is tied to your Discord user."
+                        f"Multiple servers matched **{selector}**:\n"
+                        + "\n".join(lines)
+                        + "\nReply with `!status <number>` to select one."
                     )
                     return
                 key, record = matches[0]
-                PENDING_STATUS_SELECTIONS.pop(message.author.id, None)
             else:
-                PENDING_STATUS_SELECTIONS.pop(message.author.id, None)
                 key = SERVERS["default_server"]
                 record = SERVERS["servers"][key]
 
             server_name = str(record.get("name", key))
             server_guid = str(record.get("guid", "")).strip()
             marker = " (default)" if key == SERVERS.get("default_server") else ""
-            await send_status(
-                message.channel,
-                f"BF4 Server Status — {server_name}{marker}",
-                server_guid=server_guid,
+            status = await asyncio.to_thread(get_server_status, None, server_guid)
+            await message.channel.send(
+                build_message(f"BF4 Server Status — {server_name}{marker}", status)
             )
+            return
 
-        elif command == "!announce":
-            if not await require_management(message, "!announce"):
-                return
-            announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-            channel = client.get_channel(announcement_id)
-            if channel is None:
-                await message.channel.send("⚠️ Configured announcement channel could not be found.")
-                return
-            await send_status(channel, "BF4 Map Change")
-
-        elif command == "!debug":
-            if not await require_management(message, "!debug"):
-                return
-            await message.channel.send(build_debug_report(get_server()))
-
-        elif command == "!version":
+        if command == "!version":
             if not VERSION_CHECK_COMPLETED:
                 await refresh_version_info()
             await message.channel.send(version_command_text())
+            return
 
     except Exception as error:
         print(f"COMMAND ERROR ({command}): {error}", flush=True)

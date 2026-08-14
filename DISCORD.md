@@ -34,7 +34,7 @@ DISCORD_TOKEN=your_real_discord_bot_token
 
 ## 3. Enable Message Content Intent
 
-ServerWatcher uses `!` prefix commands.
+ServerWatcher uses `!` prefix commands for regular users and Discord application/slash commands for management.
 
 In the Developer Portal:
 
@@ -45,7 +45,7 @@ In the Developer Portal:
 
 ## 4. Invite/install the bot
 
-Use the application's installation/OAuth2 section to generate an invite/install link for your Discord server.
+Use the application's installation/OAuth2 section to generate an invite/install link for your Discord server. Ensure the installation includes the bot and **application commands (`applications.commands`)** so the management `/` commands can be registered.
 
 Grant the bot:
 
@@ -84,7 +84,7 @@ Create one or more channels where regular users can use:
 
 These channels become entries in `listen_channel_id`.
 
-Managers can run commands in both the announcement channel and all configured listen channels.
+Managers can run slash-management commands in both the announcement channel and all configured listen channels. `!announce` is also retained as a chat-command alias.
 
 ## 6. Enable Developer Mode and copy IDs
 
@@ -174,6 +174,12 @@ In a configured listen channel:
 ```
 
 As a manager, `!help` in either a listen channel or the announcement channel shows the management command section and current settings.
+
+## Slash-command synchronization
+
+ServerWatcher syncs its management slash commands with Discord when the bot starts. The Docker log reports how many commands were synced.
+
+Global Discord slash commands may take a short time to appear after a new install or release. If the bot is online but a newly added `/` command is not visible immediately, give Discord time to propagate the command and then refresh/reopen the Discord client.
 
 ## Security reminders
 

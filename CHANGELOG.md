@@ -4,6 +4,28 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.2.0] - 2026-08-13
+
+### Added
+- Added Discord application/slash commands for ServerWatcher management operations.
+- Added `/status all` for management-only all-server status checks.
+- Added `/announce` while intentionally retaining the existing `!announce` chat-command alias.
+- Added `/debug`, `/reload`, `/addserverguid`, `/delserverguid`, `/setdefaultserver`, `/setannouncementchannel`, `/addlistenchannel`, `/dellistenchannel`, `/setmanagementrole`, `/setstatusrole`, `/setinterval`, `/setmaprole`, `/delmaprole`, `/confirm`, and `/cancel`.
+- Added startup synchronization of global Discord application commands with Docker log reporting.
+- Added a rotating Discord custom activity/presence that cycles every 30 seconds through:
+  - `<server> • <map>`
+  - `<server> currently has <players> players`
+  - `BF4 Server Watcher <version>`
+
+### Changed
+- Regular-user commands remain chat/prefix commands: `!help`, `!list`, `!status`, and `!version`.
+- Administrative chat commands no longer execute in v1.2.0 except for the retained `!announce` alias.
+- Management slash commands continue to enforce ServerWatcher's configured management-role and announcement/listen-channel restrictions.
+- Confirmation-required management actions now instruct administrators to use `/confirm` or `/cancel`.
+- The rotating presence uses the most recently cached default-server snapshot and does not create additional Keeper polling requests.
+- Updated `README.md`, `DISCORD.md`, and command help for the slash-command management model.
+- Docker image tag and application version updated to v1.2.0.
+
 ## [v1.1.10] - 2026-08-13
 
 ### Added
