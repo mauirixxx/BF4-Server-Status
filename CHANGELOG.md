@@ -4,6 +4,35 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.0] - 2026-08-14
+
+### Added
+- Added multi-default-server support with `default_servers` as an array; zero, one, or multiple defaults are valid.
+- Added automatic v1.2.x `default_server` to v1.3.0 `default_servers` schema migration for existing public installations.
+- Added `/defaultserver add`, `/defaultserver remove`, and `/defaultserver list`.
+- Added Discord autocomplete for `/defaultserver add` and `/defaultserver remove`, filtered to eligible configured servers.
+- Added independent map monitoring/state tracking for every configured default server.
+- Added multi-default rotating presence entries using cached status data.
+- Added one-time announcement-channel notification when the watcher detects that no default servers are configured.
+- Added automatic platform storage for saved servers with display labels `PC`, `PS4/5`, and `XBox`.
+- Added startup and `/reload` platform backfill for pre-existing saved servers missing platform metadata.
+- Added platform-aware aligned `!list` and administrator server-list formatting.
+- Added Battlelog URL support to `/addserverguid`; the command extracts the canonical GUID from either a raw GUID or full Battlelog server URL.
+- Added Battlelog URL platform extraction and best-effort platform detection for raw GUID additions.
+- Documented confirmed PC, PlayStation 4/5, and Xbox Battlefield 4 server support.
+
+### Changed
+- `!status` with no server argument now reports every configured default server.
+- `!status` returns `No default server(s) set` when the default list is empty; named server lookups remain available.
+- `/announce` and `!announce` now post map-style status for all default servers.
+- `/status all` and multi-server lists mark every configured default server.
+- Automatic cleanup of old map announcements is now scoped per server so one default server's map change does not remove another default server's latest announcement.
+- `/debug` uses the first configured default server and reports a friendly message when no defaults exist.
+- `/delserverguid` prevents deletion of any server that is currently in the default list.
+- Replaced `/setdefaultserver` with the `/defaultserver` command group.
+- `servers.example.json` now uses `default_servers: ["aaa"]` and includes `platform: "PC"` for the bundled AAA example.
+- Docker image tag and application version updated to v1.3.0.
+
 ## [v1.2.2] - 2026-08-14
 
 ### Added

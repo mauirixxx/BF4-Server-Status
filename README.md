@@ -1,4 +1,6 @@
-# BF4 Server Watcher v1.2.2
+# BF4 Server Watcher v1.3.0
+
+A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
 ## Setup
 
@@ -12,7 +14,7 @@ git clone https://github.com/mauirixxx/BF4-Server-Status.git bf4-serverstatus
 cd /opt/bf4-serverstatus
 ```
 
-Create the local runtime files from their examples:
+Create the local runtime files:
 
 ```bash
 cp .env.example .env
@@ -25,7 +27,7 @@ Set the real Discord bot token in `.env`:
 DISCORD_TOKEN=your_real_discord_bot_token
 ```
 
-Edit `config.json` with your Discord channel/role IDs. `servers.example.json` ships with AAA as the default template. On first startup, ServerWatcher copies it to writable `servers.json` if that file does not already exist.
+Edit `config.json` with your Discord channel/role IDs. `servers.example.json` ships with AAA as the initial default server. On first startup, ServerWatcher copies it to writable `servers.json` if that file does not already exist.
 
 Build and start:
 
@@ -35,13 +37,11 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-`config.json` and `servers.json` are writable runtime files so authorized Discord management commands can persist changes. `.env`, `config.json`, and live `servers.json` are intentionally excluded from release bundles and Git.
+Live `.env`, `config.json`, and `servers.json` are intentionally excluded from release bundles and Git.
 
 ### Updating to a new release
 
-Before updating, review `CHANGELOG.md` for release-specific notes. Also compare `config.example.json` and `servers.example.json` for newly introduced settings, but **do not overwrite** your live `.env`, `config.json`, or `servers.json`.
-
-For the standard `/opt/bf4-serverstatus` Git installation:
+Before updating, review `CHANGELOG.md`. Compare the example JSON files for new settings, but **do not overwrite** your live `.env`, `config.json`, or `servers.json`.
 
 ```bash
 cd /opt/bf4-serverstatus
@@ -53,7 +53,23 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-If you installed ServerWatcher elsewhere, replace `/opt/bf4-serverstatus` with that directory.
+If you installed ServerWatcher elsewhere, substitute your installation directory.
+
+### v1.2.x to v1.3.0 server-registry migration
+
+v1.3.0 changes the server registry from one default server to an array of default servers. Existing public v1.2.x installations are migrated automatically:
+
+```json
+"default_server": "aaa"
+```
+
+becomes:
+
+```json
+"default_servers": ["aaa"]
+```
+
+Saved server entries are preserved. v1.3.0 also attempts to backfill a missing `platform` field for pre-existing servers.
 
 ## Discord requirements
 
@@ -70,17 +86,17 @@ Recommended bot permissions:
 
 The bot itself does not require Administrator permission.
 
-**New to Discord bots? Read `DISCORD.md`.** It provides explicit Developer Portal instructions for creating the application/bot, enabling Message Content Intent, setting permissions, inviting the bot, obtaining channel/role IDs, and configuring ServerWatcher.
+**New to Discord bots? Read `DISCORD.md`.** It contains step-by-step Developer Portal, permissions, invite, channel, and role setup instructions.
 
-ServerWatcher v1.2.0 uses Discord **slash commands (`/`) for management**, while the regular user commands remain traditional `!` commands. `!announce` is intentionally retained alongside `/announce`.
+Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` is intentionally retained alongside `/announce`.
 
-After a fresh install or upgrade, ServerWatcher syncs its slash commands with Discord at startup. Global Discord application commands can take a short time to appear in every client/server after a sync.
+ServerWatcher syncs its slash commands with Discord at startup.
 
 ## Announcement and listen channels
 
-`announcement_channel_id` is the protected destination for automatic map-change announcements and manual `!announce` output.
+`announcement_channel_id` is the protected destination for automatic map-change announcements and manual announcements.
 
-`listen_channel_id` is an array of channel IDs where non-management users may use general commands:
+`listen_channel_id` is an array of channels where non-management users may use general commands:
 
 ```json
 {
@@ -92,28 +108,96 @@ After a fresh install or upgrade, ServerWatcher syncs its slash commands with Di
 }
 ```
 
-The default example is:
+The default:
 
 ```json
 "listen_channel_id": [0]
 ```
 
-`[0]` means **no regular-user command channel is configured**. It does not mean all channels.
+means no regular-user command channel is configured.
 
-Regular users may use general commands only in configured listen channels. They cannot use commands in the announcement channel, even if a Discord administrator accidentally leaves that channel writable.
-
-Bot managers may run commands in the announcement channel and in any configured listen channel.
-
-Automatic map-change announcements always go to `announcement_channel_id`.
+Regular users cannot invoke commands in the announcement channel. Managers may use management commands in the announcement channel or configured listen channels.
 
 ## Tested Battlefield platforms
 
-BF4 Server Watcher has been tested successfully with:
+BF4 Server Watcher has been successfully tested with Battlefield 4 servers on:
 
-- PC Battlefield 4 servers.
-- PlayStation 4 Battlefield 4 servers.
+- **PC**
+- **PlayStation 4 / PlayStation 5 backward compatibility** — displayed as `PS4/5`
+- **Xbox** — displayed as `XBox`
 
-Both tested platforms use the same saved-server GUID workflow and status fields used by ServerWatcher. Xbox support has not yet been confirmed and should be considered untested until verified with a known Xbox BF4 server.
+The normal snapshot-based status fields have been observed working across these tested platforms, including map, players, queue, commanders, and minimum tickets when supplied by the server snapshot.
+
+## Server platform detection
+
+Each saved server now has a `platform` field:
+
+```json
+{
+  "name": "Sloth Alliance Classics",
+  "guid": "97723370-122b-4ef4-951c-199dd92d0662",
+  "platform": "PS4/5"
+}
+```
+
+`/addserverguid` accepts either:
+
+- a raw BF4 server GUID, or
+- a full Battlelog server URL.
+
+If a Battlelog URL is supplied, ServerWatcher extracts the GUID and uses the platform segment in the URL. If only a raw GUID is supplied, ServerWatcher performs a best-effort Battlelog platform lookup.
+
+At startup and after `/reload`, existing saved servers with a missing or unknown platform are checked for platform backfill. A failed lookup is logged rather than guessed.
+
+## Multiple default servers
+
+v1.3.0 supports **zero, one, or multiple default servers**.
+
+Fresh installations begin with AAA:
+
+```json
+"default_servers": ["aaa"]
+```
+
+Use:
+
+```text
+/defaultserver add
+/defaultserver remove
+/defaultserver list
+```
+
+The `add` and `remove` commands provide Discord autocomplete lists populated from `servers.json`. `add` shows non-default servers; `remove` shows currently default servers.
+
+Zero defaults is valid. When no defaults are configured:
+
+```text
+!status
+```
+
+returns:
+
+```text
+No default server(s) set
+```
+
+The announcement channel receives `No default server(s) set` once when the watcher detects the empty-default state. ServerWatcher continues checking every `check_interval_seconds` and automatically resumes monitoring after a default is added.
+
+Named `!status <server>` lookups and `/status all` continue to work with zero defaults.
+
+Each default server is monitored independently. A map change on one default server does not require the others to change, and old automatic announcements are cleaned up per server rather than globally.
+
+## Platform-aware server lists
+
+`!list` displays platform labels in a fixed-width code block:
+
+```text
+(PC)    - AAA (default)
+(PS4/5) - Sloth Alliance Classics
+(XBox)  - Jokers Funhouse
+```
+
+The administrator's `!help` current-configuration server list uses the same platform-aware formatting.
 
 ## Status role behavior
 
@@ -123,124 +207,91 @@ Both tested platforms use the same saved-server GUID workflow and status fields 
 - Valid role ID — that role, higher roles, Administrators, and the server owner may use `!status`.
 - Invalid/nonexistent nonzero role ID — only Administrators and the server owner may use `!status` until corrected.
 
-ServerWatcher warns about invalid nonzero role IDs at startup, after `!reload`, and after `!setstatusrole`.
-
 ## Version checking
 
-ServerWatcher checks the BF4 Server Status GitHub repository for a newer release/tag at startup and then once every 24 hours. The result is cached so the 69-second BF4 polling loop does not repeatedly query GitHub.
+ServerWatcher checks the GitHub repository at startup and every 24 hours.
 
-When a newer version is found, automatic map-change announcements include the installed and available versions. If the GitHub version check fails, normal BF4 monitoring and Discord announcements continue.
+`!version` also performs an immediate fresh check before responding. If that refresh fails, the last successful cached result is preserved.
 
-`!version` performs an immediate fresh GitHub version check, then shows the installed version, latest known version, and update status. If the refresh fails, the last successful cached result is retained and identified as cached.
-
-## Help output
-
-`!help` is intentionally sent as separate logical messages:
-
-1. User commands.
-2. Management slash commands (for authorized managers).
-3. Current configuration (for authorized managers).
-
-The normal Discord message splitter remains as a safety net for unusually large configurations.
+When a newer version is known, automatic map-change announcements include the available and installed versions.
 
 ## User commands
 
-These remain chat/prefix commands:
-
-- `!help` — show command help. Managers also see the available management slash commands/current settings.
-- `!list` — show configured server names only, one per line, with the default identified.
-- `!status` — show the current default server.
-- `!status <server-name>` — exact/partial case-insensitive lookup. Unique partial matches resolve automatically; multiple matches are numbered and selection is tied to the requesting user.
-- `!version` — show installed version, latest known version, and update status.
+- `!help` — user help; managers also receive management commands and current configuration.
+- `!list` — platform-aware list of configured server names.
+- `!status` — status for every configured default server, or `No default server(s) set`.
+- `!status <server-name>` — exact/partial saved-server lookup with per-user numbered selection for ambiguous matches.
+- `!version` — installed/latest version and update status.
+- `!announce` — management-only chat alias for `/announce`.
 
 ## Management commands
 
-Management commands are Discord slash commands and require `management_min_role_id` or a higher Discord role. Discord Administrators and the server owner are always allowed. They may be used in the announcement channel or configured listen channels.
+Management slash commands require `management_min_role_id` or higher. Discord Administrators and the server owner always bypass that role threshold.
 
-- `/status all` — show every configured server's status as normal channel messages; the slash command itself is acknowledged privately. One failed lookup does not stop the remaining servers.
-- `/announce` — post the default server's map-change-style status to `announcement_channel_id`.
-- `!announce` — retained as a chat-command alias for `/announce`.
-- `/debug` — show Keeper diagnostic information for the default server.
-- `/reload` — reload `config.json` and `servers.json`.
-- `/addserverguid name:<name> guid:<guid> [make_default:true]` — add a server and optionally make it the default.
-- `/delserverguid server:<name-or-guid>` — remove a server. The current default cannot be deleted.
-- `/setdefaultserver server:<name-or-guid>` — choose an existing server as the default.
-- `/setannouncementchannel channel:<channel>` — set the automatic announcement channel using Discord's channel picker.
-- `/addlistenchannel channels:<channel list>` — add one or more listen channels. The value may contain channel mentions, IDs, or exact names separated by spaces; quote names containing spaces.
-- `/dellistenchannel channels:<channel list>` — stage removal of one or more listen channels and require `/confirm` or `/cancel`.
-- `/setmanagementrole [role:<role>]` — set the management minimum role. Leaving the role blank restricts management to Discord Administrators/server owner.
-- `/setstatusrole [role:<role>]` — set the minimum role for `!status`. Leaving the role blank allows everyone in configured listen channels.
-- `/setinterval seconds:<seconds>` — update the polling interval; minimum 10 seconds.
-- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — fuzzy-match a map and stage a role/message change. Use `disable:true` to set role ID `0`.
-- `/delmaprole map_search:<map>` — stage removal of a configured map-role mapping.
-- `/confirm` — apply the initiating administrator's pending administrative change.
-- `/cancel` — discard the initiating administrator's pending administrative change.
-
-Each administrator may have one pending confirmation-required operation at a time.
+- `/status all` — status for every configured server.
+- `/announce` — post current map-style status for every default server.
+- `/debug` — Keeper diagnostics for the first configured default server.
+- `/reload` — reload configuration/server registry and retry platform backfill.
+- `/addserverguid name:<name> guid:<GUID-or-Battlelog-URL> [make_default:true]` — add a server, detect/store platform, and optionally add it to the default list.
+- `/delserverguid server:<name-or-guid>` — remove a non-default server.
+- `/defaultserver add server:<selection>` — add a server to defaults using autocomplete.
+- `/defaultserver remove server:<selection>` — remove a server from defaults using autocomplete.
+- `/defaultserver list` — list current defaults.
+- `/setannouncementchannel channel:<channel>` — set the automatic announcement channel.
+- `/addlistenchannel channels:<channel list>` — add one or more listen channels.
+- `/dellistenchannel channels:<channel list>` — stage removal of one or more listen channels.
+- `/setmanagementrole [role:<role>]`
+- `/setstatusrole [role:<role>]`
+- `/setinterval seconds:<seconds>`
+- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]`
+- `/delmaprole map_search:<map>`
+- `/confirm`
+- `/cancel`
 
 ## Rotating Discord presence
 
-The bot rotates its Discord custom activity every 30 seconds using the most recently cached default-server status:
+The bot rotates its custom activity every 30 seconds across all currently cached default servers, followed by the bot version. For two defaults, the cycle can look like:
 
 ```text
-AAA • Hangar 21
-AAA currently has 57 players
-BF4 Server Watcher v1.2.0
+AAA • Dawnbreaker
+AAA currently has 63 players
+Flubber • Operation Locker
+Flubber currently has 48 players
+BF4 Server Watcher v1.3.0
 ```
 
-The player activity shows only the normal player count. Queue, commanders, tickets, and other status fields are not included in the presence. Presence rotation reuses the cached BF4 status and does not create extra Keeper polling requests.
-
-## Examples
-
-Regular-user chat commands:
-
-```text
-!help
-!list
-!status
-!status turtles
-!status turt
-!version
-!announce
-```
-
-Management slash-command examples:
-
-```text
-/status all
-/announce
-/debug
-/reload
-/addserverguid
-/delserverguid
-/setdefaultserver
-/setannouncementchannel
-/addlistenchannel
-/dellistenchannel
-/setmanagementrole
-/setstatusrole
-/setinterval
-/setmaprole
-/delmaprole
-/confirm
-/cancel
-```
-
-Discord presents the slash-command parameters interactively after you select a command.
+Presence uses cached watcher data and does not create extra Keeper polling requests.
 
 ## Runtime/configuration files
 
 - `.env.example` — copy to `.env`; never commit the real token.
-- `config.example.json` — copy to `config.json`; contains one Operation Locker map-role example with a generic 18-digit role-ID placeholder.
-- `servers.example.json` — bundled AAA-default template. On first startup, ServerWatcher copies it to the writable runtime `servers.json` only if `servers.json` does not already exist.
-- `maps.json` — authoritative Battlefield map ID/display-name mapping.
-- `DISCORD.md` — step-by-step Discord bot creation/setup guide.
-- `CHANGELOG.md` — version-by-version project changes.
+- `config.example.json` — copy to `config.json`.
+- `servers.example.json` — AAA-default registry template; copied to live `servers.json` only when that file does not exist.
+- `maps.json` — BF4 map ID/display-name mapping.
+- `DISCORD.md` — Discord setup guide.
+- `CHANGELOG.md` — version history.
 - `LICENSE` — MIT License.
 
-## Default server
+## Default server template
 
-The bundled `servers.example.json` starts with AAA as the default server and GUID `28773abe-e620-4d36-9512-c6f4b128f0ad`.
+`servers.example.json` begins with:
+
+```json
+{
+  "default_servers": [
+    "aaa"
+  ],
+  "servers": {
+    "aaa": {
+      "name": "AAA",
+      "guid": "28773abe-e620-4d36-9512-c6f4b128f0ad",
+      "platform": "PC"
+    }
+  }
+}
+```
+
+Administrators may later remove every default server; the presence of AAA here only defines the fresh-install starting state.
 
 ## Author and acknowledgments
 
@@ -248,22 +299,8 @@ The bundled `servers.example.json` starts with AAA as the default server and GUI
 
 **Development assistance:** OpenAI's ChatGPT
 
-BF4 Server Watcher is released under the MIT License. See `LICENSE` for the license terms.
+BF4 Server Watcher is released under the MIT License. See `LICENSE`.
 
 ## Release files and GitHub safety
 
 Release bundles intentionally contain **no `.env`, no `config.json`, and no live `servers.json`**. `.gitignore` excludes those live files, Python cache files, and release ZIPs.
-
-This project is licensed under the MIT License. See `LICENSE`.
-
-## Server registry bootstrap
-
-The release includes `servers.example.json`, not a live `servers.json`. The example contains AAA as the default server.
-
-At startup, ServerWatcher checks for the live runtime file:
-
-- If `servers.json` already exists, it is loaded and left untouched.
-- If `servers.json` does not exist, ServerWatcher copies `servers.example.json` to `servers.json` once, then uses the new file as the writable registry.
-- Existing servers added through Discord are therefore preserved across rebuilds and upgrades.
-
-The Docker Compose configuration mounts the project directory at `/data`, allowing the container to create and update the host-side `servers.json` safely.

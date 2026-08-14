@@ -204,4 +204,22 @@ Managers can add or remove multiple listen channels in one command. Each argumen
 
 ## Tested BF4 platforms
 
-ServerWatcher has been tested with PC and PlayStation 4 Battlefield 4 servers. Xbox support has not yet been confirmed.
+ServerWatcher has been successfully tested with Battlefield 4 servers on PC, PlayStation 4/5 backward compatibility, and Xbox. The same GUID-based status workflow is used across the tested platforms.
+
+
+
+## v1.3.0 server management
+
+`/addserverguid` accepts either a raw Battlefield server GUID or a full Battlelog server URL. ServerWatcher extracts the GUID and attempts to detect/store the server platform automatically.
+
+Default-server management uses:
+
+```text
+/defaultserver add
+/defaultserver remove
+/defaultserver list
+```
+
+The add/remove subcommands use Discord autocomplete so administrators can choose from the servers already saved in `servers.json`.
+
+ServerWatcher allows zero, one, or multiple default servers. With zero defaults, named `!status <server>` lookups and `/status all` still work, while automatic default-server monitoring waits until at least one default is configured.
