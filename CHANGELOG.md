@@ -4,6 +4,32 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.1] - 2026-08-14
+
+### Added
+- Added `/addserver` as the public server-add command, replacing `/addserverguid`.
+- Added batch `/addserver` support for multiple Battlelog server URLs in one command.
+- Added URL-derived server-name, GUID, platform, platform-provenance, and Battlelog-URL storage.
+- Added duplicate-GUID metadata repair: re-processing a full Battlelog URL updates an existing saved server instead of creating a duplicate.
+- Added optional `make_default` behavior across every successfully processed server in a batch `/addserver` command.
+- Added optional saved-server autocomplete to `/debug`.
+- Added immediate current-status announcement and watcher-cache seeding when a server becomes a default.
+- Added immediate automatic-announcement cleanup and cache cleanup when a server is removed from the default list.
+- Added 10-minute automatic cleanup for messages created by manual `/announce` and `!announce`.
+- Added fixed-width code-block formatting to `/defaultserver add`, `/defaultserver remove`, and `/defaultserver list` responses.
+
+### Changed
+- Full Battlelog server URLs are now the documented/recommended input for adding servers.
+- Removed the unreliable v1.3.0 Battlelog platform-probing behavior for raw GUIDs.
+- Added v1.3.1 platform-metadata repair: unverified v1.3.0 PC labels are reset to `Unknown` rather than guessed, while bundled AAA and explicit console labels are preserved.
+- `/reload` now normalizes saved platform metadata without attempting unreliable raw-GUID platform detection.
+- `/announce` and `!announce` are explicitly temporary/manual announcements and do not replace the normal automatic announcement lifecycle.
+- Updated `README.md`, `DISCORD.md`, help output, `servers.example.json`, Docker image tag, and application version for v1.3.1.
+
+### Fixed
+- Fixed v1.3.0 platform backfill incorrectly classifying PlayStation and Xbox servers as PC.
+- Fixed former-default automatic announcements remaining in the announcement channel after default status was removed.
+
 ## [v1.3.0] - 2026-08-14
 
 ### Added

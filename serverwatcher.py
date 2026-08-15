@@ -5,12 +5,13 @@ import asyncio
 import shlex
 import shutil
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.0"
+BOT_VERSION = "v1.3.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -30,6 +31,8 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it to .env or the environment.")
 
 AUTO_ANNOUNCEMENT_MARKER = "\u200b\u200c\u200d"
+NO_DEFAULT_MARKER = "\u200d\u200c\u200b"
+MANUAL_ANNOUNCEMENT_TTL_SECONDS = 10 * 60
 
 
 def load_json(path):
@@ -135,69 +138,18 @@ PLATFORM_URL_LABELS = {
     "xbox360": "XBox",
 }
 
-PLATFORM_PROBES = (
-    ("pc", "PC"),
-    ("ps4", "PS4/5"),
-    ("xboxone", "XBox"),
-    ("xbox360", "XBox"),
-)
+PLATFORM_METADATA_VERSION = 2
+BUNDLED_AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
 
 
 def extract_server_guid(value):
+    """Extract a canonical BF4 server GUID from arbitrary text."""
     match = re.search(
         r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
         str(value),
     )
     return match.group(1).lower() if match else None
-
-
-def platform_from_battlelog_url(value):
-    match = re.search(
-        r"/bf4/servers/show/(pc|ps4|xboxone|xbox360)/",
-        str(value),
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return PLATFORM_URL_LABELS.get(match.group(1).lower())
-
-
-def detect_platform_for_guid(guid, server_name="Server"):
-    """Best-effort Battlelog platform detection for a raw server GUID."""
-    guid = str(guid).lower()
-    safe_slug = re.sub(r"[^A-Za-z0-9_-]+", "-", str(server_name)).strip("-") or "Server"
-    headers = {"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"}
-
-    for platform_path, display_label in PLATFORM_PROBES:
-        url = (
-            "https://battlelog.battlefield.com/bf4/servers/show/"
-            f"{platform_path}/{guid}/{safe_slug}/"
-        )
-        try:
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=6,
-                allow_redirects=True,
-            )
-        except requests.RequestException:
-            continue
-
-        if response.status_code != 200:
-            continue
-
-        final_url = response.url.lower()
-        expected = f"/servers/show/{platform_path}/{guid}/"
-        body = response.text.lower()
-        if expected in final_url and (
-            "server details" in body
-            or "map rotation" in body
-            or guid in body
-        ):
-            return display_label
-
-    return None
 
 
 def normalize_platform_label(value):
@@ -218,45 +170,156 @@ def normalize_platform_label(value):
     return aliases.get(normalized, str(value or "").strip() or "Unknown")
 
 
+def parse_battlelog_server_url(value):
+    """Parse a full BF4 Battlelog server URL and return trusted platform metadata."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {
+        "battlelog.battlefield.com",
+        "www.battlelog.battlefield.com",
+    }:
+        return None
+
+    path_match = re.fullmatch(
+        r"/bf4/servers/show/(pc|ps4|xboxone|xbox360)/"
+        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/([^/?#]+)/?",
+        parsed.path,
+        flags=re.IGNORECASE,
+    )
+    if not path_match:
+        return None
+
+    platform_path = path_match.group(1).lower()
+    guid = path_match.group(2).lower()
+    slug = unquote(path_match.group(3)).strip()
+    derived_name = re.sub(r"[-_]+", " ", slug).strip()
+    derived_name = re.sub(r"\s+", " ", derived_name)
+    if not derived_name:
+        derived_name = f"BF4 Server {guid[:8]}"
+
+    canonical_url = (
+        "https://battlelog.battlefield.com/bf4/servers/show/"
+        f"{platform_path}/{guid}/{path_match.group(3)}/"
+    )
+    return {
+        "guid": guid,
+        "platform": PLATFORM_URL_LABELS[platform_path],
+        "name": derived_name,
+        "battlelog_url": canonical_url,
+        "platform_source": "battlelog_url",
+    }
+
+
+def parse_server_reference(value):
+    """
+    Parse a server reference.
+
+    Full Battlelog URLs are authoritative for platform. Raw GUID support remains
+    available internally and is treated as PC-only legacy support.
+    """
+    parsed_url = parse_battlelog_server_url(value)
+    if parsed_url:
+        return parsed_url
+
+    raw = str(value or "").strip()
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        raw,
+    ):
+        guid = raw.lower()
+        return {
+            "guid": guid,
+            "platform": "PC",
+            "name": f"PC Server {guid[:8]}",
+            "battlelog_url": None,
+            "platform_source": "raw_guid",
+        }
+
+    return None
+
+
+def platform_from_battlelog_url(value):
+    parsed = parse_battlelog_server_url(value)
+    return parsed["platform"] if parsed else None
+
+
 def platform_prefix(record):
     platform = normalize_platform_label(record.get("platform", "Unknown"))
     label = f"({platform})" if platform != "Unknown" else "(?)"
     return label.ljust(7)
 
 
-def backfill_server_platforms():
-    """Populate missing/unknown platform fields without changing known values."""
+def repair_v130_platform_metadata(servers):
+    """
+    Repair platform metadata written by v1.3.0's unreliable raw-GUID probe.
+
+    There is no authoritative way to distinguish a genuine PC value from a
+    console server incorrectly labeled PC once only the GUID was stored.
+    Unverified legacy PC values are therefore reset to Unknown. The bundled AAA
+    record is retained as known PC. Explicit PS4/5/XBox values are preserved.
+    Re-processing a full Battlelog URL through /addserver repairs an existing
+    matching record with authoritative URL-derived metadata.
+    """
+    current_version = int(servers.get("platform_metadata_version", 0) or 0)
+    if current_version >= PLATFORM_METADATA_VERSION:
+        return False, 0
+
     changed = False
-    for key, record in SERVERS.get("servers", {}).items():
+    reset_count = 0
+    for key, record in servers.get("servers", {}).items():
         if not isinstance(record, dict):
             continue
 
-        current = normalize_platform_label(record.get("platform", "Unknown"))
-        if current != "Unknown":
-            if record.get("platform") != current:
-                record["platform"] = current
+        guid = str(record.get("guid", "")).strip().lower()
+        platform = normalize_platform_label(record.get("platform", "Unknown"))
+        source = str(record.get("platform_source", "")).strip()
+
+        if source:
+            normalized = normalize_platform_label(platform)
+            if record.get("platform") != normalized:
+                record["platform"] = normalized
                 changed = True
             continue
 
-        guid = str(record.get("guid", "")).strip()
-        name = str(record.get("name", key)).strip()
-        detected = detect_platform_for_guid(guid, name)
-        if detected:
-            record["platform"] = detected
+        if key == "aaa" and guid == BUNDLED_AAA_GUID:
+            record["platform"] = "PC"
+            record["platform_source"] = "bundled"
             changed = True
-            print(f"Detected platform for {name}: {detected}", flush=True)
+        elif platform in {"PS4/5", "XBox"}:
+            record["platform"] = platform
+            record["platform_source"] = "legacy_preserved"
+            changed = True
         else:
-            if record.get("platform") != "Unknown":
-                record["platform"] = "Unknown"
-                changed = True
-            print(
-                f"WARNING: Could not determine platform for {name} ({guid})",
-                flush=True,
-            )
+            if platform != "Unknown":
+                reset_count += 1
+            record["platform"] = "Unknown"
+            record["platform_source"] = "v1.3.0_unverified"
+            changed = True
 
+    servers["platform_metadata_version"] = PLATFORM_METADATA_VERSION
+    changed = True
+    return changed, reset_count
+
+
+def normalize_server_platform_metadata():
+    """Normalize saved platform labels without guessing a platform from a GUID."""
+    changed = False
+    for record in SERVERS.get("servers", {}).values():
+        if not isinstance(record, dict):
+            continue
+        platform = normalize_platform_label(record.get("platform", "Unknown"))
+        if record.get("platform") != platform:
+            record["platform"] = platform
+            changed = True
     if changed:
         save_servers()
-
     return changed
 
 
@@ -396,16 +459,33 @@ def reload_runtime_config():
     global CONFIG, SERVERS
     new_config = validate_config(load_json(CONFIG_PATH))
     new_servers = load_json(SERVERS_PATH)
+
     migrated = migrate_servers_schema(new_servers)
+    metadata_changed, reset_count = repair_v130_platform_metadata(new_servers)
+
     new_servers = validate_servers(new_servers)
     CONFIG = new_config
     SERVERS = new_servers
-    if migrated:
+
+    if migrated or metadata_changed:
         write_json_in_place(SERVERS_PATH, SERVERS)
+
+    if migrated:
         print(
             "Migrated servers.json from default_server to default_servers.",
             flush=True,
         )
+    if metadata_changed:
+        print(
+            "Updated server platform metadata to v1.3.1 format.",
+            flush=True,
+        )
+        if reset_count:
+            print(
+                f"Reset {reset_count} unverified v1.3.0 platform value(s) "
+                "to Unknown. Re-add full Battlelog URLs to repair them.",
+                flush=True,
+            )
 
 
 ensure_servers_file()
@@ -797,6 +877,156 @@ async def delete_old_map_announcements(channel, server_name=None):
         print(f"ERROR deleting old announcements: {error}", flush=True)
 
 
+async def delete_no_default_notices(channel):
+    if channel is None or client.user is None:
+        return
+    try:
+        async for message in channel.history(limit=100):
+            if message.author.id != client.user.id:
+                continue
+            if (
+                NO_DEFAULT_MARKER in message.content
+                or "No default server(s) set" in message.content
+            ):
+                await message.delete()
+    except discord.Forbidden:
+        print(
+            "ERROR: Missing Read Message History or Manage Messages permission "
+            "while cleaning no-default notice",
+            flush=True,
+        )
+    except discord.HTTPException as error:
+        print(
+            f"ERROR deleting no-default notice: {error}",
+            flush=True,
+        )
+
+
+async def post_no_default_notice(channel):
+    global NO_DEFAULT_ANNOUNCED
+    if channel is None:
+        return
+    await delete_no_default_notices(channel)
+    await channel.send(
+        "⚠️ **No default server(s) set**" + NO_DEFAULT_MARKER
+    )
+    NO_DEFAULT_ANNOUNCED = True
+    print("No default server(s) set", flush=True)
+
+
+async def delete_message_later(message, delay_seconds):
+    try:
+        await asyncio.sleep(delay_seconds)
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        print(
+            "WARNING: Could not delete a manual announcement after its "
+            "cleanup timer; missing permission.",
+            flush=True,
+        )
+    except discord.HTTPException as error:
+        print(
+            f"WARNING: Manual announcement cleanup failed: {error}",
+            flush=True,
+        )
+
+
+def schedule_manual_announcement_cleanup(message):
+    asyncio.create_task(
+        delete_message_later(
+            message,
+            MANUAL_ANNOUNCEMENT_TTL_SECONDS,
+        )
+    )
+
+
+async def post_server_announcement(
+    channel,
+    key,
+    record,
+    *,
+    manual=False,
+    seed_cache=True,
+):
+    """Post current map-style status for one saved server."""
+    server_name = str(record.get("name", key))
+    server_guid = str(record.get("guid", "")).strip()
+    status = await asyncio.to_thread(
+        get_server_status,
+        None,
+        server_guid,
+    )
+
+    if not manual:
+        await delete_old_map_announcements(channel, server_name)
+
+    content = (
+        build_message(
+            "BF4 Map Change",
+            status,
+            server_name=server_name,
+        )
+        + version_update_notice()
+    )
+    if not manual:
+        content += AUTO_ANNOUNCEMENT_MARKER
+
+    sent_message = await channel.send(content)
+
+    if manual:
+        schedule_manual_announcement_cleanup(sent_message)
+    elif seed_cache:
+        LAST_MAPS[key] = status["map_id"]
+        LAST_DEFAULT_STATUSES[key] = status
+
+    return sent_message, status
+
+
+async def activate_default_server(key):
+    """Seed and immediately announce a newly activated default server."""
+    global NO_DEFAULT_ANNOUNCED
+    record = SERVERS["servers"][key]
+    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
+    channel = client.get_channel(announcement_id) if announcement_id else None
+
+    if channel is not None:
+        await delete_no_default_notices(channel)
+        NO_DEFAULT_ANNOUNCED = False
+        await post_server_announcement(
+            channel,
+            key,
+            record,
+            manual=False,
+            seed_cache=True,
+        )
+    else:
+        # Seed the watcher cache even if announcements are unavailable.
+        status = await asyncio.to_thread(
+            get_server_status,
+            None,
+            str(record.get("guid", "")).strip(),
+        )
+        LAST_MAPS[key] = status["map_id"]
+        LAST_DEFAULT_STATUSES[key] = status
+
+
+async def deactivate_default_server(key, record):
+    """Immediately remove a former default's current announcement/cache."""
+    global NO_DEFAULT_ANNOUNCED
+    server_name = str(record.get("name", key))
+    LAST_MAPS.pop(key, None)
+    LAST_DEFAULT_STATUSES.pop(key, None)
+
+    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
+    channel = client.get_channel(announcement_id) if announcement_id else None
+    if channel is not None:
+        await delete_old_map_announcements(channel, server_name)
+        if not get_default_server_keys():
+            await post_no_default_notice(channel)
+
+
 def build_map_role_ping(map_name):
     ping_config = CONFIG.get("map_role_pings", {}).get(map_name)
     if not isinstance(ping_config, dict):
@@ -835,10 +1065,10 @@ async def map_check_loop():
                 LAST_MAPS.clear()
                 LAST_DEFAULT_STATUSES.clear()
                 if channel is not None and not NO_DEFAULT_ANNOUNCED:
-                    await channel.send("⚠️ **No default server(s) set**")
-                    NO_DEFAULT_ANNOUNCED = True
-                    print("No default server(s) set", flush=True)
+                    await post_no_default_notice(channel)
             else:
+                if channel is not None and NO_DEFAULT_ANNOUNCED:
+                    await delete_no_default_notices(channel)
                 NO_DEFAULT_ANNOUNCED = False
                 active_keys = set(default_keys)
 
@@ -945,17 +1175,6 @@ async def presence_rotation_loop():
         await asyncio.sleep(30)
 
 
-async def platform_backfill_task():
-    try:
-        await asyncio.to_thread(backfill_server_platforms)
-    except Exception as error:
-        print(
-            f"WARNING: Platform backfill failed: "
-            f"{type(error).__name__}: {error}",
-            flush=True,
-        )
-
-
 @client.event
 async def on_ready():
     global watcher_started
@@ -973,7 +1192,6 @@ async def on_ready():
     except Exception as error:
         print(f"WARNING: Slash command sync failed: {type(error).__name__}: {error}", flush=True)
 
-    asyncio.create_task(platform_backfill_task())
     asyncio.create_task(map_check_loop())
     asyncio.create_task(version_check_loop())
     asyncio.create_task(presence_rotation_loop())
@@ -1234,10 +1452,10 @@ def build_help_messages(member):
     management_help = "\n".join([
         "**Management slash commands**",
         "`/status all` — show status for every configured server.",
-        "`/announce` or `!announce` — manually post the current map-change style status to the announcement channel.",
-        "`/debug` — show Keeper diagnostic information.",
+        "`/announce` or `!announce` — temporarily post current default-server status; manual announcements delete after 10 minutes.",
+        "`/debug` — show Keeper diagnostic information for a selected saved server.",
         "`/reload` — reload `config.json` and `servers.json`.",
-        "`/addserverguid` — add a server from a raw GUID or Battlelog URL; platform is detected automatically.",
+        "`/addserver` — add one or more servers from full Battlelog server URLs; optional `make_default` applies to all successful additions.",
         "`/delserverguid` — remove a non-default server.",
         "`/defaultserver add|remove|list` — manage zero, one, or multiple default servers with autocomplete.",
         "`/setannouncementchannel` — change the announcement channel.",
@@ -1360,62 +1578,6 @@ async def handle_management_command(message, raw, lowered):
         lines = [f"✅ Configuration reloaded. Interval: **{CONFIG['check_interval_seconds']} seconds**."]
         lines.extend(f"⚠️ {warning}" for warning in configuration_warnings(message.guild))
         await message.channel.send("\n".join(lines))
-        return True
-
-    if lowered.startswith("!addserverguid"):
-        if not await require_management(message, "!addserverguid"):
-            return True
-        payload = raw[len("!addserverguid"):].strip()
-        make_default = payload.lower().endswith(" default")
-        if make_default:
-            payload = payload[:-8].rstrip()
-
-        parts = shlex.split(payload)
-        if len(parts) < 2:
-            await message.channel.send(
-                "Usage: `/addserverguid` with a server name and GUID/Battlelog URL.\n"
-                "Current servers:\n" + current_server_list_text()
-            )
-            return True
-
-        server_ref = parts[-1]
-        name = " ".join(parts[:-1]).strip()
-        guid = extract_server_guid(server_ref)
-        if not guid:
-            await message.channel.send(
-                "⚠️ No valid Battlefield server GUID was found. "
-                "Paste either the raw GUID or the full Battlelog server URL."
-            )
-            return True
-
-        existing_key, _ = find_server(name)
-        guid_key, _ = find_server(guid)
-        if existing_key or guid_key:
-            await message.channel.send(
-                "⚠️ That server name or GUID already exists in `servers.json`."
-            )
-            return True
-
-        platform = (
-            platform_from_battlelog_url(server_ref)
-            or await asyncio.to_thread(detect_platform_for_guid, guid, name)
-            or "Unknown"
-        )
-        key = unique_server_key(name)
-        SERVERS["servers"][key] = {
-            "name": name,
-            "guid": guid,
-            "platform": platform,
-        }
-        if make_default and key not in SERVERS["default_servers"]:
-            SERVERS["default_servers"].append(key)
-
-        save_servers()
-        suffix = " and added it to the default servers" if make_default else ""
-        await message.channel.send(
-            f"✅ Added **{name}** — `{guid}` ({platform}) to `servers.json`{suffix}.\n"
-            "Current servers:\n" + current_server_list_text()
-        )
         return True
 
     if lowered.startswith("!delserverguid"):
@@ -1902,7 +2064,7 @@ async def slash_status_all(interaction: discord.Interaction):
 tree.add_command(status_group)
 
 
-@tree.command(name="announce", description="Post current map announcements for all default servers")
+@tree.command(name="announce", description="Temporarily announce all default servers")
 async def slash_announce(interaction: discord.Interaction):
     proxy = await prepare_management_interaction(interaction)
     if proxy is None:
@@ -1918,54 +2080,70 @@ async def slash_announce(interaction: discord.Interaction):
 
     defaults = get_default_server_records()
     if not defaults:
-        await channel.send("⚠️ **No default server(s) set**")
         await interaction.followup.send("⚠️ No default server(s) set.")
         return
 
     sent = 0
+    failures = []
     for key, record in defaults:
         server_name = str(record.get("name", key))
-        server_guid = str(record.get("guid", "")).strip()
         try:
-            status = await asyncio.to_thread(
-                get_server_status,
-                None,
-                server_guid,
-            )
-            await channel.send(
-                build_message(
-                    "BF4 Map Change",
-                    status,
-                    server_name=server_name,
-                )
-                + version_update_notice()
+            await post_server_announcement(
+                channel,
+                key,
+                record,
+                manual=True,
+                seed_cache=False,
             )
             sent += 1
         except Exception as error:
-            await interaction.followup.send(
-                f"⚠️ Announcement failed for **{server_name}**: "
-                f"`{type(error).__name__}`"
+            failures.append(
+                f"{server_name}: {type(error).__name__}"
             )
 
-    if sent:
-        await interaction.followup.send(
-            f"✅ Posted **{sent}** default-server announcement(s) to "
-            f"**#{getattr(channel, 'name', announcement_id)}**."
+    lines = [
+        f"✅ Posted **{sent}** temporary default-server announcement(s) "
+        f"to **#{getattr(channel, 'name', announcement_id)}**.",
+        "Manual announcements automatically delete after **10 minutes**.",
+    ]
+    if failures:
+        lines.append(
+            "⚠️ Failed:\n" + "\n".join(failures)
         )
+    await interaction.followup.send("\n".join(lines))
 
 
-@tree.command(name="debug", description="Show Keeper diagnostic information for the first default server")
-async def slash_debug(interaction: discord.Interaction):
+@tree.command(name="debug", description="Show Keeper diagnostics for a saved server")
+@discord.app_commands.describe(
+    server="Optional saved server; defaults to the first configured default server"
+)
+async def slash_debug(
+    interaction: discord.Interaction,
+    server: str | None = None,
+):
     proxy = await prepare_management_interaction(interaction)
     if proxy is None:
         return
 
-    defaults = get_default_server_records()
-    if not defaults:
-        await interaction.followup.send("⚠️ No default server(s) set.")
-        return
+    if server:
+        record = SERVERS.get("servers", {}).get(server)
+        key = server
+        if not isinstance(record, dict):
+            await interaction.followup.send(
+                "⚠️ That server is not currently configured. "
+                "Choose one from the autocomplete list."
+            )
+            return
+    else:
+        defaults = get_default_server_records()
+        if not defaults:
+            await interaction.followup.send(
+                "⚠️ No default server(s) set. "
+                "Select a saved server with the `server` option."
+            )
+            return
+        key, record = defaults[0]
 
-    key, record = defaults[0]
     try:
         data = await asyncio.to_thread(
             get_server,
@@ -1981,6 +2159,18 @@ async def slash_debug(interaction: discord.Interaction):
         )
 
 
+@slash_debug.autocomplete("server")
+async def autocomplete_debug_server(
+    interaction: discord.Interaction,
+    current: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return []
+    if not can_manage(interaction.user):
+        return []
+    return default_server_choices(current, "all")
+
+
 @tree.command(name="reload", description="Reload config.json and servers.json")
 async def slash_reload(interaction: discord.Interaction):
     proxy = await prepare_management_interaction(interaction)
@@ -1989,7 +2179,7 @@ async def slash_reload(interaction: discord.Interaction):
 
     try:
         reload_runtime_config()
-        await asyncio.to_thread(backfill_server_platforms)
+        normalize_server_platform_metadata()
         lines = [
             f"✅ Configuration reloaded. Interval: "
             f"**{CONFIG['check_interval_seconds']} seconds**."
@@ -2005,62 +2195,162 @@ async def slash_reload(interaction: discord.Interaction):
         )
 
 
-@tree.command(name="addserverguid", description="Add a BF4 server using a GUID or Battlelog server URL")
-@discord.app_commands.describe(
-    name="Friendly server name",
-    guid="Raw Battlefield server GUID or full Battlelog server URL",
-    make_default="Also add this server to the default-server list",
+@tree.command(
+    name="addserver",
+    description="Add one or more Battlefield 4 servers using Battlelog server URLs",
 )
-async def slash_addserverguid(
+@discord.app_commands.describe(
+    server_urls="Paste one or more full Battlelog server URLs, separated by spaces or new lines",
+    make_default="Also add every successfully processed server to the default-server list",
+)
+async def slash_addserver(
     interaction: discord.Interaction,
-    name: str,
-    guid: str,
+    server_urls: str,
     make_default: bool = False,
 ):
     proxy = await prepare_management_interaction(interaction)
     if proxy is None:
         return
 
-    parsed_guid = extract_server_guid(guid)
-    if not parsed_guid:
+    references = [
+        item
+        for item in re.split(r"[\s,]+", server_urls.strip())
+        if item
+    ]
+    if not references:
         await interaction.followup.send(
-            "⚠️ No valid Battlefield server GUID was found in that value. "
-            "Paste either the raw GUID or the full Battlelog server URL."
+            "⚠️ Paste at least one full Battlelog server URL."
         )
         return
 
-    existing_key, _ = find_server(name)
-    guid_key, _ = find_server(parsed_guid)
-    if existing_key or guid_key:
+    results = []
+    activated_keys = []
+    changed = False
+
+    for reference in references:
+        parsed = parse_server_reference(reference)
+        if not parsed:
+            results.append(
+                "⚠️ Could not parse a Battlefield 4 Battlelog server URL: "
+                f"`{reference[:120]}`"
+            )
+            continue
+
+        guid = parsed["guid"]
+        existing_key, existing_record = find_server(guid)
+
+        if existing_key is not None:
+            metadata_changed = False
+
+            # Full Battlelog URLs are authoritative for platform metadata.
+            if parsed.get("platform_source") == "battlelog_url":
+                for field in (
+                    "platform",
+                    "platform_source",
+                    "battlelog_url",
+                ):
+                    value = parsed.get(field)
+                    if value and existing_record.get(field) != value:
+                        existing_record[field] = value
+                        metadata_changed = True
+
+                current_name = str(
+                    existing_record.get("name", "")
+                ).strip()
+                if not current_name or current_name.startswith("PC Server "):
+                    existing_record["name"] = parsed["name"]
+                    metadata_changed = True
+
+            newly_default = False
+            if (
+                make_default
+                and existing_key not in SERVERS["default_servers"]
+            ):
+                SERVERS["default_servers"].append(existing_key)
+                activated_keys.append(existing_key)
+                newly_default = True
+                changed = True
+
+            if metadata_changed:
+                changed = True
+
+            name = existing_record.get("name", existing_key)
+            platform = normalize_platform_label(
+                existing_record.get("platform", "Unknown")
+            )
+            if metadata_changed or newly_default:
+                detail = []
+                if metadata_changed:
+                    detail.append("platform metadata updated")
+                if newly_default:
+                    detail.append("added to defaults")
+                results.append(
+                    f"✅ Updated existing **{name}** ({platform}): "
+                    + ", ".join(detail)
+                    + "."
+                )
+            else:
+                results.append(
+                    f"ℹ️ **{name}** ({platform}) is already configured."
+                )
+            continue
+
+        name = parsed["name"]
+        key = unique_server_key(name)
+        record = {
+            "name": name,
+            "guid": guid,
+            "platform": parsed["platform"],
+            "platform_source": parsed["platform_source"],
+        }
+        if parsed.get("battlelog_url"):
+            record["battlelog_url"] = parsed["battlelog_url"]
+
+        SERVERS["servers"][key] = record
+        changed = True
+
+        if make_default:
+            SERVERS["default_servers"].append(key)
+            activated_keys.append(key)
+
+        results.append(
+            f"✅ Added **{name}** ({parsed['platform']}) — `{guid}`"
+            + (" and added to defaults." if make_default else ".")
+        )
+
+    if changed:
+        save_servers()
+
+    # New defaults are announced immediately. A failed announcement does not
+    # roll back the saved default state.
+    for key in activated_keys:
+        record = SERVERS["servers"].get(key, {})
+        try:
+            await activate_default_server(key)
+            results.append(
+                f"📣 Posted current status for "
+                f"**{record.get('name', key)}**."
+            )
+        except Exception as error:
+            results.append(
+                f"⚠️ **{record.get('name', key)}** is a default, but its "
+                f"immediate status announcement failed: "
+                f"`{type(error).__name__}`"
+            )
+
+    response_text = "\n".join(results)
+    for chunk in split_discord_message(response_text):
+        await interaction.followup.send(chunk)
+
+    for listing_chunk in split_discord_message(
+        current_server_list_text(),
+        limit=1750,
+    ):
         await interaction.followup.send(
-            "⚠️ That server name or GUID already exists in `servers.json`."
+            "Current servers:\n```text\n"
+            + listing_chunk
+            + "\n```"
         )
-        return
-
-    platform = platform_from_battlelog_url(guid)
-    if not platform:
-        platform = await asyncio.to_thread(
-            detect_platform_for_guid,
-            parsed_guid,
-            name,
-        )
-    platform = platform or "Unknown"
-
-    key = unique_server_key(name)
-    SERVERS["servers"][key] = {
-        "name": name.strip(),
-        "guid": parsed_guid,
-        "platform": platform,
-    }
-    if make_default and key not in SERVERS["default_servers"]:
-        SERVERS["default_servers"].append(key)
-
-    save_servers()
-    suffix = " and added it to the default servers" if make_default else ""
-    await interaction.followup.send(
-        f"✅ Added **{name}** — `{parsed_guid}` ({platform}){suffix}.\n"
-        "Current servers:\n" + current_server_list_text()
-    )
 
 
 @tree.command(name="delserverguid", description="Remove a non-default BF4 server")
@@ -2070,6 +2360,7 @@ async def slash_delserverguid(interaction: discord.Interaction, server: str):
         interaction,
         f'!delserverguid "{server}"',
     )
+
 
 
 def default_server_choices(current, mode):
@@ -2108,6 +2399,10 @@ defaultserver_group = discord.app_commands.Group(
 )
 
 
+def format_default_servers_block():
+    return "```text\n" + current_default_server_text() + "\n```"
+
+
 @defaultserver_group.command(name="add", description="Add a configured server to the default list")
 @discord.app_commands.describe(server="Choose a configured non-default server")
 async def slash_defaultserver_add(
@@ -2127,15 +2422,31 @@ async def slash_defaultserver_add(
 
     defaults = SERVERS["default_servers"]
     if server in defaults:
-        await interaction.followup.send("ℹ️ That server is already a default.")
+        await interaction.followup.send(
+            "ℹ️ That server is already a default.\n"
+            + format_default_servers_block()
+        )
         return
 
     defaults.append(server)
     save_servers()
     record = SERVERS["servers"][server]
+
+    announcement_note = ""
+    try:
+        await activate_default_server(server)
+        announcement_note = "\n📣 Current status was posted immediately."
+    except Exception as error:
+        announcement_note = (
+            "\n⚠️ The server was added as a default, but the immediate "
+            f"status announcement failed: `{type(error).__name__}`"
+        )
+
     await interaction.followup.send(
-        f"✅ Added **{record.get('name', server)}** to the default servers.\n"
-        "Default servers:\n" + current_default_server_text()
+        f"✅ Added **{record.get('name', server)}** to the default servers."
+        + announcement_note
+        + "\n**Default servers:**\n"
+        + format_default_servers_block()
     )
 
 
@@ -2169,12 +2480,27 @@ async def slash_defaultserver_remove(
         )
         return
 
+    record = SERVERS["servers"].get(server, {})
     defaults.remove(server)
     save_servers()
-    record = SERVERS["servers"].get(server, {})
+
+    cleanup_note = ""
+    try:
+        await deactivate_default_server(server, record)
+        cleanup_note = "\n🧹 Its current automatic announcement was removed."
+    except Exception as error:
+        LAST_MAPS.pop(server, None)
+        LAST_DEFAULT_STATUSES.pop(server, None)
+        cleanup_note = (
+            "\n⚠️ The server was removed from defaults, but announcement "
+            f"cleanup failed: `{type(error).__name__}`"
+        )
+
     await interaction.followup.send(
-        f"✅ Removed **{record.get('name', server)}** from the default servers.\n"
-        "Default servers:\n" + current_default_server_text()
+        f"✅ Removed **{record.get('name', server)}** from the default servers."
+        + cleanup_note
+        + "\n**Default servers:**\n"
+        + format_default_servers_block()
     )
 
 
@@ -2196,7 +2522,7 @@ async def slash_defaultserver_list(interaction: discord.Interaction):
     if proxy is None:
         return
     await interaction.followup.send(
-        "**Default servers:**\n" + current_default_server_text()
+        "**Default servers:**\n" + format_default_servers_block()
     )
 
 
@@ -2345,25 +2671,34 @@ async def on_message(message):
 
             defaults = get_default_server_records()
             if not defaults:
-                await channel.send("⚠️ **No default server(s) set**")
+                await message.channel.send("⚠️ No default server(s) set.")
                 return
 
+            sent = 0
+            failures = []
             for key, record in defaults:
                 server_name = str(record.get("name", key))
-                server_guid = str(record.get("guid", "")).strip()
-                status = await asyncio.to_thread(
-                    get_server_status,
-                    None,
-                    server_guid,
-                )
-                await channel.send(
-                    build_message(
-                        "BF4 Map Change",
-                        status,
-                        server_name=server_name,
+                try:
+                    await post_server_announcement(
+                        channel,
+                        key,
+                        record,
+                        manual=True,
+                        seed_cache=False,
                     )
-                    + version_update_notice()
-                )
+                    sent += 1
+                except Exception as error:
+                    failures.append(
+                        f"{server_name}: {type(error).__name__}"
+                    )
+
+            summary = (
+                f"✅ Posted **{sent}** temporary announcement(s). "
+                "They will automatically delete after **10 minutes**."
+            )
+            if failures:
+                summary += "\n⚠️ Failed:\n" + "\n".join(failures)
+            await message.channel.send(summary)
             return
 
 

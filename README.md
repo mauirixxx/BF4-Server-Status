@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.0
+# BF4 Server Watcher v1.3.1
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -130,24 +130,24 @@ The normal snapshot-based status fields have been observed working across these 
 
 ## Server platform detection
 
-Each saved server now has a `platform` field:
+`/addserver` is the normal way to add BF4 servers. Paste one or more **full Battlelog server URLs** into the command. ServerWatcher extracts the GUID, server name, and platform from each URL.
 
-```json
-{
-  "name": "Sloth Alliance Classics",
-  "guid": "97723370-122b-4ef4-951c-199dd92d0662",
-  "platform": "PS4/5"
-}
+Example Battlelog platform segments are interpreted as:
+
+```text
+/pc/       -> PC
+/ps4/      -> PS4/5
+/xboxone/  -> XBox
+/xbox360/  -> XBox
 ```
 
-`/addserverguid` accepts either:
+Full Battlelog URLs are required in the documented workflow because the Keeper snapshot does not provide reliable platform metadata and a GUID by itself cannot reliably distinguish console platforms.
 
-- a raw BF4 server GUID, or
-- a full Battlelog server URL.
+v1.3.0 used an unreliable raw-GUID platform probe that could incorrectly label console servers as PC. On the first v1.3.1 load, unverified v1.3.0 `PC` values are reset to `Unknown` rather than guessed. The bundled AAA record remains known PC, and explicit PS4/5/XBox values are preserved.
 
-If a Battlelog URL is supplied, ServerWatcher extracts the GUID and uses the platform segment in the URL. If only a raw GUID is supplied, ServerWatcher performs a best-effort Battlelog platform lookup.
+To repair an existing server whose platform becomes `Unknown`, run `/addserver` with that server's full Battlelog URL. If the GUID already exists, ServerWatcher updates the existing record's platform metadata instead of creating a duplicate.
 
-At startup and after `/reload`, existing saved servers with a missing or unknown platform are checked for platform backfill. A failed lookup is logged rather than guessed.
+Saved URL-derived records include platform provenance and the Battlelog URL so future releases do not need to guess the platform again.
 
 ## Multiple default servers
 
@@ -187,6 +187,26 @@ Named `!status <server>` lookups and `/status all` continue to work with zero de
 
 Each default server is monitored independently. A map change on one default server does not require the others to change, and old automatic announcements are cleaned up per server rather than globally.
 
+When `/defaultserver add` activates a server, ServerWatcher immediately fetches its current status, posts its current automatic announcement, and seeds the watcher cache so the next polling cycle does not create a false map-change announcement.
+
+When `/defaultserver remove` removes a server, its current automatic announcement and cached watcher state are removed immediately. If that leaves zero defaults, the announcement channel receives the normal `No default server(s) set` notice.
+
+## Adding servers
+
+Use `/addserver` and paste one or more full Battlelog server URLs into `server_urls`.
+
+For a single server:
+
+```text
+/addserver server_urls:https://battlelog.battlefield.com/bf4/servers/show/ps4/<guid>/<server-name>/
+```
+
+For multiple servers, paste several URLs separated by spaces or new lines. The command processes each URL independently, so one invalid or duplicate item does not abort the entire batch.
+
+If `make_default:true` is selected, every successfully processed server is also added to `default_servers` and receives an immediate current-status announcement.
+
+If a supplied URL matches a GUID already stored in `servers.json`, ServerWatcher uses the URL to repair/update that existing record's trusted platform metadata rather than creating a duplicate.
+
 ## Platform-aware server lists
 
 `!list` displays platform labels in a fixed-width code block:
@@ -222,17 +242,17 @@ When a newer version is known, automatic map-change announcements include the av
 - `!status` — status for every configured default server, or `No default server(s) set`.
 - `!status <server-name>` — exact/partial saved-server lookup with per-user numbered selection for ambiguous matches.
 - `!version` — installed/latest version and update status.
-- `!announce` — management-only chat alias for `/announce`.
+- `!announce` — management-only chat alias for `/announce`; manually posted announcements automatically delete after 10 minutes.
 
 ## Management commands
 
 Management slash commands require `management_min_role_id` or higher. Discord Administrators and the server owner always bypass that role threshold.
 
 - `/status all` — status for every configured server.
-- `/announce` — post current map-style status for every default server.
-- `/debug` — Keeper diagnostics for the first configured default server.
-- `/reload` — reload configuration/server registry and retry platform backfill.
-- `/addserverguid name:<name> guid:<GUID-or-Battlelog-URL> [make_default:true]` — add a server, detect/store platform, and optionally add it to the default list.
+- `/announce` — temporarily post current map-style status for every default server; each manual announcement automatically deletes after 10 minutes.
+- `/debug [server:<selection>]` — Keeper diagnostics for any saved server using autocomplete; with no selection it uses the first configured default.
+- `/reload` — reload configuration/server registry and normalize saved platform metadata without guessing from raw GUIDs.
+- `/addserver server_urls:<Battlelog URLs> [make_default:true]` — add or repair one or more servers from full Battlelog URLs. URLs may be separated by spaces or new lines. `make_default:true` applies to every successfully processed server.
 - `/delserverguid server:<name-or-guid>` — remove a non-default server.
 - `/defaultserver add server:<selection>` — add a server to defaults using autocomplete.
 - `/defaultserver remove server:<selection>` — remove a server from defaults using autocomplete.
@@ -248,6 +268,12 @@ Management slash commands require `management_min_role_id` or higher. Discord Ad
 - `/confirm`
 - `/cancel`
 
+## Manual announcement cleanup
+
+Manual announcements created by `/announce` or `!announce` are temporary. Each message is scheduled for deletion after **10 minutes (600 seconds)**.
+
+Automatic map-change announcements are not affected by this timer. They continue to use the normal per-server lifecycle: replacement on that server's next map change, or immediate removal when the server is removed from the default list.
+
 ## Rotating Discord presence
 
 The bot rotates its custom activity every 30 seconds across all currently cached default servers, followed by the bot version. For two defaults, the cycle can look like:
@@ -257,7 +283,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.0
+BF4 Server Watcher v1.3.1
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.

@@ -1,4 +1,5 @@
 {
+  "platform_metadata_version": 2,
   "default_servers": [
     "aaa"
   ],
@@ -6,7 +7,8 @@
     "aaa": {
       "name": "AAA",
       "guid": "28773abe-e620-4d36-9512-c6f4b128f0ad",
-      "platform": "PC"
+      "platform": "PC",
+      "platform_source": "bundled"
     }
   }
 }

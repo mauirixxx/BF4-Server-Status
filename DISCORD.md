@@ -208,9 +208,11 @@ ServerWatcher has been successfully tested with Battlefield 4 servers on PC, Pla
 
 
 
-## v1.3.0 server management
+## v1.3.1 server management
 
-`/addserverguid` accepts either a raw Battlefield server GUID or a full Battlelog server URL. ServerWatcher extracts the GUID and attempts to detect/store the server platform automatically.
+Use `/addserver` to add BF4 servers. Paste one or more full Battlelog server URLs into the `server_urls` field. ServerWatcher extracts the GUID, derives the server name, and trusts the platform encoded in the Battlelog URL.
+
+`make_default:true` applies to every successfully processed URL in that command.
 
 Default-server management uses:
 
@@ -220,6 +222,18 @@ Default-server management uses:
 /defaultserver list
 ```
 
-The add/remove subcommands use Discord autocomplete so administrators can choose from the servers already saved in `servers.json`.
+The add/remove subcommands use Discord autocomplete.
 
-ServerWatcher allows zero, one, or multiple default servers. With zero defaults, named `!status <server>` lookups and `/status all` still work, while automatic default-server monitoring waits until at least one default is configured.
+Adding a default immediately posts its current automatic status announcement. Removing a default immediately removes that server's current automatic announcement and cached watcher state.
+
+`/debug` has an optional saved-server autocomplete selector. With no selection it uses the first configured default server.
+
+Manual `/announce` and `!announce` messages automatically delete after 10 minutes.
+
+ServerWatcher allows zero, one, or multiple default servers. Named `!status <server>` lookups and `/status all` still work when no defaults are configured.
+
+### v1.3.0 platform metadata repair
+
+v1.3.0 could incorrectly label console servers as PC because its platform probe was not reliable. v1.3.1 does not guess console platform from a raw GUID.
+
+On first v1.3.1 load, unverified v1.3.0 PC labels are reset to `Unknown`. Re-run `/addserver` with the full Battlelog URL for an existing server to repair its platform metadata; matching GUIDs are updated instead of duplicated.
