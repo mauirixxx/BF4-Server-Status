@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.2"
+BOT_VERSION = "v1.3.3"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -1362,7 +1362,19 @@ def current_map_role_list_text(guild):
     for map_name, entry in CONFIG.get("map_role_pings", {}).items():
         if not isinstance(entry, dict):
             continue
-        lines.append(f"{map_name} — {format_role_setting(guild, entry.get('role_id', 0))}")
+        role_text = format_role_setting(
+            guild,
+            entry.get("role_id", 0),
+        )
+        message_text = " ".join(
+            str(
+                entry.get("message")
+                or f"{map_name} is now live!"
+            ).splitlines()
+        )
+        lines.append(
+            f'{map_name} — {role_text} - "{message_text}"'
+        )
     return "\n".join(lines) if lines else "None"
 
 
@@ -1518,6 +1530,7 @@ def build_help_messages(member):
         "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
         "`/setinterval` — change the polling interval (minimum 10 seconds).",
         "`/setmaprole` — immediately set or disable a map-specific role/message.",
+        "`/editmaprole` — edit an existing map role; optionally replace its role and edit its current message in a pre-filled dialog.",
         "`/delmaprole` — immediately delete a configured map role ping.",
     ])
 
@@ -2632,6 +2645,196 @@ async def slash_setmaprole(
         + "\nCurrent map role pings:\n"
         + current_map_role_list_text(interaction.guild)
     )
+
+
+async def validate_modal_management_interaction(
+    interaction: discord.Interaction,
+):
+    """Validate a management interaction without deferring, so a modal can open."""
+    if (
+        interaction.guild is None
+        or not isinstance(interaction.user, discord.Member)
+    ):
+        await interaction.response.send_message(
+            "⛔ Management commands can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return False
+
+    if not can_manage(interaction.user):
+        await interaction.response.send_message(
+            "⛔ You do not have permission to use that management command.",
+            ephemeral=True,
+        )
+        return False
+
+    announcement_id = int(
+        CONFIG.get("announcement_channel_id", 0)
+    )
+    allowed_ids = listen_channel_ids()
+    if announcement_id:
+        allowed_ids.add(announcement_id)
+
+    if interaction.channel_id not in allowed_ids:
+        await interaction.response.send_message(
+            "⛔ Management commands may only be used in the configured "
+            "announcement channel or a configured listen channel.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
+class EditMapRoleModal(discord.ui.Modal):
+    def __init__(
+        self,
+        map_name: str,
+        guild: discord.Guild,
+        replacement_role_id: int | None,
+    ):
+        self.map_name = map_name
+        self.guild = guild
+        self.replacement_role_id = replacement_role_id
+
+        entry = CONFIG.get("map_role_pings", {}).get(
+            map_name,
+            {},
+        )
+        current_message = str(
+            entry.get("message")
+            or f"{map_name} is now live!"
+        )
+
+        super().__init__(
+            title=f"Edit map role — {map_name}"[:45]
+        )
+
+        self.message_input = discord.ui.TextInput(
+            label="Map ping message",
+            style=discord.TextStyle.paragraph,
+            default=current_message[:4000],
+            required=True,
+            min_length=1,
+            max_length=4000,
+        )
+        self.add_item(self.message_input)
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ):
+        entry = CONFIG.get("map_role_pings", {}).get(
+            self.map_name
+        )
+        if not isinstance(entry, dict):
+            await interaction.response.send_message(
+                f"⚠️ The map role for **{self.map_name}** no longer exists.",
+                ephemeral=True,
+            )
+            return
+
+        if self.replacement_role_id is not None:
+            entry["role_id"] = self.replacement_role_id
+
+        entry["message"] = str(self.message_input.value).strip()
+        save_config()
+
+        role_text = (
+            "Disabled (0)"
+            if int(entry.get("role_id", 0) or 0) == 0
+            else format_role_setting(
+                self.guild,
+                entry.get("role_id", 0),
+            )
+        )
+
+        await interaction.response.send_message(
+            f"✅ Updated map role ping for **{self.map_name}**.\n"
+            f"Role: **{role_text}**\n"
+            f'Message: **"{entry["message"]}"**\n'
+            "Current map role pings:\n"
+            + current_map_role_list_text(self.guild),
+            ephemeral=True,
+        )
+
+
+@tree.command(
+    name="editmaprole",
+    description="Edit an existing map-role ping",
+)
+@discord.app_commands.describe(
+    map_name="Choose an existing configured map role",
+    role="Optional replacement role; leave blank to keep the current role",
+)
+async def slash_editmaprole(
+    interaction: discord.Interaction,
+    map_name: str,
+    role: discord.Role | None = None,
+):
+    if not await validate_modal_management_interaction(
+        interaction
+    ):
+        return
+
+    matches = configured_map_role_matches(map_name)
+    if not matches:
+        await interaction.response.send_message(
+            f"⚠️ No configured map role ping matched **{map_name}**.",
+            ephemeral=True,
+        )
+        return
+    if len(matches) > 1:
+        await interaction.response.send_message(
+            f"⚠️ Multiple configured maps matched **{map_name}**:\n"
+            + "\n".join(matches)
+            + "\nChoose one from the autocomplete list.",
+            ephemeral=True,
+        )
+        return
+
+    resolved_map = matches[0]
+    await interaction.response.send_modal(
+        EditMapRoleModal(
+            resolved_map,
+            interaction.guild,
+            role.id if role is not None else None,
+        )
+    )
+
+
+@slash_editmaprole.autocomplete("map_name")
+async def autocomplete_editmaprole(
+    interaction: discord.Interaction,
+    current: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return []
+    if not can_manage(interaction.user):
+        return []
+
+    current_text = str(current or "").strip().casefold()
+    choices = []
+    for map_name in sorted(
+        name
+        for name, entry
+        in CONFIG.get("map_role_pings", {}).items()
+        if isinstance(entry, dict)
+    ):
+        if (
+            current_text
+            and current_text not in map_name.casefold()
+        ):
+            continue
+        choices.append(
+            discord.app_commands.Choice(
+                name=map_name[:100],
+                value=map_name,
+            )
+        )
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 @tree.command(name="delmaprole", description="Delete a configured map role ping immediately")

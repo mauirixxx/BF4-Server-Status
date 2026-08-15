@@ -4,6 +4,19 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.3] - 2026-08-15
+
+### Added
+- Added `/editmaprole` for editing an existing configured map-role ping.
+- Added configured-map autocomplete to `/editmaprole`.
+- Added an optional Discord role selector to `/editmaprole`; leaving it blank preserves the existing configured role.
+- Added a pre-filled Discord modal for editing the current map-role message.
+- Added map-role messages to the administrator `!help` current-configuration output.
+
+### Changed
+- Map-role entries in `!help` now remain compact and display the configured/default message on the same line, for example: `Operation Metro 2014 — @TFA (...) - "Operation Metro 2014 is now live!"`.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.3.
+
 ## [v1.3.2] - 2026-08-15
 
 ### Added

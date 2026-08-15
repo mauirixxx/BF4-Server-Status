@@ -248,3 +248,12 @@ On first v1.3.1 load, unverified v1.3.0 PC labels are reset to `Unknown`. Re-run
 - Multi-server lists sort PC first, then PS4/5, XBox, and Unknown, with alphabetical sorting inside each platform.
 - Unknown platforms are displayed explicitly as `(Unknown)`.
 - Startup logs include the slash-command names returned by Discord after synchronization.
+
+
+## v1.3.3 map-role editing
+
+`/editmaprole` edits an existing configured map-role ping. Choose the map from autocomplete, optionally select a replacement Discord role, and submit the command. ServerWatcher then opens a modal with the existing/default map ping message pre-filled.
+
+Leaving the optional role blank preserves the existing role. The edited message is saved immediately when the modal is submitted.
+
+Administrator `!help` output displays each configured map-role ping on one line with its role and configured/default message.

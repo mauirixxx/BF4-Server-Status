@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.2
+# BF4 Server Watcher v1.3.3
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -268,8 +268,23 @@ Management slash commands require `management_min_role_id` or higher. Discord Ad
 - `/setmanagementrole [role:<role>]`
 - `/setstatusrole [role:<role>]`
 - `/setinterval seconds:<seconds>`
-- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — apply the map-role change immediately.
+- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — create or replace a map-role configuration immediately.
+- `/editmaprole map_name:<selection> [role:<role>]` — select an existing configured map via autocomplete, optionally choose a replacement role, then edit the current message in a pre-filled modal. Leaving the role blank preserves the existing role.
 - `/delmaprole map_search:<map>` — delete the selected configured map-role mapping immediately.
+
+## Editing map-role pings
+
+`/editmaprole` is for changing an existing configured map-role ping without deleting/recreating it.
+
+The `map_name` option autocompletes only maps that already have a configured map-role entry. The optional `role` option uses Discord's normal role picker. Leave it blank to preserve the current role.
+
+After submitting `/editmaprole`, ServerWatcher opens a modal with the currently configured message (or the default `<map> is now live!` message) already filled in. Edit the text and submit the modal to save the change.
+
+The administrator `!help` current-configuration output shows each map role, role ID, and message on one line, for example:
+
+```text
+Operation Metro 2014 — @TFA (1529396067072868444) - "Operation Metro 2014 is now live!"
+```
 
 ## Manual announcement cleanup
 
@@ -286,7 +301,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.2
+BF4 Server Watcher v1.3.3
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.
