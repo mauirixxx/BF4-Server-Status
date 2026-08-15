@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.1"
+BOT_VERSION = "v1.3.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -188,7 +188,7 @@ def parse_battlelog_server_url(value):
     path_match = re.fullmatch(
         r"/bf4/servers/show/(pc|ps4|xboxone|xbox360)/"
         r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/([^/?#]+)/?",
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/([^/?#]+))?/?",
         parsed.path,
         flags=re.IGNORECASE,
     )
@@ -197,15 +197,18 @@ def parse_battlelog_server_url(value):
 
     platform_path = path_match.group(1).lower()
     guid = path_match.group(2).lower()
-    slug = unquote(path_match.group(3)).strip()
+    raw_slug = path_match.group(3)
+    slug = unquote(raw_slug).strip() if raw_slug else ""
     derived_name = re.sub(r"[-_]+", " ", slug).strip()
     derived_name = re.sub(r"\s+", " ", derived_name)
     if not derived_name:
-        derived_name = f"BF4 Server {guid[:8]}"
+        platform_label = PLATFORM_URL_LABELS[platform_path]
+        derived_name = f"{platform_label} Server {guid[:8]}"
 
     canonical_url = (
         "https://battlelog.battlefield.com/bf4/servers/show/"
-        f"{platform_path}/{guid}/{path_match.group(3)}/"
+        f"{platform_path}/{guid}/"
+        + (f"{raw_slug}/" if raw_slug else "")
     )
     return {
         "guid": guid,
@@ -250,10 +253,40 @@ def platform_from_battlelog_url(value):
     return parsed["platform"] if parsed else None
 
 
-def platform_prefix(record):
+PLATFORM_SORT_ORDER = {
+    "PC": 0,
+    "PS4/5": 1,
+    "XBox": 2,
+    "Unknown": 3,
+}
+
+
+def platform_display_label(record):
     platform = normalize_platform_label(record.get("platform", "Unknown"))
-    label = f"({platform})" if platform != "Unknown" else "(?)"
-    return label.ljust(7)
+    return f"({platform})"
+
+
+def server_sort_key(item):
+    key, record = item
+    platform = normalize_platform_label(record.get("platform", "Unknown"))
+    name = str(record.get("name", key)).casefold()
+    return (
+        PLATFORM_SORT_ORDER.get(platform, 99),
+        name,
+        str(key).casefold(),
+    )
+
+
+def sorted_server_items(items=None):
+    if items is None:
+        items = SERVERS.get("servers", {}).items()
+    return sorted(list(items), key=server_sort_key)
+
+
+def sorted_default_server_records():
+    return sorted_server_items(get_default_server_records())
+
+
 
 
 def repair_v130_platform_metadata(servers):
@@ -842,7 +875,6 @@ LAST_MAPS = {}
 LAST_DEFAULT_STATUSES = {}
 NO_DEFAULT_ANNOUNCED = False
 watcher_started = False
-PENDING_ADMIN_CHANGES = {}
 PENDING_STATUS_SELECTIONS = {}
 
 
@@ -1188,7 +1220,15 @@ async def on_ready():
 
     try:
         synced = await tree.sync()
-        print(f"Slash commands synced: {len(synced)}", flush=True)
+        synced_names = ", ".join(
+            f"/{command.name}"
+            for command in synced
+        )
+        print(
+            f"Slash commands synced: {len(synced)}"
+            + (f" — {synced_names}" if synced_names else ""),
+            flush=True,
+        )
     except Exception as error:
         print(f"WARNING: Slash command sync failed: {type(error).__name__}: {error}", flush=True)
 
@@ -1263,30 +1303,57 @@ def format_role_setting(guild, role_id):
     return f"@{role.name} ({role_id})" if role else str(role_id)
 
 
+def format_server_records(records, include_guids=True, mark_defaults=True):
+    rows = []
+    default_keys = set(get_default_server_keys())
+
+    for key, record in sorted_server_items(records):
+        if not isinstance(record, dict):
+            continue
+        platform = platform_display_label(record)
+        name = str(record.get("name", key))
+        guid = str(record.get("guid", "missing GUID"))
+        marker = " (default)" if mark_defaults and key in default_keys else ""
+        rows.append((platform, name, guid, marker))
+
+    if not rows:
+        return "None"
+
+    platform_width = max(len(row[0]) for row in rows)
+    name_width = max(len(row[1]) for row in rows)
+
+    lines = []
+    for platform, name, guid, marker in rows:
+        if include_guids:
+            lines.append(
+                f"{platform.ljust(platform_width)} - "
+                f"{name.ljust(name_width)} — {guid}{marker}"
+            )
+        else:
+            lines.append(
+                f"{platform.ljust(platform_width)} - {name}{marker}"
+            )
+    return "\n".join(lines)
+
+
 def current_default_server_text():
     defaults = get_default_server_records()
     if not defaults:
         return "No default server(s) set"
-    return "\n".join(
-        f"{platform_prefix(record)} - {record.get('name', key)} — {record.get('guid', 'missing GUID')}"
-        for key, record in defaults
+    return format_server_records(
+        defaults,
+        include_guids=True,
+        mark_defaults=False,
     )
 
 
 def current_server_list_text(include_guids=True):
-    lines = []
-    default_keys = set(get_default_server_keys())
-    for key, record in SERVERS.get("servers", {}).items():
-        marker = " (default)" if key in default_keys else ""
-        prefix = platform_prefix(record)
-        name = record.get("name", key)
-        if include_guids:
-            lines.append(
-                f"{prefix} - {name} — {record.get('guid', 'missing GUID')}{marker}"
-            )
-        else:
-            lines.append(f"{prefix} - {name}{marker}")
-    return "\n".join(lines) if lines else "None"
+    return format_server_records(
+        SERVERS.get("servers", {}).items(),
+        include_guids=include_guids,
+        mark_defaults=True,
+    )
+
 
 
 
@@ -1389,21 +1456,6 @@ def parse_channel_arguments(guild, payload):
     return resolved, ambiguous, missing
 
 
-def pending_admin_change_text(pending):
-    action = pending.get("action")
-    if action == "set_map_role":
-        return f"set map role for {pending.get('map_name', 'unknown map')}"
-    if action == "delete_map_role":
-        return f"delete map role for {pending.get('map_name', 'unknown map')}"
-    if action == "delete_listen_channels":
-        return "remove listen channel(s)"
-    return "administrative change"
-
-
-def can_stage_admin_change(user_id):
-    return PENDING_ADMIN_CHANGES.get(user_id)
-
-
 def current_listen_channel_text(guild):
     ids = sorted(listen_channel_ids())
     if not ids:
@@ -1456,18 +1508,17 @@ def build_help_messages(member):
         "`/debug` — show Keeper diagnostic information for a selected saved server.",
         "`/reload` — reload `config.json` and `servers.json`.",
         "`/addserver` — add one or more servers from full Battlelog server URLs; optional `make_default` applies to all successful additions.",
-        "`/delserverguid` — remove a non-default server.",
+        "`/delserver` — select and immediately delete a configured non-default server.",
+        "`/renameserver` — select a configured server and give it a new display name.",
         "`/defaultserver add|remove|list` — manage zero, one, or multiple default servers with autocomplete.",
         "`/setannouncementchannel` — change the announcement channel.",
         "`/addlistenchannel` — add one or more regular-user command channels.",
-        "`/dellistenchannel` — stage removal of one or more regular-user command channels.",
+        "`/dellistenchannel` — immediately remove one or more regular-user command channels.",
         "`/setmanagementrole` — change the management minimum role.",
         "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
         "`/setinterval` — change the polling interval (minimum 10 seconds).",
-        "`/setmaprole` — stage a map-specific role/message change.",
-        "`/delmaprole` — stage deletion of a configured map role ping.",
-        "`/confirm` — apply your pending administrative change.",
-        "`/cancel` — discard your pending administrative change.",
+        "`/setmaprole` — immediately set or disable a map-specific role/message.",
+        "`/delmaprole` — immediately delete a configured map role ping.",
     ])
 
     current_config = "\n\n".join([
@@ -1580,36 +1631,6 @@ async def handle_management_command(message, raw, lowered):
         await message.channel.send("\n".join(lines))
         return True
 
-    if lowered.startswith("!delserverguid"):
-        if not await require_management(message, "!delserverguid"):
-            return True
-        parts = raw.split(maxsplit=1)
-        if len(parts) != 2:
-            await message.channel.send(
-                "Usage: `!delserverguid <name-or-guid>`\n"
-                "Current servers:\n" + current_server_list_text()
-            )
-            return True
-        key, record = find_server(parts[1].strip().strip('"').strip("'"))
-        if key is None:
-            await message.channel.send("⚠️ No matching server was found in `servers.json`.")
-            return True
-        if key in set(get_default_server_keys()):
-            await message.channel.send(
-                "⛔ You cannot delete a current default server. "
-                "Use `/defaultserver remove` first."
-            )
-            return True
-        name = str(record.get("name", key))
-        guid = str(record.get("guid", ""))
-        del SERVERS["servers"][key]
-        save_servers()
-        await message.channel.send(
-            f"✅ Removed **{name}** — `{guid}` from `servers.json`.\n"
-            "Current servers:\n" + current_server_list_text()
-        )
-        return True
-
     if lowered.startswith("!setdefaultserver"):
         await message.channel.send(
             "ℹ️ v1.3.0 uses `/defaultserver add`, `/defaultserver remove`, "
@@ -1686,54 +1707,6 @@ async def handle_management_command(message, raw, lowered):
         await message.channel.send("\n".join(lines))
         return True
 
-    if lowered.startswith("!dellistenchannel"):
-        if not await require_management(message, "!dellistenchannel"):
-            return True
-        existing_pending = can_stage_admin_change(message.author.id)
-        if existing_pending:
-            await message.channel.send(
-                f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `/confirm` or `/cancel` before starting another confirmation-required change."
-            )
-            return True
-        payload = raw[len("!dellistenchannel"):].strip()
-        if not payload:
-            await message.channel.send(
-                "Usage: `!dellistenchannel <channel> [channel...]`\n"
-                "Each channel may be a mention, numeric ID, or exact channel name. Quote names containing spaces.\n"
-                "Current listen channels:\n" + current_listen_channel_text(message.guild)
-            )
-            return True
-        channels, ambiguous, missing = parse_channel_arguments(message.guild, payload)
-        configured_ids = listen_channel_ids()
-        removable = [channel for channel in channels if channel.id in configured_ids]
-        not_configured = [channel for channel in channels if channel.id not in configured_ids]
-        report = []
-        for token, matches in ambiguous:
-            report.append(
-                f"⚠️ Multiple channels matched **{token}**:\n" +
-                "\n".join(f"#{c.name} — `{c.id}`" for c in matches)
-            )
-        if missing:
-            report.append("⚠️ Could not resolve:\n" + "\n".join(missing))
-        if not_configured:
-            report.append("Not currently configured:\n" + "\n".join(f"#{c.name} (`{c.id}`)" for c in not_configured))
-        if not removable:
-            report.append("⚠️ No configured listen channels were selected for removal.")
-            report.append("Current listen channels:\n" + current_listen_channel_text(message.guild))
-            await message.channel.send("\n".join(report))
-            return True
-        PENDING_ADMIN_CHANGES[message.author.id] = {
-            "action": "delete_listen_channels",
-            "channel_ids": [channel.id for channel in removable],
-        }
-        report.insert(0, "The following listen channels will be removed:\n" + "\n".join(
-            f"#{c.name} (`{c.id}`)" for c in removable
-        ))
-        report.append("\nType `/confirm` to remove them.\nType `/cancel` to discard this change.")
-        await message.channel.send("\n".join(report))
-        return True
-
     if lowered.startswith("!setmanagementrole"):
         if not await require_management(message, "!setmanagementrole"):
             return True
@@ -1788,163 +1761,6 @@ async def handle_management_command(message, raw, lowered):
         CONFIG["check_interval_seconds"] = seconds
         save_config()
         await message.channel.send(f"✅ Check interval updated to **{seconds} seconds**.")
-        return True
-
-    if lowered.startswith("!setmaprole"):
-        if not await require_management(message, "!setmaprole"):
-            return True
-        existing_pending = can_stage_admin_change(message.author.id)
-        if existing_pending:
-            await message.channel.send(
-                f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `/confirm` or `/cancel` first."
-            )
-            return True
-        payload = raw[len("!setmaprole"):].strip()
-        try:
-            tokens = shlex.split(payload)
-        except ValueError as error:
-            await message.channel.send(f"⚠️ Could not parse command: {error}")
-            return True
-        role_index = None
-        for index, token in enumerate(tokens):
-            if token == "0" or re.fullmatch(r"<@&\d{15,22}>", token) or re.fullmatch(r"\d{15,22}", token):
-                role_index = index
-                break
-        if role_index is None or role_index == 0:
-            await message.channel.send(
-                "Usage: `!setmaprole <map-search> <@role-or-id> [\"optional message\"]`\n"
-                "Current map role pings:\n" + current_map_role_list_text(message.guild)
-            )
-            return True
-        query = " ".join(tokens[:role_index]).strip()
-        role_id = parse_discord_id(tokens[role_index])
-        custom_message = " ".join(tokens[role_index + 1:]).strip() or None
-        matches = map_name_matches(query.strip('"').strip("'"))
-        if not matches:
-            await message.channel.send(
-                f"⚠️ No map in `maps.json` matched **{query}**. Try a more recognizable part of the map name."
-            )
-            return True
-        if len(matches) > 1:
-            await message.channel.send(
-                f"⚠️ Multiple maps matched **{query}**:\n" + "\n".join(matches) +
-                "\nPlease use a more specific map search."
-            )
-            return True
-        map_name = matches[0]
-        PENDING_ADMIN_CHANGES[message.author.id] = {
-            "action": "set_map_role",
-            "map_name": map_name,
-            "role_id": role_id,
-            "message": custom_message,
-        }
-        role_text = format_role_setting(message.guild, role_id) if role_id else "Disabled (0)"
-        message_text = custom_message or f"{map_name} is now live!"
-        await message.channel.send(
-            f"Suggested match: **{map_name}**\n"
-            f"Role: **{role_text}**\n"
-            f"Message: **{message_text}**" + ("" if custom_message else " *(default)*") + "\n\n"
-            "Type `/confirm` to save this change.\nType `/cancel` to discard it."
-        )
-        return True
-
-    if lowered.startswith("!delmaprole"):
-        if not await require_management(message, "!delmaprole"):
-            return True
-        existing_pending = can_stage_admin_change(message.author.id)
-        if existing_pending:
-            await message.channel.send(
-                f"⚠️ You already have a pending **{pending_admin_change_text(existing_pending)}**. "
-                "Use `/confirm` or `/cancel` first."
-            )
-            return True
-        query = raw[len("!delmaprole"):].strip().strip('"').strip("'")
-        if not query:
-            await message.channel.send(
-                "Usage: `!delmaprole <map-search>`\nCurrent map role pings:\n" +
-                current_map_role_list_text(message.guild)
-            )
-            return True
-        matches = configured_map_role_matches(query)
-        if not matches:
-            await message.channel.send(f"⚠️ No configured map role ping matched **{query}**.")
-            return True
-        if len(matches) > 1:
-            await message.channel.send(
-                f"⚠️ Multiple configured maps matched **{query}**:\n" + "\n".join(matches) +
-                "\nPlease use a more specific map search."
-            )
-            return True
-        map_name = matches[0]
-        entry = CONFIG["map_role_pings"][map_name]
-        PENDING_ADMIN_CHANGES[message.author.id] = {"action": "delete_map_role", "map_name": map_name}
-        await message.channel.send(
-            f"Suggested match: **{map_name}**\n"
-            f"Current role: **{format_role_setting(message.guild, entry.get('role_id', 0))}**\n"
-            "This will remove the configured map role ping.\n\n"
-            "Type `/confirm` to remove it.\nType `/cancel` to discard this change."
-        )
-        return True
-
-    if lowered == "!confirm":
-        if not await require_management(message, "!confirm"):
-            return True
-        pending = PENDING_ADMIN_CHANGES.pop(message.author.id, None)
-        if not pending:
-            await message.channel.send("⚠️ You do not have a pending administrative change.")
-            return True
-
-        action = pending.get("action")
-        if action == "delete_listen_channels":
-            remove_ids = set(int(x) for x in pending.get("channel_ids", []))
-            current = [int(x) for x in CONFIG.get("listen_channel_id", [0]) if int(x) not in remove_ids and int(x) != 0]
-            CONFIG["listen_channel_id"] = current or [0]
-            save_config()
-            await message.channel.send(
-                "✅ Listen channel removal applied.\nCurrent listen channels:\n" +
-                current_listen_channel_text(message.guild)
-            )
-            return True
-
-        map_name = pending.get("map_name")
-        if action == "delete_map_role":
-            CONFIG["map_role_pings"].pop(map_name, None)
-            save_config()
-            await message.channel.send(
-                f"✅ Removed map role ping for **{map_name}**.\nCurrent map role pings:\n" +
-                current_map_role_list_text(message.guild)
-            )
-            return True
-
-        if action == "set_map_role":
-            role_id = pending["role_id"]
-            custom_message = pending.get("message")
-            CONFIG["map_role_pings"][map_name] = {
-                "role_id": role_id,
-                "message": custom_message or f"{map_name} is now live!",
-            }
-            save_config()
-            applied = "disabled" if not role_id else "updated"
-            await message.channel.send(
-                f"✅ Map ping role {applied} for **{map_name}**.\nCurrent map role pings:\n" +
-                current_map_role_list_text(message.guild)
-            )
-            return True
-
-        await message.channel.send("⚠️ The pending administrative change type was not recognized.")
-        return True
-
-    if lowered == "!cancel":
-        if not await require_management(message, "!cancel"):
-            return True
-        pending = PENDING_ADMIN_CHANGES.pop(message.author.id, None)
-        if pending is None:
-            await message.channel.send("⚠️ You do not have a pending administrative change.")
-        else:
-            await message.channel.send(
-                f"✅ Your pending **{pending_admin_change_text(pending)}** was discarded."
-            )
         return True
 
     return False
@@ -2038,7 +1854,7 @@ async def slash_status_all(interaction: discord.Interaction):
         )
         return
 
-    for key, record in SERVERS.get("servers", {}).items():
+    for key, record in sorted_server_items():
         server_name = str(record.get("name", key))
         server_guid = str(record.get("guid", "")).strip()
         marker = " (default)" if key in set(get_default_server_keys()) else ""
@@ -2078,7 +1894,7 @@ async def slash_announce(interaction: discord.Interaction):
         )
         return
 
-    defaults = get_default_server_records()
+    defaults = sorted_default_server_records()
     if not defaults:
         await interaction.followup.send("⚠️ No default server(s) set.")
         return
@@ -2353,13 +2169,110 @@ async def slash_addserver(
         )
 
 
-@tree.command(name="delserverguid", description="Remove a non-default BF4 server")
-@discord.app_commands.describe(server="Saved server name or GUID")
-async def slash_delserverguid(interaction: discord.Interaction, server: str):
-    await run_legacy_management_backend(
-        interaction,
-        f'!delserverguid "{server}"',
+@tree.command(name="delserver", description="Delete a configured non-default BF4 server")
+@discord.app_commands.describe(server="Choose a configured server to delete")
+async def slash_delserver(
+    interaction: discord.Interaction,
+    server: str,
+):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    record = SERVERS.get("servers", {}).get(server)
+    if not isinstance(record, dict):
+        await interaction.followup.send(
+            "⚠️ That server is not currently configured. "
+            "Choose one from the autocomplete list."
+        )
+        return
+
+    if server in set(get_default_server_keys()):
+        await interaction.followup.send(
+            f"⛔ **{record.get('name', server)}** is currently a default server. "
+            "Remove it with `/defaultserver remove` before deleting it."
+        )
+        return
+
+    name = str(record.get("name", server))
+    guid = str(record.get("guid", ""))
+    del SERVERS["servers"][server]
+    save_servers()
+
+    await interaction.followup.send(
+        f"✅ Removed **{name}** — `{guid}` from `servers.json`.\n"
+        "Current servers:\n```text\n"
+        + current_server_list_text(include_guids=True)
+        + "\n```"
     )
+
+
+@slash_delserver.autocomplete("server")
+async def autocomplete_delserver(
+    interaction: discord.Interaction,
+    current: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return []
+    if not can_manage(interaction.user):
+        return []
+    return default_server_choices(current, "all")
+
+
+@tree.command(name="renameserver", description="Rename a configured BF4 server")
+@discord.app_commands.describe(
+    server="Choose a configured server",
+    new_name="New display name for the server",
+)
+async def slash_renameserver(
+    interaction: discord.Interaction,
+    server: str,
+    new_name: str,
+):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    record = SERVERS.get("servers", {}).get(server)
+    if not isinstance(record, dict):
+        await interaction.followup.send(
+            "⚠️ That server is not currently configured. "
+            "Choose one from the autocomplete list."
+        )
+        return
+
+    cleaned_name = re.sub(r"\s+", " ", str(new_name)).strip()
+    if not cleaned_name:
+        await interaction.followup.send("⚠️ The new server name cannot be empty.")
+        return
+    if len(cleaned_name) > 100:
+        await interaction.followup.send(
+            "⚠️ Keep the server name to **100 characters or fewer**."
+        )
+        return
+
+    old_name = str(record.get("name", server))
+    record["name"] = cleaned_name
+    save_servers()
+
+    await interaction.followup.send(
+        f"✅ Renamed **{old_name}** to **{cleaned_name}**.\n"
+        "Current servers:\n```text\n"
+        + current_server_list_text(include_guids=True)
+        + "\n```"
+    )
+
+
+@slash_renameserver.autocomplete("server")
+async def autocomplete_renameserver(
+    interaction: discord.Interaction,
+    current: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return []
+    if not can_manage(interaction.user):
+        return []
+    return default_server_choices(current, "all")
 
 
 
@@ -2368,7 +2281,7 @@ def default_server_choices(current, mode):
     default_keys = set(get_default_server_keys())
     choices = []
 
-    for key, record in SERVERS.get("servers", {}).items():
+    for key, record in sorted_server_items():
         if mode == "add" and key in default_keys:
             continue
         if mode == "remove" and key not in default_keys:
@@ -2376,7 +2289,7 @@ def default_server_choices(current, mode):
 
         name = str(record.get("name", key))
         platform = normalize_platform_label(record.get("platform", "Unknown"))
-        label = f"({platform if platform != 'Unknown' else '?'}) {name}"
+        label = f"({platform}) {name}"
         haystack = f"{key} {name} {platform}".lower()
         if current_text and current_text not in haystack:
             continue
@@ -2391,6 +2304,8 @@ def default_server_choices(current, mode):
             break
 
     return choices
+
+
 
 
 defaultserver_group = discord.app_commands.Group(
@@ -2548,12 +2463,82 @@ async def slash_addlistenchannel(interaction: discord.Interaction, channels: str
     await run_legacy_management_backend(interaction, f"!addlistenchannel {channels}")
 
 
-@tree.command(name="dellistenchannel", description="Stage removal of one or more listen channels")
+@tree.command(name="dellistenchannel", description="Remove one or more listen channels immediately")
 @discord.app_commands.describe(
     channels="Channel mentions, IDs, or exact names separated by spaces; quote names containing spaces"
 )
-async def slash_dellistenchannel(interaction: discord.Interaction, channels: str):
-    await run_legacy_management_backend(interaction, f"!dellistenchannel {channels}")
+async def slash_dellistenchannel(
+    interaction: discord.Interaction,
+    channels: str,
+):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    resolved, ambiguous, missing = parse_channel_arguments(
+        interaction.guild,
+        channels,
+    )
+    configured_ids = listen_channel_ids()
+    removable = [
+        channel
+        for channel in resolved
+        if channel.id in configured_ids
+    ]
+    not_configured = [
+        channel
+        for channel in resolved
+        if channel.id not in configured_ids
+    ]
+
+    report = []
+    if removable:
+        remove_ids = {channel.id for channel in removable}
+        remaining = [
+            int(value)
+            for value in CONFIG.get("listen_channel_id", [0])
+            if int(value) != 0 and int(value) not in remove_ids
+        ]
+        CONFIG["listen_channel_id"] = remaining or [0]
+        save_config()
+        report.append(
+            "✅ Removed listen channels:\n"
+            + "\n".join(
+                f"#{channel.name} (`{channel.id}`)"
+                for channel in removable
+            )
+        )
+
+    if not_configured:
+        report.append(
+            "Not currently configured:\n"
+            + "\n".join(
+                f"#{channel.name} (`{channel.id}`)"
+                for channel in not_configured
+            )
+        )
+
+    for token, matches in ambiguous:
+        report.append(
+            f"⚠️ Multiple channels matched **{token}**:\n"
+            + "\n".join(
+                f"#{channel.name} — `{channel.id}`"
+                for channel in matches
+            )
+        )
+
+    if missing:
+        report.append("⚠️ Could not resolve:\n" + "\n".join(missing))
+
+    if not report:
+        report.append("⚠️ No configured listen channels were selected.")
+
+    report.append(
+        "Current listen channels:\n"
+        + current_listen_channel_text(interaction.guild)
+    )
+    await interaction.followup.send("\n".join(report))
+
 
 
 @tree.command(name="setmanagementrole", description="Set the minimum ServerWatcher management role")
@@ -2585,7 +2570,7 @@ async def slash_setinterval(interaction: discord.Interaction, seconds: int):
     await run_legacy_management_backend(interaction, f"!setinterval {seconds}")
 
 
-@tree.command(name="setmaprole", description="Stage a map-specific role ping configuration")
+@tree.command(name="setmaprole", description="Set a map-specific role ping immediately")
 @discord.app_commands.describe(
     map_search="Full or partial BF4 map name",
     role="Discord role to ping; leave blank only when disable is true",
@@ -2599,34 +2584,88 @@ async def slash_setmaprole(
     message: str | None = None,
     disable: bool = False,
 ):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
     if not disable and role is None:
-        await interaction.response.send_message(
-            "⚠️ Select a role, or set `disable` to true.",
-            ephemeral=True,
+        await interaction.followup.send(
+            "⚠️ Select a role, or set `disable` to true."
         )
         return
 
-    role_value = "0" if disable else str(role.id)
-    raw = f'!setmaprole "{map_search}" {role_value}'
+    matches = map_name_matches(map_search)
+    if not matches:
+        await interaction.followup.send(
+            f"⚠️ No map in `maps.json` matched **{map_search}**. "
+            "Try a more recognizable part of the map name."
+        )
+        return
+    if len(matches) > 1:
+        await interaction.followup.send(
+            f"⚠️ Multiple maps matched **{map_search}**:\n"
+            + "\n".join(matches)
+            + "\nPlease use a more specific map search."
+        )
+        return
+
+    map_name = matches[0]
+    role_id = 0 if disable else role.id
+    entry = {"role_id": role_id}
     if message:
-        safe_message = message.replace('"', "'")
-        raw += f' "{safe_message}"'
-    await run_legacy_management_backend(interaction, raw)
+        entry["message"] = message
+
+    CONFIG["map_role_pings"][map_name] = entry
+    save_config()
+
+    role_text = (
+        "Disabled (0)"
+        if role_id == 0
+        else format_role_setting(interaction.guild, role_id)
+    )
+    message_text = message or f"{map_name} is now live!"
+    await interaction.followup.send(
+        f"✅ Map role ping updated for **{map_name}**.\n"
+        f"Role: **{role_text}**\n"
+        f"Message: **{message_text}**"
+        + ("" if message else " *(default)*")
+        + "\nCurrent map role pings:\n"
+        + current_map_role_list_text(interaction.guild)
+    )
 
 
-@tree.command(name="delmaprole", description="Stage deletion of a configured map role ping")
-async def slash_delmaprole(interaction: discord.Interaction, map_search: str):
-    await run_legacy_management_backend(interaction, f'!delmaprole "{map_search}"')
+@tree.command(name="delmaprole", description="Delete a configured map role ping immediately")
+@discord.app_commands.describe(map_search="Full or partial configured map name")
+async def slash_delmaprole(
+    interaction: discord.Interaction,
+    map_search: str,
+):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
 
+    matches = configured_map_role_matches(map_search)
+    if not matches:
+        await interaction.followup.send(
+            f"⚠️ No configured map role ping matched **{map_search}**."
+        )
+        return
+    if len(matches) > 1:
+        await interaction.followup.send(
+            f"⚠️ Multiple configured maps matched **{map_search}**:\n"
+            + "\n".join(matches)
+            + "\nPlease use a more specific map search."
+        )
+        return
 
-@tree.command(name="confirm", description="Apply your pending administrative change")
-async def slash_confirm(interaction: discord.Interaction):
-    await run_legacy_management_backend(interaction, "!confirm")
-
-
-@tree.command(name="cancel", description="Discard your pending administrative change")
-async def slash_cancel(interaction: discord.Interaction):
-    await run_legacy_management_backend(interaction, "!cancel")
+    map_name = matches[0]
+    CONFIG["map_role_pings"].pop(map_name, None)
+    save_config()
+    await interaction.followup.send(
+        f"✅ Removed map role ping for **{map_name}**.\n"
+        "Current map role pings:\n"
+        + current_map_role_list_text(interaction.guild)
+    )
 
 
 @client.event
@@ -2669,7 +2708,7 @@ async def on_message(message):
                 )
                 return
 
-            defaults = get_default_server_records()
+            defaults = sorted_default_server_records()
             if not defaults:
                 await message.channel.send("⚠️ No default server(s) set.")
                 return
@@ -2771,7 +2810,7 @@ async def on_message(message):
                 key, record = matches[0]
 
             else:
-                defaults = get_default_server_records()
+                defaults = sorted_default_server_records()
                 if not defaults:
                     await message.channel.send("No default server(s) set")
                     return

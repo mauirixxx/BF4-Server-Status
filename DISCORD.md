@@ -208,9 +208,9 @@ ServerWatcher has been successfully tested with Battlefield 4 servers on PC, Pla
 
 
 
-## v1.3.1 server management
+## v1.3.2 server management
 
-Use `/addserver` to add BF4 servers. Paste one or more full Battlelog server URLs into the `server_urls` field. ServerWatcher extracts the GUID, derives the server name, and trusts the platform encoded in the Battlelog URL.
+Use `/addserver` to add BF4 servers. Paste one or more Battlelog server URLs into the `server_urls` field. Both `/show/<platform>/<guid>/` and `/show/<platform>/<guid>/<server-name>/` forms are accepted. ServerWatcher extracts the GUID and trusts the platform encoded in the URL.
 
 `make_default:true` applies to every successfully processed URL in that command.
 
@@ -237,3 +237,14 @@ ServerWatcher allows zero, one, or multiple default servers. Named `!status <ser
 v1.3.0 could incorrectly label console servers as PC because its platform probe was not reliable. v1.3.1 does not guess console platform from a raw GUID.
 
 On first v1.3.1 load, unverified v1.3.0 PC labels are reset to `Unknown`. Re-run `/addserver` with the full Battlelog URL for an existing server to repair its platform metadata; matching GUIDs are updated instead of duplicated.
+
+
+## v1.3.2 management cleanup
+
+- `/delserver` replaces `/delserverguid` and uses autocomplete. It deletes immediately but refuses to delete a current default server.
+- `/renameserver` uses autocomplete and changes only the saved display name.
+- `/dellistenchannel`, `/setmaprole`, and `/delmaprole` now apply immediately.
+- `/confirm` and `/cancel` were removed because no remaining management operation uses staged confirmation.
+- Multi-server lists sort PC first, then PS4/5, XBox, and Unknown, with alphabetical sorting inside each platform.
+- Unknown platforms are displayed explicitly as `(Unknown)`.
+- Startup logs include the slash-command names returned by Discord after synchronization.

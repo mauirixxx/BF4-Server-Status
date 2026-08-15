@@ -4,6 +4,31 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.2] - 2026-08-15
+
+### Added
+- Added `/renameserver` with configured-server autocomplete and a custom `new_name` field.
+- Added support for short Battlelog server URLs ending immediately after the GUID, while retaining support for URLs containing a server-name slug.
+- Added slash-command name logging after Discord command synchronization.
+- Added consistent platform sorting for multi-server output: PC, PS4/5, XBox, Unknown; server names sort alphabetically within each platform.
+
+### Changed
+- Renamed `/delserverguid` to `/delserver`.
+- `/delserver` now uses autocomplete and deletes the selected non-default server immediately.
+- `/dellistenchannel` now applies removals immediately.
+- `/setmaprole` now applies role/message changes immediately.
+- `/delmaprole` now deletes configured map-role mappings immediately.
+- Removed `/confirm`, `/cancel`, and the pending-administrative-change subsystem.
+- Unified server-list formatting across `!list`, help/configuration output, `/addserver`, `/delserver`, `/renameserver`, and default-server displays.
+- Unknown platform values now display as `(Unknown)` instead of `(?)`.
+- Server-list GUID columns are dynamically aligned when GUIDs are shown.
+- Updated README and Discord setup documentation for v1.3.2.
+- Docker image tag and application version updated to v1.3.2.
+
+### Fixed
+- Fixed valid short-form Battlelog URLs such as `/bf4/servers/show/pc/<guid>/` being rejected by `/addserver`.
+- Fixed post-delete server listings using proportional/non-aligned formatting.
+
 ## [v1.3.1] - 2026-08-14
 
 ### Added

@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.1
+# BF4 Server Watcher v1.3.2
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -90,7 +90,7 @@ The bot itself does not require Administrator permission.
 
 Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` is intentionally retained alongside `/announce`.
 
-ServerWatcher syncs its slash commands with Discord at startup.
+ServerWatcher syncs its slash commands with Discord at startup. v1.3.2 logs the names Discord accepted during sync, which helps distinguish a stale Discord client command cache from an actual registration problem.
 
 ## Announcement and listen channels
 
@@ -195,11 +195,14 @@ When `/defaultserver remove` removes a server, its current automatic announcemen
 
 Use `/addserver` and paste one or more full Battlelog server URLs into `server_urls`.
 
-For a single server:
+For a single server, either Battlelog URL form is accepted:
 
 ```text
+/addserver server_urls:https://battlelog.battlefield.com/bf4/servers/show/pc/<guid>/
 /addserver server_urls:https://battlelog.battlefield.com/bf4/servers/show/ps4/<guid>/<server-name>/
 ```
+
+If the short URL matches a GUID already saved in `servers.json`, the existing custom server name is preserved while the platform metadata is repaired. A newly added short URL receives a safe generated name that can be changed with `/renameserver`.
 
 For multiple servers, paste several URLs separated by spaces or new lines. The command processes each URL independently, so one invalid or duplicate item does not abort the entire batch.
 
@@ -212,12 +215,13 @@ If a supplied URL matches a GUID already stored in `servers.json`, ServerWatcher
 `!list` displays platform labels in a fixed-width code block:
 
 ```text
-(PC)    - AAA (default)
-(PS4/5) - Sloth Alliance Classics
-(XBox)  - Jokers Funhouse
+(PC)      - AAA (default)
+(PS4/5)   - Sloth Alliance Classics
+(XBox)    - Jokers Funhouse
+(Unknown) - Unverified Server
 ```
 
-The administrator's `!help` current-configuration server list uses the same platform-aware formatting.
+Multi-server displays are consistently sorted **PC → PS4/5 → XBox → Unknown**, then alphabetically by server name. The administrator's `!help` current-configuration list, `/addserver`, `/delserver`, `/renameserver`, `/defaultserver`, `/status all`, and plain multi-default `!status` use the same ordering/formatting conventions.
 
 ## Status role behavior
 
@@ -253,20 +257,19 @@ Management slash commands require `management_min_role_id` or higher. Discord Ad
 - `/debug [server:<selection>]` — Keeper diagnostics for any saved server using autocomplete; with no selection it uses the first configured default.
 - `/reload` — reload configuration/server registry and normalize saved platform metadata without guessing from raw GUIDs.
 - `/addserver server_urls:<Battlelog URLs> [make_default:true]` — add or repair one or more servers from full Battlelog URLs. URLs may be separated by spaces or new lines. `make_default:true` applies to every successfully processed server.
-- `/delserverguid server:<name-or-guid>` — remove a non-default server.
+- `/delserver server:<selection>` — immediately delete a non-default server using autocomplete. Current default servers must be removed from the default list first.
+- `/renameserver server:<selection> new_name:<name>` — rename a saved server without changing its GUID, platform, Battlelog metadata, or default status.
 - `/defaultserver add server:<selection>` — add a server to defaults using autocomplete.
 - `/defaultserver remove server:<selection>` — remove a server from defaults using autocomplete.
 - `/defaultserver list` — list current defaults.
 - `/setannouncementchannel channel:<channel>` — set the automatic announcement channel.
 - `/addlistenchannel channels:<channel list>` — add one or more listen channels.
-- `/dellistenchannel channels:<channel list>` — stage removal of one or more listen channels.
+- `/dellistenchannel channels:<channel list>` — immediately remove one or more listen channels.
 - `/setmanagementrole [role:<role>]`
 - `/setstatusrole [role:<role>]`
 - `/setinterval seconds:<seconds>`
-- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]`
-- `/delmaprole map_search:<map>`
-- `/confirm`
-- `/cancel`
+- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — apply the map-role change immediately.
+- `/delmaprole map_search:<map>` — delete the selected configured map-role mapping immediately.
 
 ## Manual announcement cleanup
 
@@ -283,7 +286,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.1
+BF4 Server Watcher v1.3.2
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.
