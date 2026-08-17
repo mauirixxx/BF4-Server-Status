@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.3"
+BOT_VERSION = "v1.3.4"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -790,6 +790,135 @@ def build_message(title, status, server_name=None):
     return message
 
 
+def player_display_name(player):
+    if not isinstance(player, dict):
+        return "Unknown"
+    for key in ("name", "personaName"):
+        value = player.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return "Unknown"
+
+
+def team_player_names(data):
+    """Return active BF4 teams and their player names; team 0/unassigned is omitted."""
+    teams = data.get("teamInfo", {})
+    if not isinstance(teams, dict):
+        return []
+
+    result = []
+    for team_id, team in teams.items():
+        if str(team_id) == "0" or not isinstance(team, dict):
+            continue
+        players = team.get("players", {})
+        names = []
+        if isinstance(players, dict):
+            for player in players.values():
+                if isinstance(player, dict):
+                    names.append(player_display_name(player))
+        result.append((str(team_id), names))
+
+    def team_key(item):
+        team_id = item[0]
+        try:
+            return (0, int(team_id))
+        except (TypeError, ValueError):
+            return (1, str(team_id))
+
+    return sorted(result, key=team_key)
+
+
+def build_player_roster_messages(data, server_name):
+    """
+    Build one or more Discord-safe side-by-side team roster messages.
+    Player roles are intentionally not shown.
+    """
+    teams = team_player_names(data)
+    if not teams:
+        return [
+            f"👥 **BF4 Players — {server_name}**\n"
+            "No team player data is available for this server."
+        ]
+
+    # BF4 normal matches use two active teams. If an unusual snapshot exposes
+    # more than two, render subsequent pairs as additional roster blocks.
+    messages = []
+    for pair_start in range(0, len(teams), 2):
+        pair = teams[pair_start:pair_start + 2]
+        left_id, left_names = pair[0]
+        if len(pair) == 2:
+            right_id, right_names = pair[1]
+        else:
+            right_id, right_names = "", []
+
+        left_header = f"TEAM {left_id} ({len(left_names)})"
+        right_header = (
+            f"TEAM {right_id} ({len(right_names)})"
+            if right_id
+            else ""
+        )
+
+        left_width = max(
+            [len(left_header)] + [len(name) for name in left_names] + [1]
+        )
+        right_width = max(
+            [len(right_header)] + [len(name) for name in right_names] + [1]
+        )
+
+        row_count = max(len(left_names), len(right_names), 1)
+        rows = []
+        for index in range(row_count):
+            left = left_names[index] if index < len(left_names) else ""
+            right = right_names[index] if index < len(right_names) else ""
+            if right_id:
+                rows.append(
+                    f"{left.ljust(left_width)}   {right.ljust(right_width)}".rstrip()
+                )
+            else:
+                rows.append(left)
+
+        header_line = (
+            f"{left_header.ljust(left_width)}   {right_header}".rstrip()
+            if right_id
+            else left_header
+        )
+        divider_line = (
+            f"{'-' * left_width}   {'-' * len(right_header)}"
+            if right_id
+            else "-" * left_width
+        )
+
+        prefix = f"👥 **BF4 Players — {server_name}**\n"
+        # Keep code blocks below Discord's message ceiling and repeat headers
+        # if an unexpectedly large roster needs multiple messages.
+        current_rows = []
+        for row in rows:
+            candidate_rows = current_rows + [row]
+            body = "\n".join(
+                [header_line, divider_line] + candidate_rows
+            )
+            candidate = prefix + "```text\n" + body + "\n```"
+            if current_rows and len(candidate) > 1900:
+                body = "\n".join(
+                    [header_line, divider_line] + current_rows
+                )
+                messages.append(
+                    prefix + "```text\n" + body + "\n```"
+                )
+                current_rows = [row]
+            else:
+                current_rows = candidate_rows
+
+        body = "\n".join(
+            [header_line, divider_line] + current_rows
+        )
+        messages.append(
+            prefix + "```text\n" + body + "\n```"
+        )
+
+    return messages
+
+
 def compact_player_sample(player):
     if not isinstance(player, dict):
         return {}
@@ -1504,7 +1633,8 @@ def build_help_messages(member):
         "**User commands**",
         "`!help` — show this help message.",
         "`!list` — list configured server names.",
-        "`!status [server-name]` — show the default server, or a saved server by exact/partial name.",
+        "`!status [server-name]` — show the default server(s), or a saved server by exact/partial name.",
+        "`!status <server-name> players` — show a side-by-side player list broken down by team.",
         "`!version` — show the bot version and update status.",
     ])
 
@@ -1564,7 +1694,7 @@ def build_help_messages(member):
             ),
         ),
         safe(
-            "**Polling interval:**\n",
+            "**Polling interval:** ",
             lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds",
         ),
         safe(
@@ -2953,10 +3083,30 @@ async def on_message(message):
 
 
         if command == "!status" or command.startswith("!status "):
-            selector = raw[len("!status"):].strip()
+            payload = raw[len("!status"):].strip()
+            players_requested = False
+
+            if payload.lower() == "players":
+                players_requested = True
+                selector = ""
+            elif re.search(r"\s+players$", payload, flags=re.IGNORECASE):
+                players_requested = True
+                selector = re.sub(
+                    r"\s+players$",
+                    "",
+                    payload,
+                    flags=re.IGNORECASE,
+                ).strip()
+            else:
+                selector = payload
 
             if selector.lower() == "all":
-                if can_manage(message.author):
+                if players_requested:
+                    await message.channel.send(
+                        "⚠️ The `players` option requires one saved server. "
+                        "Use `!status <server-name> players`."
+                    )
+                elif can_manage(message.author):
                     await message.channel.send(
                         "ℹ️ Use `/status all` for the management all-server status command."
                     )
@@ -2973,54 +3123,93 @@ async def on_message(message):
                 )
                 return
 
-            # Named lookup continues to target one saved server.
-            if selector.isdigit() and message.author.id in PENDING_STATUS_SELECTIONS:
-                choices = PENDING_STATUS_SELECTIONS[message.author.id]
+            # Numbered selections preserve whether the original ambiguous
+            # request asked for the team player roster.
+            if (
+                selector.isdigit()
+                and message.author.id in PENDING_STATUS_SELECTIONS
+            ):
+                pending = PENDING_STATUS_SELECTIONS[message.author.id]
+                if isinstance(pending, dict):
+                    choices = pending.get("keys", [])
+                    players_requested = (
+                        players_requested
+                        or bool(pending.get("players"))
+                    )
+                else:
+                    # Compatibility with any in-memory pre-v1.3.4 selection.
+                    choices = pending
+
                 selection = int(selector)
                 if selection < 1 or selection > len(choices):
                     await message.channel.send(
                         f"⚠️ Choose a number from **1** to **{len(choices)}**."
                     )
                     return
+
                 key = choices[selection - 1]
                 record = SERVERS["servers"][key]
-                PENDING_STATUS_SELECTIONS.pop(message.author.id, None)
+                PENDING_STATUS_SELECTIONS.pop(
+                    message.author.id,
+                    None,
+                )
 
             elif selector:
                 matches = find_server_matches(selector)
                 if not matches:
                     await message.channel.send(
                         f"⚠️ Server **{selector}** was not found in `servers.json`.\n"
-                        "Use `!list` to see configured server names."
+                        "Use `!list` to see configured servers."
                     )
                     return
 
                 if len(matches) > 1:
-                    PENDING_STATUS_SELECTIONS[message.author.id] = [
-                        key for key, _ in matches
-                    ]
+                    PENDING_STATUS_SELECTIONS[message.author.id] = {
+                        "keys": [key for key, _ in matches],
+                        "players": players_requested,
+                    }
                     lines = [
                         f"{index}. {record.get('name', key)}"
-                        for index, (key, record) in enumerate(matches, start=1)
+                        for index, (key, record)
+                        in enumerate(matches, start=1)
                     ]
+                    suffix = (
+                        "\nThe selected server will show its team player list."
+                        if players_requested
+                        else ""
+                    )
                     await message.channel.send(
                         f"Multiple servers matched **{selector}**:\n"
                         + "\n".join(lines)
                         + "\nReply with `!status <number>` to select one."
+                        + suffix
                     )
                     return
 
                 key, record = matches[0]
 
             else:
+                if players_requested:
+                    await message.channel.send(
+                        "Usage: `!status <server-name> players`\n"
+                        "Use `!list` to see configured servers."
+                    )
+                    return
+
                 defaults = sorted_default_server_records()
                 if not defaults:
-                    await message.channel.send("No default server(s) set")
+                    await message.channel.send(
+                        "No default server(s) set"
+                    )
                     return
 
                 for key, record in defaults:
-                    server_name = str(record.get("name", key))
-                    server_guid = str(record.get("guid", "")).strip()
+                    server_name = str(
+                        record.get("name", key)
+                    )
+                    server_guid = str(
+                        record.get("guid", "")
+                    ).strip()
                     try:
                         status = await asyncio.to_thread(
                             get_server_status,
@@ -3029,20 +3218,43 @@ async def on_message(message):
                         )
                         await message.channel.send(
                             build_message(
-                                f"BF4 Server Status — {server_name} (default)",
+                                f"BF4 Server Status — "
+                                f"{server_name} (default)",
                                 status,
                             )
                         )
                     except Exception as error:
                         await message.channel.send(
                             f"⚠️ **{server_name} (default)** — "
-                            f"status lookup failed: `{type(error).__name__}`"
+                            f"status lookup failed: "
+                            f"`{type(error).__name__}`"
                         )
                 return
 
             server_name = str(record.get("name", key))
-            server_guid = str(record.get("guid", "")).strip()
-            marker = " (default)" if key in set(get_default_server_keys()) else ""
+            server_guid = str(
+                record.get("guid", "")
+            ).strip()
+            marker = (
+                " (default)"
+                if key in set(get_default_server_keys())
+                else ""
+            )
+
+            if players_requested:
+                # Fetch one Keeper snapshot and build the roster directly
+                # from teamInfo. No player-role information is displayed.
+                data = await asyncio.to_thread(
+                    get_server,
+                    server_guid,
+                )
+                for roster_message in build_player_roster_messages(
+                    data,
+                    server_name,
+                ):
+                    await message.channel.send(roster_message)
+                return
+
             status = await asyncio.to_thread(
                 get_server_status,
                 None,
@@ -3050,7 +3262,8 @@ async def on_message(message):
             )
             await message.channel.send(
                 build_message(
-                    f"BF4 Server Status — {server_name}{marker}",
+                    f"BF4 Server Status — "
+                    f"{server_name}{marker}",
                     status,
                 )
             )

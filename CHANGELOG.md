@@ -4,6 +4,20 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.4] - 2026-08-16
+
+### Added
+- Added the user-accessible `!status <server-name> players` view.
+- Added side-by-side active-team player rosters from the existing Keeper `teamInfo` snapshot data.
+- Added preservation of the `players` option through ambiguous partial-name numbered selection.
+- Added Discord-safe roster chunking for unexpectedly large player lists.
+
+### Changed
+- `!status <server-name>` without the `players` option retains the existing status output unchanged.
+- Player roster output intentionally shows player names only and does not expose player-role information.
+- The `!help` polling interval now displays on one line, for example `Polling interval: 69 seconds`.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.4.
+
 ## [v1.3.3] - 2026-08-15
 
 ### Added

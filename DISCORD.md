@@ -257,3 +257,14 @@ On first v1.3.1 load, unverified v1.3.0 PC labels are reset to `Unknown`. Re-run
 Leaving the optional role blank preserves the existing role. The edited message is saved immediately when the modal is submitted.
 
 Administrator `!help` output displays each configured map-role ping on one line with its role and configured/default message.
+
+
+## v1.3.4 user player roster
+
+Users who already have permission to use `!status` can request the current team rosters for one saved server:
+
+```text
+!status <server-name> players
+```
+
+The result displays player names side by side by active team. Player roles are not displayed. Partial-name and numbered-selection behavior remains supported.

@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.3
+# BF4 Server Watcher v1.3.4
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -223,6 +223,27 @@ If a supplied URL matches a GUID already stored in `servers.json`, ServerWatcher
 
 Multi-server displays are consistently sorted **PC → PS4/5 → XBox → Unknown**, then alphabetically by server name. The administrator's `!help` current-configuration list, `/addserver`, `/delserver`, `/renameserver`, `/defaultserver`, `/status all`, and plain multi-default `!status` use the same ordering/formatting conventions.
 
+## Team player roster
+
+The normal user `!status` command supports an optional `players` view:
+
+```text
+!status flubber players
+```
+
+This displays the active team player names side by side in a fixed-width code block. Team `0` / unassigned entries are not shown, and no player-role information is included.
+
+The `players` option uses the same `status_min_role_id` and listen-channel permissions as the existing user `!status` command.
+
+Partial server-name matching still works. If the server name is ambiguous, the normal numbered selection flow preserves the requested player-roster view:
+
+```text
+!status slo players
+!status 2
+```
+
+The roster is built from the same Keeper server snapshot used for the lookup; it does not perform separate per-player requests.
+
 ## Status role behavior
 
 `status_min_role_id` controls normal `!status` access inside configured listen channels:
@@ -245,6 +266,7 @@ When a newer version is known, automatic map-change announcements include the av
 - `!list` — platform-aware list of configured server names.
 - `!status` — status for every configured default server, or `No default server(s) set`.
 - `!status <server-name>` — exact/partial saved-server lookup with per-user numbered selection for ambiguous matches.
+- `!status <server-name> players` — user-accessible side-by-side player roster broken down by active team. This uses the same server snapshot data and does not display player roles.
 - `!version` — installed/latest version and update status.
 - `!announce` — management-only chat alias for `/announce`; manually posted announcements automatically delete after 10 minutes.
 
@@ -301,7 +323,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.3
+BF4 Server Watcher v1.3.4
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.
