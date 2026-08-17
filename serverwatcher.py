@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.7"
+BOT_VERSION = "v1.3.8"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -75,6 +75,17 @@ def validate_config(config):
         raise ValueError("check_interval_seconds must be at least 10")
     if not isinstance(config["map_role_pings"], dict):
         raise ValueError("map_role_pings must be an object")
+
+    try:
+        requested_presence = int(
+            config.get("presence_update_seconds", 30)
+        )
+    except (TypeError, ValueError):
+        requested_presence = 30
+    config["presence_update_seconds"] = max(
+        10,
+        min(60, requested_presence),
+    )
     return config
 
 
@@ -490,7 +501,8 @@ def ensure_servers_file():
 
 def reload_runtime_config():
     global CONFIG, SERVERS
-    new_config = validate_config(load_json(CONFIG_PATH))
+    raw_config = load_json(CONFIG_PATH)
+    new_config = validate_config(raw_config)
     new_servers = load_json(SERVERS_PATH)
 
     migrated = migrate_servers_schema(new_servers)
@@ -499,6 +511,13 @@ def reload_runtime_config():
     new_servers = validate_servers(new_servers)
     CONFIG = new_config
     SERVERS = new_servers
+
+    if raw_config != new_config:
+        write_json_in_place(CONFIG_PATH, new_config)
+        print(
+            "Normalized presence_update_seconds to supported 10-60 second range.",
+            flush=True,
+        )
 
     if migrated or metadata_changed:
         write_json_in_place(SERVERS_PATH, SERVERS)
@@ -1775,7 +1794,7 @@ async def presence_rotation_loop():
                 flush=True,
             )
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(int(CONFIG.get("presence_update_seconds", 30)))
 
 
 @client.event
@@ -2102,6 +2121,7 @@ def build_help_messages(member):
         "`/setmanagementrole` — change the management minimum role.",
         "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
         "`/setinterval` — change the polling interval (minimum 10 seconds).",
+        "`/setpresenceupdate` — change presence rotation timing; values are clamped to 10–60 seconds.",
         "`/setmaprole` — immediately set or disable a map-specific role/message.",
         "`/editmaprole` — edit an existing map role; optionally replace its role and edit its current message in a pre-filled dialog.",
         "`/delmaprole` — immediately delete a configured map role ping.",
@@ -2139,6 +2159,10 @@ def build_help_messages(member):
         safe(
             "**Polling interval:** ",
             lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds",
+        ),
+        safe(
+            "**Presence update interval:** ",
+            lambda: f"{CONFIG.get('presence_update_seconds', 30)} seconds",
         ),
         safe(
             "**Map role pings:**\n",
@@ -3350,6 +3374,42 @@ async def slash_setstatusrole(
 @tree.command(name="setinterval", description="Set BF4 polling interval in seconds")
 async def slash_setinterval(interaction: discord.Interaction, seconds: int):
     await run_legacy_management_backend(interaction, f"!setinterval {seconds}")
+
+
+@tree.command(
+    name="setpresenceupdate",
+    description="Set Discord presence rotation interval in seconds",
+)
+@discord.app_commands.describe(
+    seconds="Requested interval in seconds; values are clamped to 10-60",
+)
+async def slash_setpresenceupdate(
+    interaction: discord.Interaction,
+    seconds: int,
+):
+    proxy = await prepare_management_interaction(interaction)
+    if proxy is None:
+        return
+
+    requested = int(seconds)
+    effective = max(10, min(60, requested))
+    CONFIG["presence_update_seconds"] = effective
+    save_config()
+
+    if requested < 10:
+        await interaction.followup.send(
+            f"⚠️ **{requested} seconds** is below the minimum presence update interval.\n"
+            f"Presence update interval set to the minimum: **{effective} seconds**."
+        )
+    elif requested > 60:
+        await interaction.followup.send(
+            f"⚠️ **{requested} seconds** exceeds the maximum presence update interval.\n"
+            f"Presence update interval set to the maximum: **{effective} seconds**."
+        )
+    else:
+        await interaction.followup.send(
+            f"✅ Presence update interval set to **{effective} seconds**."
+        )
 
 
 @tree.command(name="setmaprole", description="Set a map-specific role ping immediately")

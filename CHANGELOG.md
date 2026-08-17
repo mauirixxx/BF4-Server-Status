@@ -4,6 +4,20 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.8] - 2026-08-17
+
+### Added
+- Added `/setpresenceupdate seconds:<number>` for administrators.
+- Added `presence_update_seconds` to `config.example.json` with a default of 30 seconds.
+- Added the current presence update interval to administrator `!help`.
+
+### Changed
+- Discord presence rotation now reads the live configured interval every cycle instead of using a hard-coded 30 seconds.
+- Presence update values are clamped to the supported 10-60 second range instead of being rejected.
+- Existing installations without `presence_update_seconds` automatically receive the 30-second default.
+- `/reload` normalizes and persists manually edited presence intervals, so a restart is not required.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.8.
+
 ## [v1.3.7] - 2026-08-17
 
 ### Changed

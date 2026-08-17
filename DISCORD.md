@@ -304,3 +304,10 @@ Console servers and PC BFLIST fallback retain the existing Keeper name-only side
 Large Wide player-stat outputs are split into multiple clean channel messages before they approach Discord's message limit. Every continuation repeats the team and stat headers.
 
 `/status server` player-output chunks are sent as normal channel messages and the deferred slash response is cleared, avoiding Discord's reply-style follow-up banner.
+
+
+## v1.3.8 presence rotation timing
+
+Use `/setpresenceupdate` to change the Discord presence rotation interval. The effective value is clamped to 10-60 seconds and saved immediately.
+
+Existing installations without the new setting default to 30 seconds. `/reload` is sufficient after manual `config.json` edits; no bot restart is required.
