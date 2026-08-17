@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.5"
+BOT_VERSION = "v1.3.6"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -984,6 +984,275 @@ def bflist_team_rosters(bflist_server, keeper_data):
     return result
 
 
+def bflist_scoreboard_teams(bflist_server, keeper_data):
+    """
+    Return rich PC scoreboard rows from BFLIST, with Keeper faction labels.
+    Only normal Player entries are included.
+    """
+    keeper_teams = {
+        item["team_id"]: item
+        for item in keeper_team_rosters(keeper_data)
+    }
+
+    grouped = {}
+    players = bflist_server.get("players", [])
+    if not isinstance(players, list):
+        return []
+
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+
+        player_type = as_int(player.get("type"))
+        type_label = str(player.get("typeLabel", "")).strip().lower()
+        if player_type not in (None, 0):
+            continue
+        if type_label and type_label != "player":
+            continue
+
+        team_id_value = as_int(player.get("team"))
+        if team_id_value is None or team_id_value <= 0:
+            continue
+
+        kills = as_int(player.get("kills")) or 0
+        deaths = as_int(player.get("deaths")) or 0
+        score = as_int(player.get("score")) or 0
+        kdr = (kills / deaths) if deaths > 0 else float(kills)
+
+        team_id = str(team_id_value)
+        grouped.setdefault(team_id, []).append({
+            "name": player_display_name(player),
+            "score": score,
+            "kills": kills,
+            "deaths": deaths,
+            "kdr": kdr,
+        })
+
+    result = []
+    all_team_ids = sorted(
+        set(keeper_teams) | set(grouped),
+        key=lambda value: (
+            0,
+            int(value),
+        ) if str(value).isdigit() else (1, str(value)),
+    )
+
+    for team_id in all_team_ids:
+        rows = grouped.get(team_id, [])
+        rows.sort(
+            key=lambda row: (
+                -row["score"],
+                row["name"].casefold(),
+            )
+        )
+        for index, row in enumerate(rows, start=1):
+            row["place"] = index
+
+        result.append({
+            "team_id": team_id,
+            "faction": keeper_teams.get(team_id, {}).get("faction"),
+            "rows": rows,
+        })
+
+    return result
+
+
+def rich_team_header(team):
+    label = f"TEAM {team['team_id']}"
+    faction = team.get("faction")
+    if faction:
+        label += f" - {faction}"
+    return f"{label} ({len(team.get('rows', []))})"
+
+
+def format_score(value):
+    return f"{int(value):,}"
+
+
+def mobile_scoreboard_messages(teams, server_name):
+    """Render rich BFLIST scoreboard teams vertically for mobile readability."""
+    messages = []
+    for team in teams:
+        header = rich_team_header(team)
+        rows = team.get("rows", [])
+
+        name_width = max(
+            [4] + [len(row["name"]) for row in rows] + [1]
+        )
+        name_width = min(name_width, 28)
+
+        column_header = (
+            f"{'PL':>2}  "
+            f"{'NAME'.ljust(name_width)}  "
+            f"{'SCORE':>7}  "
+            f"{'K':>3}  "
+            f"{'D':>3}  "
+            f"{'KDR':>5}"
+        )
+        divider = "-" * len(column_header)
+
+        formatted_rows = []
+        for row in rows:
+            name = row["name"]
+            if len(name) > name_width:
+                name = name[:max(1, name_width - 1)] + "…"
+            formatted_rows.append(
+                f"{row['place']:02d}  "
+                f"{name.ljust(name_width)}  "
+                f"{format_score(row['score']):>7}  "
+                f"{row['kills']:>3}  "
+                f"{row['deaths']:>3}  "
+                f"{row['kdr']:>5.2f}"
+            )
+
+        prefix = f"👥 **BF4 Player Stats — {server_name}**\n"
+        current = []
+        for row in formatted_rows:
+            candidate = current + [row]
+            body = "\n".join(
+                [header, divider, column_header] + candidate
+            )
+            message = prefix + "```text\n" + body + "\n```"
+            if current and len(message) > 1900:
+                body = "\n".join(
+                    [header, divider, column_header] + current
+                )
+                messages.append(
+                    prefix + "```text\n" + body + "\n```"
+                )
+                current = [row]
+            else:
+                current = candidate
+
+        body = "\n".join(
+            [header, divider, column_header] + current
+        )
+        messages.append(
+            prefix + "```text\n" + body + "\n```"
+        )
+
+    return messages
+
+
+def wide_scoreboard_messages(teams, server_name):
+    """Render two rich BFLIST scoreboard teams side by side for desktop users."""
+    if not teams:
+        return []
+
+    messages = []
+    for pair_start in range(0, len(teams), 2):
+        pair = teams[pair_start:pair_start + 2]
+        left = pair[0]
+        right = pair[1] if len(pair) == 2 else None
+
+        def prepare(team):
+            rows = team.get("rows", [])
+            name_width = max(
+                [4] + [len(row["name"]) for row in rows] + [1]
+            )
+            # Keep the total two-team view within practical Discord width.
+            name_width = min(name_width, 20)
+            col = (
+                f"{'PL':>2} "
+                f"{'NAME'.ljust(name_width)} "
+                f"{'SCORE':>7} "
+                f"{'K':>3} "
+                f"{'D':>3} "
+                f"{'KDR':>5}"
+            )
+            rendered = []
+            for row in rows:
+                name = row["name"]
+                if len(name) > name_width:
+                    name = name[:max(1, name_width - 1)] + "…"
+                rendered.append(
+                    f"{row['place']:02d} "
+                    f"{name.ljust(name_width)} "
+                    f"{format_score(row['score']):>7} "
+                    f"{row['kills']:>3} "
+                    f"{row['deaths']:>3} "
+                    f"{row['kdr']:>5.2f}"
+                )
+            return rich_team_header(team), col, rendered
+
+        left_header, left_cols, left_rows = prepare(left)
+        if right:
+            right_header, right_cols, right_rows = prepare(right)
+        else:
+            right_header, right_cols, right_rows = "", "", []
+
+        left_width = max(
+            len(left_header),
+            len(left_cols),
+            *(len(row) for row in left_rows),
+        )
+        right_width = (
+            max(
+                len(right_header),
+                len(right_cols),
+                *(len(row) for row in right_rows),
+            )
+            if right
+            else 0
+        )
+
+        header_line = (
+            f"{left_header.ljust(left_width)}   {right_header}".rstrip()
+            if right
+            else left_header
+        )
+        divider_line = (
+            f"{'-' * left_width}   {'-' * right_width}"
+            if right
+            else "-" * left_width
+        )
+        cols_line = (
+            f"{left_cols.ljust(left_width)}   {right_cols}".rstrip()
+            if right
+            else left_cols
+        )
+
+        row_count = max(len(left_rows), len(right_rows), 1)
+        rendered_rows = []
+        for index in range(row_count):
+            lrow = left_rows[index] if index < len(left_rows) else ""
+            rrow = right_rows[index] if index < len(right_rows) else ""
+            if right:
+                rendered_rows.append(
+                    f"{lrow.ljust(left_width)}   {rrow}".rstrip()
+                )
+            else:
+                rendered_rows.append(lrow)
+
+        prefix = f"👥 **BF4 Player Stats — {server_name}**\n"
+        current = []
+        for row in rendered_rows:
+            candidate = current + [row]
+            body = "\n".join(
+                [header_line, divider_line, cols_line] + candidate
+            )
+            message = prefix + "```text\n" + body + "\n```"
+            if current and len(message) > 1900:
+                body = "\n".join(
+                    [header_line, divider_line, cols_line] + current
+                )
+                messages.append(
+                    prefix + "```text\n" + body + "\n```"
+                )
+                current = [row]
+            else:
+                current = candidate
+
+        body = "\n".join(
+            [header_line, divider_line, cols_line] + current
+        )
+        messages.append(
+            prefix + "```text\n" + body + "\n```"
+        )
+
+    return messages
+
+
 def roster_header(team):
     label = f"TEAM {team['team_id']}"
     faction = team.get("faction")
@@ -1819,6 +2088,7 @@ def build_help_messages(member):
     management_help = "\n".join([
         "**Management slash commands**",
         "`/status all` — show status for every configured server.",
+        "`/status server` — choose one configured server; optionally show players with Mobile (default) or Wide layout.",
         "`/announce` or `!announce` — temporarily post current default-server status; manual announcements delete after 10 minutes.",
         "`/debug` — show Keeper diagnostic information for a selected saved server.",
         "`/reload` — reload `config.json` and `servers.json`.",
@@ -2150,9 +2420,15 @@ status_group = discord.app_commands.Group(
 )
 
 
-@status_group.command(name="all", description="Show status for every configured BF4 server")
+@status_group.command(
+    name="all",
+    description="Show status for every configured BF4 server",
+)
 async def slash_status_all(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(interaction, ephemeral=True)
+    proxy = await prepare_management_interaction(
+        interaction,
+        ephemeral=True,
+    )
     if proxy is None:
         return
 
@@ -2173,7 +2449,11 @@ async def slash_status_all(interaction: discord.Interaction):
     for key, record in sorted_server_items():
         server_name = str(record.get("name", key))
         server_guid = str(record.get("guid", "")).strip()
-        marker = " (default)" if key in set(get_default_server_keys()) else ""
+        marker = (
+            " (default)"
+            if key in set(get_default_server_keys())
+            else ""
+        )
         try:
             status = await asyncio.to_thread(
                 get_server_status,
@@ -2191,6 +2471,149 @@ async def slash_status_all(interaction: discord.Interaction):
                 f"⚠️ **{server_name}{marker}** — "
                 f"status lookup failed: `{type(error).__name__}`"
             )
+
+
+@status_group.command(
+    name="server",
+    description="Show status or player details for one configured BF4 server",
+)
+@discord.app_commands.describe(
+    server="Choose a configured server",
+    players="Show player details instead of the normal server status",
+    layout="Player-stat layout; Mobile is the default",
+)
+@discord.app_commands.choices(
+    layout=[
+        discord.app_commands.Choice(name="Mobile", value="mobile"),
+        discord.app_commands.Choice(name="Wide", value="wide"),
+    ]
+)
+async def slash_status_server(
+    interaction: discord.Interaction,
+    server: str,
+    players: bool = False,
+    layout: str = "mobile",
+):
+    proxy = await prepare_management_interaction(
+        interaction,
+        ephemeral=True,
+    )
+    if proxy is None:
+        return
+
+    record = SERVERS.get("servers", {}).get(server)
+    if not isinstance(record, dict):
+        await interaction.followup.send(
+            "⚠️ That server is not currently configured. "
+            "Choose one from the autocomplete list.",
+            ephemeral=True,
+        )
+        return
+
+    server_name = str(record.get("name", server))
+    server_guid = str(record.get("guid", "")).strip()
+    marker = (
+        " (default)"
+        if server in set(get_default_server_keys())
+        else ""
+    )
+
+    if not players:
+        try:
+            status = await asyncio.to_thread(
+                get_server_status,
+                None,
+                server_guid,
+            )
+            await interaction.followup.send(
+                build_message(
+                    f"BF4 Server Status — {server_name}{marker}",
+                    status,
+                ),
+                ephemeral=True,
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"⚠️ **{server_name}{marker}** — "
+                f"status lookup failed: `{type(error).__name__}`",
+                ephemeral=True,
+            )
+        return
+
+    try:
+        keeper_data = await asyncio.to_thread(
+            get_server,
+            server_guid,
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"⚠️ Player lookup failed for **{server_name}**: "
+            f"`{type(error).__name__}`",
+            ephemeral=True,
+        )
+        return
+
+    platform = normalize_platform_label(
+        record.get("platform", "Unknown")
+    )
+
+    # Rich score/K/D/KDR output is PC+BFLIST only.
+    if platform == "PC":
+        bflist_server = await asyncio.to_thread(
+            get_bflist_server_for_guid,
+            server_guid,
+            keeper_data,
+        )
+        if bflist_server is not None:
+            rich_teams = bflist_scoreboard_teams(
+                bflist_server,
+                keeper_data,
+            )
+            if rich_teams:
+                formatter = (
+                    wide_scoreboard_messages
+                    if layout == "wide"
+                    else mobile_scoreboard_messages
+                )
+                for scoreboard_message in formatter(
+                    rich_teams,
+                    server_name,
+                ):
+                    await interaction.followup.send(
+                        scoreboard_message,
+                        ephemeral=True,
+                    )
+                return
+
+        print(
+            f"BFLIST rich scoreboard unavailable for {server_name}; "
+            "using Keeper fallback.",
+            flush=True,
+        )
+
+    # Console servers and failed PC enrichment intentionally retain the
+    # existing v1.3.5 Keeper name-only side-by-side output.
+    keeper_teams = keeper_team_rosters(keeper_data)
+    for roster_message in build_player_roster_messages(
+        keeper_teams,
+        server_name,
+    ):
+        await interaction.followup.send(
+            roster_message,
+            ephemeral=True,
+        )
+
+
+@slash_status_server.autocomplete("server")
+async def autocomplete_status_server(
+    interaction: discord.Interaction,
+    current: str,
+):
+    if not isinstance(interaction.user, discord.Member):
+        return []
+    if not can_manage(interaction.user):
+        return []
+    return default_server_choices(current, "all")
 
 
 tree.add_command(status_group)

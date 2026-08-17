@@ -279,3 +279,21 @@ For PC servers, ServerWatcher attempts to enrich the Keeper snapshot with BFLIST
 If BFLIST is unavailable or cannot be matched to the saved PC server GUID, ServerWatcher automatically falls back to Keeper's team/player order and omits numbering.
 
 PS4/5 and XBox servers always use the unnumbered Keeper roster.
+
+
+## v1.3.6 slash status layouts
+
+Administrative status commands are split into:
+
+```text
+/status all
+/status server
+```
+
+`/status all` only performs the all-server status lookup.
+
+`/status server` uses configured-server autocomplete. `players` defaults to false. When player details are enabled, `layout` defaults to Mobile and can optionally be set to Wide.
+
+For PC+BFLIST results, Mobile stacks the rich scoreboards vertically and Wide displays both teams side by side. The rich columns are place, name, score, kills, deaths, and KDR.
+
+Console servers and PC BFLIST fallback retain the existing Keeper name-only side-by-side roster regardless of the layout selection.

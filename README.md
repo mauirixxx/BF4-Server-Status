@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.5
+# BF4 Server Watcher v1.3.6
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -295,6 +295,7 @@ When a newer version is known, automatic map-change announcements include the av
 Management slash commands require `management_min_role_id` or higher. Discord Administrators and the server owner always bypass that role threshold.
 
 - `/status all` — status for every configured server.
+- `/status server server:<selection> [players:true] [layout:Mobile|Wide]` — status for one saved server, with optional rich player stats. Mobile is the default layout.
 - `/announce` — temporarily post current map-style status for every default server; each manual announcement automatically deletes after 10 minutes.
 - `/debug [server:<selection>]` — Keeper diagnostics for any saved server using autocomplete; with no selection it uses the first configured default.
 - `/reload` — reload configuration/server registry and normalize saved platform metadata without guessing from raw GUIDs.
@@ -328,6 +329,46 @@ The administrator `!help` current-configuration output shows each map role, role
 Operation Metro 2014 — @TFA (1529396067072868444) - "Operation Metro 2014 is now live!"
 ```
 
+## Rich slash-status player stats
+
+The administrative `/status` command now has two subcommands:
+
+```text
+/status all
+/status server
+```
+
+`/status all` keeps the existing all-server status behavior and does not expose player/layout options.
+
+`/status server` lets a manager choose one configured server using autocomplete and optionally request player details:
+
+```text
+/status server server:<selection> players:true layout:Mobile
+/status server server:<selection> players:true layout:Wide
+```
+
+`players` defaults to `false`. `layout` defaults to **Mobile**.
+
+For PC servers where BFLIST enrichment succeeds, the slash player view includes:
+
+```text
+PL  NAME  SCORE  K  D  KDR
+```
+
+The PC scoreboard is sorted by BFLIST score within each team. `PL` is the verified score-order position. KDR is calculated as kills divided by deaths; when deaths are zero, KDR is displayed as the kill count rather than dividing by zero.
+
+**Mobile** stacks Team 1 and Team 2 vertically for narrower displays. **Wide** renders the two complete scoreboards side by side for desktop/monitor use.
+
+If BFLIST cannot be used for a PC server, or if the server is PS4/5 or XBox, `/status server ... players:true` deliberately falls back to the existing Keeper name-only side-by-side roster. Keeper fallback output is not changed by the Mobile/Wide selection.
+
+The regular user command:
+
+```text
+!status <server-name> players
+```
+
+remains unchanged from v1.3.5 and continues to use the compact two-team name list.
+
 ## Manual announcement cleanup
 
 Manual announcements created by `/announce` or `!announce` are temporary. Each message is scheduled for deletion after **10 minutes (600 seconds)**.
@@ -343,7 +384,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.5
+BF4 Server Watcher v1.3.6
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.

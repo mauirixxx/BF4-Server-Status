@@ -4,6 +4,22 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.6] - 2026-08-17
+
+### Added
+- Added `/status server` with configured-server autocomplete.
+- Added optional `players` selection to `/status server`; it defaults to false.
+- Added `Mobile` and `Wide` rich player-stat layouts, with Mobile as the default.
+- Added PC+BFLIST player-stat columns for place, name, score, kills, deaths, and KDR.
+- Added vertically stacked Mobile scoreboard rendering.
+- Added side-by-side Wide scoreboard rendering.
+
+### Changed
+- `/status all` remains dedicated to all-server status and does not expose player/layout options.
+- The regular user `!status <server> players` output remains unchanged from v1.3.5.
+- Console servers and PC BFLIST fallback continue to use the existing Keeper name-only roster regardless of slash layout selection.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.6.
+
 ## [v1.3.5] - 2026-08-16
 
 ### Added
