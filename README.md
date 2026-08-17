@@ -1,4 +1,4 @@
-# BF4 Server Watcher v1.3.4
+# BF4 Server Watcher v1.3.5
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
 
@@ -231,18 +231,38 @@ The normal user `!status` command supports an optional `players` view:
 !status flubber players
 ```
 
-This displays the active team player names side by side in a fixed-width code block. Team `0` / unassigned entries are not shown, and no player-role information is included.
-
-The `players` option uses the same `status_min_role_id` and listen-channel permissions as the existing user `!status` command.
-
-Partial server-name matching still works. If the server name is ambiguous, the normal numbered selection flow preserves the requested player-roster view:
+Roster headings always retain the BF4 team number and add Keeper's faction value when recognized:
 
 ```text
-!status slo players
-!status 2
+TEAM 1 - US (32)        TEAM 2 - RU (31)
 ```
 
-The roster is built from the same Keeper server snapshot used for the lookup; it does not perform separate per-player requests.
+BF4 faction IDs are displayed as `US`, `RU`, or `CN`. If faction data is missing or unrecognized, ServerWatcher falls back to `TEAM 1 (32)` / `TEAM 2 (31)` rather than guessing.
+
+### PC servers
+
+For saved servers whose platform is `PC`, ServerWatcher first fetches the Keeper snapshot for universal team/faction data, then attempts BFLIST enrichment for the current scoreboard.
+
+When BFLIST is available, only normal player entries are used, each team is sorted by score from highest to lowest, commanders/non-player entries are excluded, and the displayed positions are numbered:
+
+```text
+TEAM 1 - US (32)             TEAM 2 - RU (31)
+------------------------     ------------------------
+01. PlayerOne                01. PlayerAlpha
+02. PlayerTwo                02. PlayerBravo
+```
+
+BFLIST's BF4 v2 single-server endpoint is keyed by IP:port, so ServerWatcher resolves a PC server by querying the BFLIST current-server endpoint for one of the live player names from Keeper and verifies that the returned server GUID matches the saved GUID before using its scoreboard data.
+
+If BFLIST cannot be resolved or queried, the command gracefully falls back to Keeper's `teamInfo` order. Keeper fallback is intentionally **not numbered**, because that returned order is not guaranteed to be the live score leaderboard.
+
+### PlayStation and Xbox servers
+
+PS4/5 and XBox rosters continue to use Keeper only. Players remain grouped by active team in Keeper's returned order and are not numbered. The faction-aware `TEAM 1 - US/RU/CN` headings still apply when Keeper supplies a recognized faction value.
+
+Team `0` / unassigned entries are not shown. Player role information is not displayed.
+
+The `players` option uses the same `status_min_role_id` and listen-channel permissions as the existing user `!status` command. Partial server-name matching and the numbered server-selection flow remain supported.
 
 ## Status role behavior
 
@@ -323,7 +343,7 @@ AAA • Dawnbreaker
 AAA currently has 63 players
 Flubber • Operation Locker
 Flubber currently has 48 players
-BF4 Server Watcher v1.3.4
+BF4 Server Watcher v1.3.5
 ```
 
 Presence uses cached watcher data and does not create extra Keeper polling requests.

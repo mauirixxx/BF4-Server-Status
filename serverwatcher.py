@@ -5,13 +5,13 @@ import asyncio
 import shlex
 import shutil
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.4"
+BOT_VERSION = "v1.3.5"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -790,6 +790,13 @@ def build_message(title, status, server_name=None):
     return message
 
 
+FACTION_LABELS = {
+    0: "US",
+    1: "RU",
+    2: "CN",
+}
+
+
 def player_display_name(player):
     if not isinstance(player, dict):
         return "Unknown"
@@ -800,8 +807,16 @@ def player_display_name(player):
     return "Unknown"
 
 
-def team_player_names(data):
-    """Return active BF4 teams and their player names; team 0/unassigned is omitted."""
+def faction_label(value):
+    faction_id = as_int(value)
+    return FACTION_LABELS.get(faction_id)
+
+
+def keeper_team_rosters(data):
+    """
+    Return Keeper team rosters in the API-provided player order.
+    Team 0/unassigned is intentionally omitted.
+    """
     teams = data.get("teamInfo", {})
     if not isinstance(teams, dict):
         return []
@@ -810,16 +825,23 @@ def team_player_names(data):
     for team_id, team in teams.items():
         if str(team_id) == "0" or not isinstance(team, dict):
             continue
+
         players = team.get("players", {})
         names = []
         if isinstance(players, dict):
             for player in players.values():
                 if isinstance(player, dict):
                     names.append(player_display_name(player))
-        result.append((str(team_id), names))
+
+        result.append({
+            "team_id": str(team_id),
+            "faction": faction_label(team.get("faction")),
+            "names": names,
+            "numbered": False,
+        })
 
     def team_key(item):
-        team_id = item[0]
+        team_id = item["team_id"]
         try:
             return (0, int(team_id))
         except (TypeError, ValueError):
@@ -828,35 +850,183 @@ def team_player_names(data):
     return sorted(result, key=team_key)
 
 
-def build_player_roster_messages(data, server_name):
+def keeper_player_candidates(data):
+    """
+    Return player names suitable for locating a PC server through BFLIST.
+    Prefer normal players and skip commanders where Keeper exposes the role.
+    """
+    candidates = []
+    seen = set()
+    teams = data.get("teamInfo", {})
+    if not isinstance(teams, dict):
+        return candidates
+
+    for team_id, team in teams.items():
+        if str(team_id) == "0" or not isinstance(team, dict):
+            continue
+        players = team.get("players", {})
+        if not isinstance(players, dict):
+            continue
+
+        for player in players.values():
+            if not isinstance(player, dict):
+                continue
+            role = player_role(player)
+            if role == "commander":
+                continue
+            name = player_display_name(player)
+            key = name.casefold()
+            if name != "Unknown" and key not in seen:
+                seen.add(key)
+                candidates.append(name)
+
+    return candidates
+
+
+def get_bflist_server_for_guid(server_guid, keeper_data):
+    """
+    Resolve a live PC server through BFLIST using one of Keeper's player names.
+
+    BFLIST's v2 single-server endpoint is keyed by IP:port, while its
+    player-current-server endpoint returns the full server object including
+    GUID and scoreboard data. We verify the returned GUID before using it.
+    """
+    target_guid = str(server_guid or "").strip().lower()
+    if not target_guid:
+        return None
+
+    # Try several names in case a player lookup is unavailable or ambiguous.
+    for name in keeper_player_candidates(keeper_data)[:12]:
+        try:
+            response = requests.get(
+                "https://api.bflist.io/v2/bf4/players/"
+                f"{quote(name, safe='')}/server",
+                timeout=6,
+            )
+            if response.status_code != 200:
+                continue
+            server = response.json()
+            if not isinstance(server, dict):
+                continue
+            if str(server.get("guid", "")).strip().lower() != target_guid:
+                continue
+            if not isinstance(server.get("players"), list):
+                continue
+            return server
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+
+    return None
+
+
+def bflist_team_rosters(bflist_server, keeper_data):
+    """
+    Return verified PC scoreboard order from BFLIST.
+
+    Only normal Player entries are included. Each team is sorted by score
+    descending and numbered from 01 within that team.
+    """
+    keeper_teams = {
+        item["team_id"]: item
+        for item in keeper_team_rosters(keeper_data)
+    }
+
+    grouped = {}
+    players = bflist_server.get("players", [])
+    if not isinstance(players, list):
+        return []
+
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+
+        player_type = as_int(player.get("type"))
+        type_label = str(player.get("typeLabel", "")).strip().lower()
+        if player_type not in (None, 0):
+            continue
+        if type_label and type_label != "player":
+            continue
+
+        team_id_value = as_int(player.get("team"))
+        if team_id_value is None or team_id_value <= 0:
+            continue
+        team_id = str(team_id_value)
+
+        grouped.setdefault(team_id, []).append({
+            "name": player_display_name(player),
+            "score": as_int(player.get("score")) or 0,
+        })
+
+    result = []
+    all_team_ids = sorted(
+        set(keeper_teams) | set(grouped),
+        key=lambda value: (
+            0,
+            int(value),
+        ) if str(value).isdigit() else (1, str(value)),
+    )
+
+    for team_id in all_team_ids:
+        rows = grouped.get(team_id, [])
+        rows.sort(
+            key=lambda row: (
+                -row["score"],
+                row["name"].casefold(),
+            )
+        )
+        result.append({
+            "team_id": team_id,
+            "faction": keeper_teams.get(team_id, {}).get("faction"),
+            "names": [row["name"] for row in rows],
+            "numbered": True,
+        })
+
+    return result
+
+
+def roster_header(team):
+    label = f"TEAM {team['team_id']}"
+    faction = team.get("faction")
+    if faction:
+        label += f" - {faction}"
+    return f"{label} ({len(team.get('names', []))})"
+
+
+def roster_display_names(team):
+    names = list(team.get("names", []))
+    if not team.get("numbered"):
+        return names
+
+    width = max(2, len(str(max(len(names), 1))))
+    return [
+        f"{index:0{width}d}. {name}"
+        for index, name in enumerate(names, start=1)
+    ]
+
+
+def build_player_roster_messages(teams, server_name, source_label=None):
     """
     Build one or more Discord-safe side-by-side team roster messages.
-    Player roles are intentionally not shown.
+
+    Numbering is only used for BFLIST-backed PC scoreboard order. Keeper
+    fallback/console output remains unnumbered to avoid implying rank.
     """
-    teams = team_player_names(data)
     if not teams:
         return [
             f"👥 **BF4 Players — {server_name}**\n"
             "No team player data is available for this server."
         ]
 
-    # BF4 normal matches use two active teams. If an unusual snapshot exposes
-    # more than two, render subsequent pairs as additional roster blocks.
     messages = []
     for pair_start in range(0, len(teams), 2):
         pair = teams[pair_start:pair_start + 2]
-        left_id, left_names = pair[0]
-        if len(pair) == 2:
-            right_id, right_names = pair[1]
-        else:
-            right_id, right_names = "", []
+        left = pair[0]
+        right = pair[1] if len(pair) == 2 else None
 
-        left_header = f"TEAM {left_id} ({len(left_names)})"
-        right_header = (
-            f"TEAM {right_id} ({len(right_names)})"
-            if right_id
-            else ""
-        )
+        left_header = roster_header(left)
+        right_header = roster_header(right) if right else ""
+        left_names = roster_display_names(left)
+        right_names = roster_display_names(right) if right else []
 
         left_width = max(
             [len(left_header)] + [len(name) for name in left_names] + [1]
@@ -868,29 +1038,31 @@ def build_player_roster_messages(data, server_name):
         row_count = max(len(left_names), len(right_names), 1)
         rows = []
         for index in range(row_count):
-            left = left_names[index] if index < len(left_names) else ""
-            right = right_names[index] if index < len(right_names) else ""
-            if right_id:
+            left_name = left_names[index] if index < len(left_names) else ""
+            right_name = right_names[index] if index < len(right_names) else ""
+            if right:
                 rows.append(
-                    f"{left.ljust(left_width)}   {right.ljust(right_width)}".rstrip()
+                    f"{left_name.ljust(left_width)}   "
+                    f"{right_name.ljust(right_width)}".rstrip()
                 )
             else:
-                rows.append(left)
+                rows.append(left_name)
 
         header_line = (
             f"{left_header.ljust(left_width)}   {right_header}".rstrip()
-            if right_id
+            if right
             else left_header
         )
         divider_line = (
             f"{'-' * left_width}   {'-' * len(right_header)}"
-            if right_id
+            if right
             else "-" * left_width
         )
 
         prefix = f"👥 **BF4 Players — {server_name}**\n"
-        # Keep code blocks below Discord's message ceiling and repeat headers
-        # if an unexpectedly large roster needs multiple messages.
+        if source_label:
+            prefix += f"*{source_label}*\n"
+
         current_rows = []
         for row in rows:
             candidate_rows = current_rows + [row]
@@ -917,6 +1089,7 @@ def build_player_roster_messages(data, server_name):
         )
 
     return messages
+
 
 
 def compact_player_sample(player):
@@ -3242,14 +3415,41 @@ async def on_message(message):
             )
 
             if players_requested:
-                # Fetch one Keeper snapshot and build the roster directly
-                # from teamInfo. No player-role information is displayed.
-                data = await asyncio.to_thread(
+                # Keeper remains the universal source for team/faction data.
+                # PC servers additionally use BFLIST when available to obtain
+                # verified scoreboard order and score-based numbering.
+                keeper_data = await asyncio.to_thread(
                     get_server,
                     server_guid,
                 )
+                platform = normalize_platform_label(
+                    record.get("platform", "Unknown")
+                )
+
+                teams = None
+                if platform == "PC":
+                    bflist_server = await asyncio.to_thread(
+                        get_bflist_server_for_guid,
+                        server_guid,
+                        keeper_data,
+                    )
+                    if bflist_server is not None:
+                        teams = bflist_team_rosters(
+                            bflist_server,
+                            keeper_data,
+                        )
+                    else:
+                        print(
+                            f"BFLIST roster unavailable for {server_name}; "
+                            "using Keeper fallback.",
+                            flush=True,
+                        )
+
+                if not teams:
+                    teams = keeper_team_rosters(keeper_data)
+
                 for roster_message in build_player_roster_messages(
-                    data,
+                    teams,
                     server_name,
                 ):
                     await message.channel.send(roster_message)

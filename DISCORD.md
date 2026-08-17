@@ -268,3 +268,14 @@ Users who already have permission to use `!status` can request the current team 
 ```
 
 The result displays player names side by side by active team. Player roles are not displayed. Partial-name and numbered-selection behavior remains supported.
+
+
+## v1.3.5 PC scoreboard enrichment
+
+`!status <server-name> players` keeps `TEAM 1` / `TEAM 2` as the stable side identifiers and adds the Keeper faction label when recognized (`US`, `RU`, `CN`).
+
+For PC servers, ServerWatcher attempts to enrich the Keeper snapshot with BFLIST's live BF4 scoreboard data. When BFLIST succeeds, each team is ordered by score and numbered `01.`, `02.`, etc. Commanders/non-player entries are excluded from the numbered scoreboard.
+
+If BFLIST is unavailable or cannot be matched to the saved PC server GUID, ServerWatcher automatically falls back to Keeper's team/player order and omits numbering.
+
+PS4/5 and XBox servers always use the unnumbered Keeper roster.

@@ -4,6 +4,23 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.5] - 2026-08-16
+
+### Added
+- Added dynamic BF4 faction labels to player-roster headings while retaining `TEAM 1` / `TEAM 2`.
+- Added BF4 faction mapping: `0 = US`, `1 = RU`, `2 = CN`, with an unlabelled fallback for unknown values.
+- Added BFLIST v2 scoreboard enrichment for PC `!status <server> players` requests.
+- Added verified PC scoreboard positions formatted as `01.`, `02.`, etc.
+- Added BFLIST server verification against the saved BF4 server GUID before scoreboard data is used.
+- Added graceful Keeper fallback when BFLIST is unavailable, ambiguous, fails, or cannot verify the target PC server.
+
+### Changed
+- PC player rosters use BFLIST score-descending team order when enrichment succeeds.
+- BFLIST-backed PC rosters exclude commander/non-player entries from the numbered scoreboard.
+- Keeper fallback and console rosters remain unnumbered so API-return order is not presented as scoreboard rank.
+- PS4/5 and XBox `players` output remains Keeper-only.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.5.
+
 ## [v1.3.4] - 2026-08-16
 
 ### Added
