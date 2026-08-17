@@ -4,6 +4,19 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v1.3.7] - 2026-08-17
+
+### Changed
+- Wide `/status server ... players:true` output now uses a conservative 1750-character pre-chunking ceiling.
+- Every Wide continuation chunk repeats the team headings and stat-column headers.
+- Slash player-stat and Keeper-fallback chunks are posted as ordinary channel messages instead of interaction follow-ups.
+- The deferred slash response is removed after player-output messages are posted.
+- Updated `README.md`, `DISCORD.md`, Docker image tag, and application version for v1.3.7.
+
+### Fixed
+- Fixed large Wide scoreboards producing Discord reply-style continuation banners when multiple interaction follow-up messages were required.
+- Fixed full-server Wide output reaching Discord's practical message-size boundary before splitting.
+
 ## [v1.3.6] - 2026-08-17
 
 ### Added

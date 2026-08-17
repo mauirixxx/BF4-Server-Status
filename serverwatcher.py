@@ -11,7 +11,7 @@ import requests
 import discord
 from dotenv import load_dotenv
 
-BOT_VERSION = "v1.3.6"
+BOT_VERSION = "v1.3.7"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 LATEST_VERSION = None
@@ -1134,8 +1134,8 @@ def mobile_scoreboard_messages(teams, server_name):
     return messages
 
 
-def wide_scoreboard_messages(teams, server_name):
-    """Render two rich BFLIST scoreboard teams side by side for desktop users."""
+def wide_scoreboard_messages(teams, server_name, message_limit=1750):
+    """Render desktop scoreboards in pre-sized chunks below Discord limits."""
     if not teams:
         return []
 
@@ -1232,7 +1232,7 @@ def wide_scoreboard_messages(teams, server_name):
                 [header_line, divider_line, cols_line] + candidate
             )
             message = prefix + "```text\n" + body + "\n```"
-            if current and len(message) > 1900:
+            if current and len(message) > message_limit:
                 body = "\n".join(
                     [header_line, divider_line, cols_line] + current
                 )
@@ -2473,6 +2473,49 @@ async def slash_status_all(interaction: discord.Interaction):
             )
 
 
+async def send_clean_status_chunks(
+    interaction: discord.Interaction,
+    chunks,
+):
+    """
+    Send scoreboard/roster chunks as normal channel messages, then remove the
+    deferred interaction response so Discord does not render follow-ups as
+    reply-style continuations.
+    """
+    channel = interaction.channel
+    if channel is None:
+        await interaction.followup.send(
+            "⚠️ The current Discord channel could not be resolved.",
+            ephemeral=True,
+        )
+        return False
+
+    try:
+        for chunk in chunks:
+            await channel.send(chunk)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+        return True
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "⚠️ I could not post the player output in this channel.",
+            ephemeral=True,
+        )
+        return False
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"⚠️ Player output failed: `{type(error).__name__}`",
+            ephemeral=True,
+        )
+        print(
+            f"PLAYER OUTPUT ERROR: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        return False
+
+
 @status_group.command(
     name="server",
     description="Show status or player details for one configured BF4 server",
@@ -2575,14 +2618,14 @@ async def slash_status_server(
                     if layout == "wide"
                     else mobile_scoreboard_messages
                 )
-                for scoreboard_message in formatter(
+                scoreboard_messages = formatter(
                     rich_teams,
                     server_name,
-                ):
-                    await interaction.followup.send(
-                        scoreboard_message,
-                        ephemeral=True,
-                    )
+                )
+                await send_clean_status_chunks(
+                    interaction,
+                    scoreboard_messages,
+                )
                 return
 
         print(
@@ -2594,14 +2637,14 @@ async def slash_status_server(
     # Console servers and failed PC enrichment intentionally retain the
     # existing v1.3.5 Keeper name-only side-by-side output.
     keeper_teams = keeper_team_rosters(keeper_data)
-    for roster_message in build_player_roster_messages(
+    roster_messages = build_player_roster_messages(
         keeper_teams,
         server_name,
-    ):
-        await interaction.followup.send(
-            roster_message,
-            ephemeral=True,
-        )
+    )
+    await send_clean_status_chunks(
+        interaction,
+        roster_messages,
+    )
 
 
 @slash_status_server.autocomplete("server")

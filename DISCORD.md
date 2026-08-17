@@ -297,3 +297,10 @@ Administrative status commands are split into:
 For PC+BFLIST results, Mobile stacks the rich scoreboards vertically and Wide displays both teams side by side. The rich columns are place, name, score, kills, deaths, and KDR.
 
 Console servers and PC BFLIST fallback retain the existing Keeper name-only side-by-side roster regardless of the layout selection.
+
+
+## v1.3.7 wide scoreboard continuation
+
+Large Wide player-stat outputs are split into multiple clean channel messages before they approach Discord's message limit. Every continuation repeats the team and stat headers.
+
+`/status server` player-output chunks are sent as normal channel messages and the deferred slash response is cleared, avoiding Discord's reply-style follow-up banner.
