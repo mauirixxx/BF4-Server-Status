@@ -1,7 +1,7 @@
 services:
   bf4-server-watcher:
     build: .
-    image: bf4-server-watcher:1.3.8
+    image: bf4-server-watcher:2.0.0
     container_name: BF4_ServerWatcher
     restart: unless-stopped
     env_file:
@@ -9,4 +9,8 @@ services:
     environment:
       SERVERWATCHER_RUNTIME_DIR: /data
     volumes:
+      # Kept for v1.x migration access to legacy config.json/servers.json.
+      # v2 runtime configuration is database-backed and does not use JSON.
       - ./:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

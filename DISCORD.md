@@ -1,53 +1,22 @@
-# Discord Setup Guide
+# Discord Setup
 
-This guide is for users who have never created a Discord bot before.
+BF4 Server Watcher v2 can serve multiple Discord guilds from one bot instance.
 
-The examples assume BF4 Server Watcher is installed at `/opt/bf4-serverstatus`. If you installed it somewhere else, use your installation directory instead.
+## Developer Portal
 
-## 1. Create a Discord application
+Create a Discord application and bot in the Discord Developer Portal.
 
-1. Sign in to the Discord Developer Portal.
-2. Open **Applications**.
-3. Select **New Application**.
-4. Give it a name such as `BF4 Server Watcher`.
-5. Create/open the application.
-6. Open the **Bot** section and create the bot user if Discord presents that option.
+Enable **Message Content Intent** because the normal user commands remain `!` prefix commands.
 
-## 2. Create and protect the bot token
+The bot token belongs in `.env`:
 
-In **Bot**, create/reset the token and copy it.
-
-Treat the token like a password. Do not paste it into Discord, commit it to Git, or store it in `config.json`.
-
-On the Docker host:
-
-```bash
-cd /opt/bf4-serverstatus
-cp .env.example .env
+```env
+DISCORD_TOKEN=...
 ```
 
-Edit `.env`:
+Never commit the real token.
 
-```text
-DISCORD_TOKEN=your_real_discord_bot_token
-```
-
-## 3. Enable Message Content Intent
-
-ServerWatcher uses `!` prefix commands for regular users and Discord application/slash commands for management.
-
-In the Developer Portal:
-
-1. Open **Bot**.
-2. Find **Privileged Gateway Intents**.
-3. Enable **Message Content Intent**.
-4. Save changes if prompted.
-
-## 4. Invite/install the bot
-
-Use the application's installation/OAuth2 section to generate an invite/install link for your Discord server. Ensure the installation includes the bot and **application commands (`applications.commands`)** so the management `/` commands can be registered.
-
-Grant the bot:
+## Recommended bot permissions
 
 - View Channel
 - Send Messages
@@ -56,258 +25,132 @@ Grant the bot:
 - Manage Messages
 - Mention @everyone, @here, and All Roles
 
-`Manage Messages` is used to remove the previous automatic map-change announcement. The mention permission allows map-role pings.
+Administrator permission is not required.
 
-ServerWatcher does **not** require Discord Administrator permission.
+## Slash commands
 
-Complete the authorization flow and select the server where you are allowed to add applications/bots.
+Management commands use Discord slash commands.
 
-## 5. Create Discord channels
+ServerWatcher syncs the command tree at startup and logs the accepted command names/count to Docker logs.
 
-### Announcement channel
+If Discord's client does not immediately show a newly registered command, refresh the Discord client (`Ctrl+R` on desktop).
 
-Create a protected channel for automatic BF4 map announcements. This becomes `announcement_channel_id`.
+## Multi-guild behavior
 
-It is recommended that normal users cannot post there. ServerWatcher also protects the channel internally: non-management users cannot run bot commands there.
+Each Discord guild receives independent database-backed configuration.
 
-### Listen/command channels
-
-Create one or more channels where regular users can use:
+When the bot joins a guild, ServerWatcher immediately creates its guild records and seeds:
 
 ```text
-!help
-!list
-!status
-!status turtles
-!version
+AAA as a default BF4 server
+announcement channel = 0
+listen channels = none
+management minimum role = 0
+status minimum role = 0
+Operation Locker map role:
+  role_id = 0
+  message = Operation Locker is now live!
 ```
 
-These channels become entries in `listen_channel_id`.
+The AAA BF4 server itself exists once globally and is reused across every guild.
 
-Managers can run slash-management commands in both the announcement channel and all configured listen channels. `!announce` is also retained as a chat-command alias.
+## First-time guild bootstrap
 
-## 6. Enable Developer Mode and copy IDs
+A brand-new guild has no configured announcement/listen channels.
 
-Enable **Developer Mode** in the Discord client settings. Then use the context menu on channels and roles to copy IDs.
+To avoid a configuration dead end, managers may use management commands in any channel while the guild has no command channels configured.
 
-Useful IDs include:
+After an announcement channel or listen channel exists, the normal channel restrictions apply.
 
-- Announcement channel ID.
-- Listen/command channel IDs.
-- Management minimum role ID.
-- Optional status minimum role ID.
-- Map-ping role IDs.
+## Announcement channel
 
-ServerWatcher channel-management commands can also resolve channel mentions and exact case-insensitive channel names.
-
-## 7. Create config.json
-
-On the host:
-
-```bash
-cd /opt/bf4-serverstatus
-cp config.example.json config.json
-```
-
-Example:
-
-```json
-{
-  "announcement_channel_id": 111111111111111111,
-  "listen_channel_id": [
-    222222222222222222,
-    333333333333333333
-  ],
-  "management_min_role_id": 444444444444444444,
-  "status_min_role_id": 0,
-  "check_interval_seconds": 69,
-  "map_role_pings": {
-    "Operation Locker": {
-      "role_id": 123456789012345678,
-      "message": "Operation Locker is now live!"
-    }
-  }
-}
-```
-
-`listen_channel_id` must be an array. `[0]` means no regular-user command channel is configured.
-
-`status_min_role_id: 0` allows any user in an allowed listen channel to use normal `!status` commands.
-
-A nonzero `management_min_role_id` gives that role or higher access to management commands. Discord Administrators/server owner always bypass the ServerWatcher role threshold.
-
-## 8. Discord permissions vs. ServerWatcher access controls
-
-These are separate layers.
-
-Discord permissions control what the **bot** can see/do.
-
-ServerWatcher settings control which **people** can invoke commands:
-
-- `announcement_channel_id` — automatic/manual announcement destination; managers may also run commands there.
-- `listen_channel_id` — regular-user command channels.
-- `management_min_role_id` — manager command threshold.
-- `status_min_role_id` — optional role threshold for normal status lookups.
-
-Even if a user can type in the announcement channel because Discord permissions were configured incorrectly, ServerWatcher itself refuses that user's commands there.
-
-## 9. Start the bot
-
-```bash
-cd /opt/bf4-serverstatus
-docker compose build
-docker compose up -d
-docker logs -f BF4_ServerWatcher
-```
-
-A healthy startup shows Discord login, the ServerWatcher version, and the current map for the default BF4 server.
-
-## 10. Initial tests
-
-In a configured listen channel:
+Use:
 
 ```text
-!version
-!help
-!list
-!status
+/setannouncementchannel
 ```
 
-As a manager, `!help` in either a listen channel or the announcement channel shows the management command section and current settings.
+to choose the guild's automatic announcement destination.
 
-## Slash-command synchronization
+Automatic map-change announcement message IDs are persisted in the database. ServerWatcher can therefore delete/replace the previous automatic message after a restart.
 
-ServerWatcher syncs its management slash commands with Discord when the bot starts. The Docker log reports how many commands were synced.
+## Listen channels
 
-Global Discord slash commands may take a short time to appear after a new install or release. If the bot is online but a newly added `/` command is not visible immediately, give Discord time to propagate the command and then refresh/reopen the Discord client.
-
-## Security reminders
-
-- Never publish the bot token.
-- Never commit `.env`.
-- Live `config.json` is intentionally excluded by `.gitignore`.
-- Do not grant the bot Discord Administrator unless you independently need it.
-- Keep the ServerWatcher management role restricted.
-
-
-## Listen-channel management
-
-Managers can add or remove multiple listen channels in one command. Each argument may be a channel mention, numeric ID, or exact channel name; quote names containing spaces.
+Use:
 
 ```text
-!addlistenchannel general bf4-chat 123456789012345678
-!dellistenchannel general bf4-chat
+/addlistenchannel
+/dellistenchannel
 ```
 
-`!addlistenchannel` applies valid additions immediately. `!dellistenchannel` stages the removals and requires the same initiating administrator to use `!confirm` or `!cancel`. Each administrator can have one pending confirmation-required operation at a time.
+to manage channels where normal users may use `!` commands.
 
+Managers may use management commands in the configured announcement channel or listen channels.
 
-## Tested BF4 platforms
+## Role thresholds
 
-ServerWatcher has been successfully tested with Battlefield 4 servers on PC, PlayStation 4/5 backward compatibility, and Xbox. The same GUID-based status workflow is used across the tested platforms.
+`/setmanagementrole` controls the normal management-role threshold.
 
+When the configured management role is `0`, Discord Administrators and the guild owner may manage ServerWatcher.
 
+`/setstatusrole` controls normal `!status` access.
 
-## v1.3.2 server management
+A status role of `0` allows everyone in configured listen channels to use `!status`.
 
-Use `/addserver` to add BF4 servers. Paste one or more Battlelog server URLs into the `server_urls` field. Both `/show/<platform>/<guid>/` and `/show/<platform>/<guid>/<server-name>/` forms are accepted. ServerWatcher extracts the GUID and trusts the platform encoded in the URL.
+Discord Administrators and the guild owner continue to bypass role thresholds.
 
-`make_default:true` applies to every successfully processed URL in that command.
+## Servers and defaults
 
-Default-server management uses:
+Each guild has its own server relationships and display names:
 
 ```text
+/addserver
+/delserver
+/renameserver
 /defaultserver add
 /defaultserver remove
 /defaultserver list
 ```
 
-The add/remove subcommands use Discord autocomplete.
+Two guilds may track the same BF4 server under different display names.
 
-Adding a default immediately posts its current automatic status announcement. Removing a default immediately removes that server's current automatic announcement and cached watcher state.
+The global polling layer still performs one Keeper lookup per unique BF4 server GUID per cycle.
 
-`/debug` has an optional saved-server autocomplete selector. With no selection it uses the first configured default server.
+## Map-role pings
 
-Manual `/announce` and `!announce` messages automatically delete after 10 minutes.
-
-ServerWatcher allows zero, one, or multiple default servers. Named `!status <server>` lookups and `/status all` still work when no defaults are configured.
-
-### v1.3.0 platform metadata repair
-
-v1.3.0 could incorrectly label console servers as PC because its platform probe was not reliable. v1.3.1 does not guess console platform from a raw GUID.
-
-On first v1.3.1 load, unverified v1.3.0 PC labels are reset to `Unknown`. Re-run `/addserver` with the full Battlelog URL for an existing server to repair its platform metadata; matching GUIDs are updated instead of duplicated.
-
-
-## v1.3.2 management cleanup
-
-- `/delserver` replaces `/delserverguid` and uses autocomplete. It deletes immediately but refuses to delete a current default server.
-- `/renameserver` uses autocomplete and changes only the saved display name.
-- `/dellistenchannel`, `/setmaprole`, and `/delmaprole` now apply immediately.
-- `/confirm` and `/cancel` were removed because no remaining management operation uses staged confirmation.
-- Multi-server lists sort PC first, then PS4/5, XBox, and Unknown, with alphabetical sorting inside each platform.
-- Unknown platforms are displayed explicitly as `(Unknown)`.
-- Startup logs include the slash-command names returned by Discord after synchronization.
-
-
-## v1.3.3 map-role editing
-
-`/editmaprole` edits an existing configured map-role ping. Choose the map from autocomplete, optionally select a replacement Discord role, and submit the command. ServerWatcher then opens a modal with the existing/default map ping message pre-filled.
-
-Leaving the optional role blank preserves the existing role. The edited message is saved immediately when the modal is submitted.
-
-Administrator `!help` output displays each configured map-role ping on one line with its role and configured/default message.
-
-
-## v1.3.4 user player roster
-
-Users who already have permission to use `!status` can request the current team rosters for one saved server:
+Use:
 
 ```text
-!status <server-name> players
+/setmaprole
+/editmaprole
+/delmaprole
 ```
 
-The result displays player names side by side by active team. Player roles are not displayed. Partial-name and numbered-selection behavior remains supported.
+The BF4 map catalog is stored in the database and is shared by all guilds.
 
+A role ID of `0` means the map ping is disabled.
 
-## v1.3.5 PC scoreboard enrichment
+## User commands
 
-`!status <server-name> players` keeps `TEAM 1` / `TEAM 2` as the stable side identifiers and adds the Keeper faction label when recognized (`US`, `RU`, `CN`).
-
-For PC servers, ServerWatcher attempts to enrich the Keeper snapshot with BFLIST's live BF4 scoreboard data. When BFLIST succeeds, each team is ordered by score and numbered `01.`, `02.`, etc. Commanders/non-player entries are excluded from the numbered scoreboard.
-
-If BFLIST is unavailable or cannot be matched to the saved PC server GUID, ServerWatcher automatically falls back to Keeper's team/player order and omits numbering.
-
-PS4/5 and XBox servers always use the unnumbered Keeper roster.
-
-
-## v1.3.6 slash status layouts
-
-Administrative status commands are split into:
+Normal users use:
 
 ```text
-/status all
-/status server
+!help
+!list
+!status
+!status <server>
+!status <server> players
+!version
 ```
 
-`/status all` only performs the all-server status lookup.
+`!announce` is retained as a management-only chat alias.
 
-`/status server` uses configured-server autocomplete. `players` defaults to false. When player details are enabled, `layout` defaults to Mobile and can optionally be set to Wide.
+## Guild removal and rejoin
 
-For PC+BFLIST results, Mobile stacks the rich scoreboards vertically and Wide displays both teams side by side. The rich columns are place, name, score, kills, deaths, and KDR.
+If the bot is removed from a guild, its guild-scoped configuration is retained for 30 days.
 
-Console servers and PC BFLIST fallback retain the existing Keeper name-only side-by-side roster regardless of the layout selection.
+If the bot rejoins during that window, ServerWatcher clears the leave timestamp and restores the existing configuration.
 
+At 00:00 UTC each day, guilds absent for at least 30 days have their guild-scoped state transactionally removed.
 
-## v1.3.7 wide scoreboard continuation
-
-Large Wide player-stat outputs are split into multiple clean channel messages before they approach Discord's message limit. Every continuation repeats the team and stat headers.
-
-`/status server` player-output chunks are sent as normal channel messages and the deferred slash response is cleared, avoiding Discord's reply-style follow-up banner.
-
-
-## v1.3.8 presence rotation timing
-
-Use `/setpresenceupdate` to change the Discord presence rotation interval. The effective value is clamped to 10-60 seconds and saved immediately.
-
-Existing installations without the new setting default to 30 seconds. `/reload` is sufficient after manual `config.json` edits; no bot restart is required.
+Permanent command-audit history is never removed by guild cleanup.

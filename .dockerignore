@@ -1,5 +1,8 @@
 .env
 __pycache__/
-*.pyc
+*.py[cod]
 *.zip
+.pytest_cache/
 config.json
+servers.json
+maps.json

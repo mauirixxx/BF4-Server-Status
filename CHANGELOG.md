@@ -2,7 +2,180 @@
 
 All notable changes to BF4 Server Watcher are recorded here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
+
+## [v2.0.0] - 2026-08-17
+
+### Major architecture
+- Reworked BF4 Server Watcher from a single-Discord flat-file application into a database-backed multi-guild bot.
+- Added independent configuration/state for every Discord guild while sharing global Battlefield 4 server metadata and external API results.
+- Added PostgreSQL as the primary deployment database.
+- Added MySQL/MariaDB compatibility through SQLAlchemy/PyMySQL.
+- Added SQLAlchemy ORM models with `pool_pre_ping=True` connection health checking.
+- Added Alembic migrations and made `alembic upgrade head` a mandatory container startup step.
+- Changed database startup behavior to fail closed after bounded retry/backoff instead of running without authoritative configuration.
+
+### Removed runtime JSON configuration
+- Removed `config.example.json` / runtime `config.json` from the v2 configuration model.
+- Removed `servers.example.json` / runtime `servers.json` from the v2 configuration model.
+- Removed `maps.json`; the static BF4 map catalog now lives in SQL.
+- Legacy v1.x JSON files are read only by the migration importer and remain untouched afterward for rollback/reference.
+- Removed JSON bind-file initialization/copy logic.
+
+### Global environment settings
+- Added `DATABASE_URL` to `.env`.
+- Moved shared polling cadence to global `CHECK_INTERVAL_SECONDS`.
+- Moved Discord presence cadence to global `PRESENCE_UPDATE_SECONDS`.
+- Added optional `LOG_LEVEL`.
+- Added migration-only `LEGACY_IMPORT_GUILD_ID` support for ambiguous v1.x imports.
+- Kept `DISCORD_TOKEN` as a global deployment secret.
+
+### Command removals
+- Removed `/reload`; database-backed state no longer requires JSON reload behavior.
+- Removed `/setinterval`; polling cadence is process-global through `CHECK_INTERVAL_SECONDS`.
+- Removed `/setpresenceupdate`; presence cadence is process-global through `PRESENCE_UPDATE_SECONDS`.
+- Removed related `!help`, README, Discord-guide, and configuration references.
+
+### Database schema
+- Added `guilds` with `guild_id`, current `guild_name`, first `joined_at`, and nullable `left_at`.
+- Added `guild_settings` with per-guild announcement channel, management role, and status role.
+- Added `guild_listen_channels` with composite `(guild_id, channel_id)` primary key.
+- Added global `bf4_servers` keyed by `server_guid`.
+- Added `guild_servers` with composite `(guild_id, server_guid)` primary key, guild-specific `display_name`, and `is_default`.
+- Added static `bf4_maps` keyed directly by `map_key`; no numeric ID/timestamps.
+- Added `guild_map_role_pings` keyed by `(guild_id, map_key)`.
+- Added `guild_server_state` for persisted map/announcement message state.
+- Added permanent `command_audit` metadata storage.
+- Added `migration_state` for idempotent legacy-import state.
+
+### Multi-guild bootstrap
+- Added immediate guild initialization on Discord `on_guild_join`.
+- New guilds start with announcement channel `0`.
+- New guilds start with no listen channels.
+- New guilds start with management minimum role `0`.
+- New guilds start with status minimum role `0`.
+- New guilds automatically receive AAA as a default server using the single global AAA row.
+- New guilds receive Operation Locker map-role configuration with `role_id=0` and message `Operation Locker is now live!`.
+- Added a management-command bootstrap exception so administrators can configure the first channel before announcement/listen channels exist.
+
+### Guild lifecycle
+- Added current guild-name reconciliation with Discord.
+- Preserved `joined_at` as the original first join timestamp.
+- Added `left_at` tracking when the bot leaves a guild.
+- Added automatic rejoin recovery: rejoining within the retention window clears `left_at` and reuses existing configuration.
+- Added 30-day retention for departed guild configuration/state.
+- Added daily guild cleanup at 00:00 UTC.
+- Made guild cleanup transactional across guild settings, listen channels, guild-server relationships, map-role pings, and announcement state.
+- Explicitly excluded global BF4 server rows, static maps, and command-audit history from departed-guild cleanup.
+
+### Permanent command auditing
+- Added durable `command_audit` storage separate from stdout/stderr operational logging.
+- Added immutable invocation-time snapshots of `guild_id` / `guild_name`, `channel_id` / `channel_name`, and `user_id` / `user_name`.
+- Added command name/type, target metadata, success/result/error metadata, duration, and safe JSON request metadata.
+- Command audit rows intentionally do not rely on cascading guild foreign keys.
+- Command audit history is retained indefinitely and is never deleted by guild cleanup.
+- Returned Discord bot output is not stored in command auditing.
+
+### Structured operational logging
+- Replaced new v2 lifecycle logic with Python `logging` rather than scattered `print()` calls.
+- Added UTC timestamp, level, and concise Docker-friendly operational messages.
+- Added startup, database readiness, Alembic, Discord readiness, guild bootstrap/reconciliation, polling, cleanup, migration, announcement, command, and version-check logging.
+- Added explicit success/failure cleanup logs including guild/channel/message identifiers.
+- Added expected exception type/identifier logging and unexpected exception type/message logging.
+- Added meaningful cycle summaries instead of noisy success logs for every tight-loop item.
+- Kept user-facing Discord responses separate from operational logs.
+- Added safeguards against logging secrets/raw sensitive API content.
+
+### Shared/deduplicated BF4 polling
+- Added global BF4 polling keyed by unique `server_guid`.
+- A BF4 server referenced by multiple Discord guilds is looked up once per polling cycle and its fresh result is reused.
+- Added cycle totals for guild-server references, unique BF4 servers, duplicate lookups avoided, succeeded/failed lookups, and fresh player total.
+- Fresh successful snapshots replace current cache data.
+- Failed lookups may leave previous data available only for diagnostics.
+- Stale snapshots are never treated as fresh map changes.
+- Global presence player totals use only successful fresh snapshots from the current cycle.
+- Retained BFLIST/PC enrichment behavior while preserving Keeper fallback/console behavior.
+
+### Persistent announcement state
+- Moved automatic announcement message IDs out of process-only memory and into `guild_server_state`.
+- Persisted previous announcement channel/message IDs per guild/server.
+- Added restart-safe deletion/replacement of previous automatic announcements.
+- Added structured success/failure logs when prior announcement messages are removed.
+- Default-server removal deletes its persisted announcement state and previous Discord message.
+- Adding a default server still performs an immediate current-status announcement when a guild announcement channel is configured.
+- Removing the final default still posts `No default server(s) set`.
+
+### Global Discord presence
+- Replaced guild/default-server-specific presence rotation with bot-wide aggregate presence.
+- Presence now rotates between total unique BF4 servers tracked and total players from current fresh snapshots.
+- A BF4 server referenced by several guilds is counted once.
+- Presence uses the shared monitor cache and generates no extra Keeper polling requests.
+
+### Legacy v1.x migration
+- Added automatic `config.json` / `servers.json` import into the v2 database.
+- Added exact replacement of temporary bootstrap state for the legacy target guild so migrated state matches v1.x data.
+- Added import of announcement channel, listen channels, management/status roles, servers, defaults, platform/Battlelog metadata, map-role IDs, and map-role messages.
+- Added idempotent migration state with not-started/in-progress/completed semantics.
+- Added database uniqueness/upsert-style reconciliation to prevent duplicate imported state.
+- Added automatic target selection when exactly one Discord guild is connected.
+- Added temporary `LEGACY_IMPORT_GUILD_ID` target selection when multiple guilds are connected.
+- Added validation that the requested legacy-import guild is currently connected.
+- Added blocking behavior rather than guessing when multiple guilds are connected without a target.
+- Added migration-completion Docker-log reminders to remove `LEGACY_IMPORT_GUILD_ID`.
+- Added later-startup reminders if the variable remains configured after migration completion.
+- Legacy files are never deleted automatically.
+
+### BF4 maps
+- Seeded the complete static 33-map BF4 catalog through the initial Alembic revision.
+- Replaced all map-name resolution/autocomplete dependencies on `maps.json` with database queries.
+- Finalized `bf4_maps` as only `map_key PRIMARY KEY` + `map_name`.
+
+### Server catalog and guild relationships
+- Added a single global BF4 server row per GUID.
+- Added guild-specific server display names/default membership.
+- `/renameserver` now changes only the current guild's display name.
+- `/delserver` removes only the current guild relationship; the global BF4 server metadata is retained indefinitely.
+- Removed the proposed enabled/disabled guild-server state.
+- Preserved platform-aware ordering PC -> PS4/5 -> XBox -> Unknown.
+
+### Existing status/player behavior retained
+- Preserved zero/one/multiple defaults independently per guild.
+- Preserved regular `!status`, named exact/partial lookup, and `!status <server> players`.
+- Preserved numbered follow-up selection for ambiguous regular-user status lookups.
+- Preserved `/status all` and `/status server`.
+- Preserved Mobile/Wide rich PC scoreboards.
+- Preserved BFLIST score ordering and place/name/score/kills/deaths/KDR output for PC.
+- Preserved Keeper fallback and unnumbered console team rosters.
+- Preserved faction-aware `TEAM 1/TEAM 2 - US/RU/CN` headings.
+- Preserved safe Wide scoreboard chunking with repeated headers.
+- Preserved manual announcement 10-minute cleanup.
+
+### Documentation
+- Rewrote `README.md` for v2 database/multi-guild deployment.
+- Added a concise README migration section pointing to `MIGRATION.md`.
+- Added `MIGRATION.md` with the full v1.x -> v2.0.0 procedure.
+- Added project-specific `DATABASE.md` containing only `DATABASE_URL` examples for PostgreSQL/MySQL/MariaDB.
+- Rewrote `DISCORD.md` for multi-guild bootstrap and database-backed configuration.
+- Added `THIRD_PARTY.md`.
+- Verified direct dependency license/version entries against the exact pinned v2.0.0 dependency set.
+- Kept the existing MIT `LICENSE`.
+
+### Dependencies
+- Pinned `discord.py==2.7.1`.
+- Pinned `requests==2.34.2`.
+- Pinned `python-dotenv==1.2.3`.
+- Added/pinned `SQLAlchemy==2.0.52`.
+- Added/pinned `alembic==1.19.1`.
+- Added/pinned `psycopg[binary]==3.3.4`.
+- Added/pinned `PyMySQL[rsa]==1.2.0`.
+
+### Docker
+- Updated image tag to `bf4-server-watcher:2.0.0`.
+- Added `entrypoint.sh`.
+- Docker startup now runs Alembic before the application.
+- Added `host.docker.internal:host-gateway` mapping for host database connectivity.
+- Retained the project-directory mount so upgraded installations can expose legacy v1.x JSON files to the one-time importer.
+- Removed JSON assets from the application image.
 
 ## [v1.3.8] - 2026-08-17
 

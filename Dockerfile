@@ -3,10 +3,12 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-COPY serverwatcher.py .
-COPY maps.json .
-COPY servers.example.json .
+COPY serverwatcher.py db.py models.py alembic.ini entrypoint.sh ./
+COPY alembic ./alembic
 
-CMD ["python3", "serverwatcher.py"]
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

@@ -1,146 +1,68 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import os
 import re
-import json
-import asyncio
 import shlex
-import shutil
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
-import requests
 import discord
+import requests
+from discord import app_commands
 from dotenv import load_dotenv
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import SQLAlchemyError
 
-BOT_VERSION = "v1.3.8"
+from db import SessionLocal, wait_for_database
+from models import (
+    BF4Map,
+    BF4Server,
+    CommandAudit,
+    Guild,
+    GuildListenChannel,
+    GuildMapRolePing,
+    GuildServer,
+    GuildServerState,
+    GuildSettings,
+    MigrationState,
+)
+
+BOT_VERSION = "v2.0.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
-LATEST_VERSION = None
-VERSION_CHECK_ERROR = None
-VERSION_CHECK_COMPLETED = False
+AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
+AAA_NAME = "AAA"
+LOCKER_KEY = "MP_Prison"
+LOCKER_MESSAGE = "Operation Locker is now live!"
+LEGACY_IMPORT_KEY = "legacy_v1_import"
+MANUAL_ANNOUNCEMENT_TTL_SECONDS = 600
+GUILD_RETENTION_DAYS = 30
+
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.environ.get("SERVERWATCHER_RUNTIME_DIR", str(BASE_DIR))).resolve()
-CONFIG_PATH = RUNTIME_DIR / "config.json"
-SERVERS_PATH = RUNTIME_DIR / "servers.json"
-SERVERS_EXAMPLE_PATH = BASE_DIR / "servers.example.json"
-MAPS_PATH = BASE_DIR / "maps.json"
-
 load_dotenv(RUNTIME_DIR / ".env")
 load_dotenv(BASE_DIR / ".env")
+
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it to .env or the environment.")
 
-AUTO_ANNOUNCEMENT_MARKER = "\u200b\u200c\u200d"
-NO_DEFAULT_MARKER = "\u200d\u200c\u200b"
-MANUAL_ANNOUNCEMENT_TTL_SECONDS = 10 * 60
+CHECK_INTERVAL_SECONDS = max(10, int(os.environ.get("CHECK_INTERVAL_SECONDS", "69")))
+PRESENCE_UPDATE_SECONDS = max(10, min(60, int(os.environ.get("PRESENCE_UPDATE_SECONDS", "30"))))
+LEGACY_IMPORT_GUILD_ID = os.environ.get("LEGACY_IMPORT_GUILD_ID", "").strip()
 
-
-def load_json(path):
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_json_in_place(path, data):
-    """Persist JSON safely to a bind-mounted file without os.replace()."""
-    serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    json.loads(serialized)  # Validate before touching the existing file.
-    with path.open("r+", encoding="utf-8") as handle:
-        handle.seek(0)
-        handle.write(serialized)
-        handle.truncate()
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-MAP_NAMES = load_json(MAPS_PATH)
-CONFIG = {}
-SERVERS = {}
-
-
-def validate_config(config):
-    required = (
-        "announcement_channel_id",
-        "listen_channel_id",
-        "management_min_role_id",
-        "status_min_role_id",
-        "check_interval_seconds",
-        "map_role_pings",
-    )
-    missing = [key for key in required if key not in config]
-    if missing:
-        raise ValueError(f"config.json missing keys: {', '.join(missing)}")
-    if not isinstance(config["listen_channel_id"], list):
-        raise ValueError("listen_channel_id must be an array")
-    if int(config["check_interval_seconds"]) < 10:
-        raise ValueError("check_interval_seconds must be at least 10")
-    if not isinstance(config["map_role_pings"], dict):
-        raise ValueError("map_role_pings must be an object")
-
-    try:
-        requested_presence = int(
-            config.get("presence_update_seconds", 30)
-        )
-    except (TypeError, ValueError):
-        requested_presence = 30
-    config["presence_update_seconds"] = max(
-        10,
-        min(60, requested_presence),
-    )
-    return config
-
-
-def migrate_servers_schema(servers):
-    """Migrate public v1.2.x single-default schema to v1.3.0 multi-default schema."""
-    changed = False
-    server_map = servers.get("servers")
-    if not isinstance(server_map, dict):
-        return changed
-
-    if "default_servers" not in servers:
-        old_default = servers.pop("default_server", None)
-        servers["default_servers"] = (
-            [old_default]
-            if old_default and old_default in server_map
-            else []
-        )
-        changed = True
-    elif "default_server" in servers:
-        servers.pop("default_server", None)
-        changed = True
-
-    return changed
-
-
-def validate_servers(servers):
-    server_map = servers.get("servers")
-    default_keys = servers.get("default_servers")
-
-    if not isinstance(server_map, dict):
-        raise ValueError("servers.json requires a servers object")
-    if not isinstance(default_keys, list):
-        raise ValueError("servers.json requires default_servers as an array")
-
-    seen = set()
-    for key in default_keys:
-        if not isinstance(key, str) or key not in server_map:
-            raise ValueError(f"default_servers references unknown server key: {key!r}")
-        if key in seen:
-            raise ValueError(f"default_servers contains duplicate server key: {key!r}")
-        seen.add(key)
-
-    for key, record in server_map.items():
-        if not isinstance(record, dict):
-            raise ValueError(f"Server record {key!r} must be an object")
-        guid = str(record.get("guid", "")).strip()
-        if not re.fullmatch(
-            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-            guid,
-        ):
-            raise ValueError(f"Server record {key!r} has an invalid GUID")
-
-    return servers
-
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+logging.Formatter.converter = time.gmtime
+log = logging.getLogger("serverwatcher")
 
 PLATFORM_URL_LABELS = {
     "pc": "PC",
@@ -148,22 +70,24 @@ PLATFORM_URL_LABELS = {
     "xboxone": "XBox",
     "xbox360": "XBox",
 }
+PLATFORM_SORT_ORDER = {"PC": 0, "PS4/5": 1, "XBox": 2, "Unknown": 3}
+FACTION_LABELS = {0: "US", 1: "RU", 2: "CN"}
 
-PLATFORM_METADATA_VERSION = 2
-BUNDLED_AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
-
-
-def extract_server_guid(value):
-    """Extract a canonical BF4 server GUID from arbitrary text."""
-    match = re.search(
-        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
-        str(value),
-    )
-    return match.group(1).lower() if match else None
+LATEST_VERSION = None
+VERSION_CHECK_ERROR = None
+FRESH_SERVER_CACHE: dict[str, dict] = {}
+LAST_SUCCESS_CACHE: dict[str, dict] = {}
+BFLIST_CACHE: dict[str, tuple[float, dict | None]] = {}
+BFLIST_CACHE_SECONDS = 15
+watcher_started = False
+PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
 
 
-def normalize_platform_label(value):
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def normalize_platform_label(value) -> str:
     normalized = str(value or "").strip().lower()
     aliases = {
         "pc": "PC",
@@ -182,65 +106,49 @@ def normalize_platform_label(value):
 
 
 def parse_battlelog_server_url(value):
-    """Parse a full BF4 Battlelog server URL and return trusted platform metadata."""
     raw = str(value or "").strip()
     try:
         parsed = urlparse(raw)
     except ValueError:
         return None
-
-    hostname = (parsed.hostname or "").lower()
-    if hostname not in {
+    if (parsed.hostname or "").lower() not in {
         "battlelog.battlefield.com",
         "www.battlelog.battlefield.com",
     }:
         return None
-
-    path_match = re.fullmatch(
+    match = re.fullmatch(
         r"/bf4/servers/show/(pc|ps4|xboxone|xbox360)/"
         r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/([^/?#]+))?/?",
         parsed.path,
         flags=re.IGNORECASE,
     )
-    if not path_match:
+    if not match:
         return None
-
-    platform_path = path_match.group(1).lower()
-    guid = path_match.group(2).lower()
-    raw_slug = path_match.group(3)
+    platform_path = match.group(1).lower()
+    guid = match.group(2).lower()
+    raw_slug = match.group(3)
     slug = unquote(raw_slug).strip() if raw_slug else ""
-    derived_name = re.sub(r"[-_]+", " ", slug).strip()
-    derived_name = re.sub(r"\s+", " ", derived_name)
-    if not derived_name:
-        platform_label = PLATFORM_URL_LABELS[platform_path]
-        derived_name = f"{platform_label} Server {guid[:8]}"
-
-    canonical_url = (
+    name = re.sub(r"\s+", " ", re.sub(r"[-_]+", " ", slug)).strip()
+    if not name:
+        name = f"{PLATFORM_URL_LABELS[platform_path]} Server {guid[:8]}"
+    canonical = (
         "https://battlelog.battlefield.com/bf4/servers/show/"
-        f"{platform_path}/{guid}/"
-        + (f"{raw_slug}/" if raw_slug else "")
+        f"{platform_path}/{guid}/" + (f"{raw_slug}/" if raw_slug else "")
     )
     return {
         "guid": guid,
         "platform": PLATFORM_URL_LABELS[platform_path],
-        "name": derived_name,
-        "battlelog_url": canonical_url,
+        "name": name,
+        "battlelog_url": canonical,
         "platform_source": "battlelog_url",
     }
 
 
 def parse_server_reference(value):
-    """
-    Parse a server reference.
-
-    Full Battlelog URLs are authoritative for platform. Raw GUID support remains
-    available internally and is treated as PC-only legacy support.
-    """
-    parsed_url = parse_battlelog_server_url(value)
-    if parsed_url:
-        return parsed_url
-
+    parsed = parse_battlelog_server_url(value)
+    if parsed:
+        return parsed
     raw = str(value or "").strip()
     if re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -255,397 +163,17 @@ def parse_server_reference(value):
             "battlelog_url": None,
             "platform_source": "raw_guid",
         }
-
     return None
 
 
-def platform_from_battlelog_url(value):
-    parsed = parse_battlelog_server_url(value)
-    return parsed["platform"] if parsed else None
-
-
-PLATFORM_SORT_ORDER = {
-    "PC": 0,
-    "PS4/5": 1,
-    "XBox": 2,
-    "Unknown": 3,
-}
-
-
-def platform_display_label(record):
-    platform = normalize_platform_label(record.get("platform", "Unknown"))
-    return f"({platform})"
-
-
-def server_sort_key(item):
-    key, record = item
-    platform = normalize_platform_label(record.get("platform", "Unknown"))
-    name = str(record.get("name", key)).casefold()
-    return (
-        PLATFORM_SORT_ORDER.get(platform, 99),
-        name,
-        str(key).casefold(),
-    )
-
-
-def sorted_server_items(items=None):
-    if items is None:
-        items = SERVERS.get("servers", {}).items()
-    return sorted(list(items), key=server_sort_key)
-
-
-def sorted_default_server_records():
-    return sorted_server_items(get_default_server_records())
-
-
-
-
-def repair_v130_platform_metadata(servers):
-    """
-    Repair platform metadata written by v1.3.0's unreliable raw-GUID probe.
-
-    There is no authoritative way to distinguish a genuine PC value from a
-    console server incorrectly labeled PC once only the GUID was stored.
-    Unverified legacy PC values are therefore reset to Unknown. The bundled AAA
-    record is retained as known PC. Explicit PS4/5/XBox values are preserved.
-    Re-processing a full Battlelog URL through /addserver repairs an existing
-    matching record with authoritative URL-derived metadata.
-    """
-    current_version = int(servers.get("platform_metadata_version", 0) or 0)
-    if current_version >= PLATFORM_METADATA_VERSION:
-        return False, 0
-
-    changed = False
-    reset_count = 0
-    for key, record in servers.get("servers", {}).items():
-        if not isinstance(record, dict):
-            continue
-
-        guid = str(record.get("guid", "")).strip().lower()
-        platform = normalize_platform_label(record.get("platform", "Unknown"))
-        source = str(record.get("platform_source", "")).strip()
-
-        if source:
-            normalized = normalize_platform_label(platform)
-            if record.get("platform") != normalized:
-                record["platform"] = normalized
-                changed = True
-            continue
-
-        if key == "aaa" and guid == BUNDLED_AAA_GUID:
-            record["platform"] = "PC"
-            record["platform_source"] = "bundled"
-            changed = True
-        elif platform in {"PS4/5", "XBox"}:
-            record["platform"] = platform
-            record["platform_source"] = "legacy_preserved"
-            changed = True
-        else:
-            if platform != "Unknown":
-                reset_count += 1
-            record["platform"] = "Unknown"
-            record["platform_source"] = "v1.3.0_unverified"
-            changed = True
-
-    servers["platform_metadata_version"] = PLATFORM_METADATA_VERSION
-    changed = True
-    return changed, reset_count
-
-
-def normalize_server_platform_metadata():
-    """Normalize saved platform labels without guessing a platform from a GUID."""
-    changed = False
-    for record in SERVERS.get("servers", {}).values():
-        if not isinstance(record, dict):
-            continue
-        platform = normalize_platform_label(record.get("platform", "Unknown"))
-        if record.get("platform") != platform:
-            record["platform"] = platform
-            changed = True
-    if changed:
-        save_servers()
-    return changed
-
-
-def parse_semantic_version(value):
-    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value).strip())
-    if not match:
-        return None
-    return tuple(int(part) for part in match.groups())
-
-
-def normalized_version(value):
-    parsed = parse_semantic_version(value)
-    if parsed is None:
-        return None
-    return f"v{parsed[0]}.{parsed[1]}.{parsed[2]}"
-
-
-def discover_latest_version():
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}",
-    }
-    api_root = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
-
-    release_response = requests.get(
-        f"{api_root}/releases/latest",
-        headers=headers,
-        timeout=10,
-    )
-    if release_response.status_code == 200:
-        release_tag = normalized_version(release_response.json().get("tag_name", ""))
-        if release_tag:
-            return release_tag
-    elif release_response.status_code != 404:
-        release_response.raise_for_status()
-
-    tags_response = requests.get(
-        f"{api_root}/tags",
-        headers=headers,
-        params={"per_page": 100},
-        timeout=10,
-    )
-    tags_response.raise_for_status()
-
-    candidates = []
-    for item in tags_response.json():
-        if not isinstance(item, dict):
-            continue
-        name = normalized_version(item.get("name", ""))
-        parsed = parse_semantic_version(name)
-        if parsed is not None:
-            candidates.append((parsed, name))
-
-    if not candidates:
-        raise RuntimeError("No semantic-version GitHub release or tag was found")
-
-    return max(candidates, key=lambda item: item[0])[1]
-
-
-def is_update_available():
-    current = parse_semantic_version(BOT_VERSION)
-    latest = parse_semantic_version(LATEST_VERSION)
-    return current is not None and latest is not None and latest > current
-
-
-def version_update_notice():
-    if not is_update_available():
-        return ""
-    return (
-        f"\n\n⬆️ New version available: **{LATEST_VERSION}** — "
-        f"Current version installed: **{BOT_VERSION}**"
-    )
-
-
-def version_command_text():
-    lines = [f"BF4 Server Watcher **{BOT_VERSION}**"]
-    if LATEST_VERSION:
-        lines.append(f"Latest version: **{LATEST_VERSION}**")
-        if is_update_available():
-            lines.append("⬆️ **Update available!**")
-        else:
-            lines.append("✅ You're up to date.")
-        if VERSION_CHECK_ERROR:
-            lines.append("⚠️ Fresh version check failed; showing the last successful cached result.")
-    elif VERSION_CHECK_COMPLETED:
-        lines.append("Latest version: **Unable to check**")
-    else:
-        lines.append("Latest version: **Checking...**")
-    return "\n".join(lines)
-
-
-async def refresh_version_info():
-    global LATEST_VERSION, VERSION_CHECK_ERROR, VERSION_CHECK_COMPLETED
-    try:
-        latest = await asyncio.to_thread(discover_latest_version)
-        LATEST_VERSION = latest
-        VERSION_CHECK_ERROR = None
-        VERSION_CHECK_COMPLETED = True
-        if is_update_available():
-            print(
-                f"UPDATE AVAILABLE: {LATEST_VERSION} (installed: {BOT_VERSION})",
-                flush=True,
-            )
-        else:
-            print(
-                f"Version check: installed {BOT_VERSION}; latest {LATEST_VERSION}",
-                flush=True,
-            )
-    except Exception as error:
-        VERSION_CHECK_ERROR = f"{type(error).__name__}: {error}"
-        VERSION_CHECK_COMPLETED = True
-        print(f"WARNING: GitHub version check failed: {VERSION_CHECK_ERROR}", flush=True)
-
-
-async def version_check_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        await refresh_version_info()
-        await asyncio.sleep(VERSION_CHECK_INTERVAL_SECONDS)
-
-
-def ensure_servers_file():
-    if SERVERS_PATH.exists():
-        if SERVERS_PATH.is_dir():
-            raise RuntimeError(
-                f"{SERVERS_PATH} is a directory, not a file. Remove that directory and restart ServerWatcher."
-            )
-        return
-    if not SERVERS_EXAMPLE_PATH.exists():
-        raise RuntimeError(f"Missing {SERVERS_EXAMPLE_PATH.name}; cannot initialize servers.json")
-    SERVERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(SERVERS_EXAMPLE_PATH, SERVERS_PATH)
-    print(f"Created {SERVERS_PATH} from {SERVERS_EXAMPLE_PATH.name}", flush=True)
-
-
-def reload_runtime_config():
-    global CONFIG, SERVERS
-    raw_config = load_json(CONFIG_PATH)
-    new_config = validate_config(raw_config)
-    new_servers = load_json(SERVERS_PATH)
-
-    migrated = migrate_servers_schema(new_servers)
-    metadata_changed, reset_count = repair_v130_platform_metadata(new_servers)
-
-    new_servers = validate_servers(new_servers)
-    CONFIG = new_config
-    SERVERS = new_servers
-
-    if raw_config != new_config:
-        write_json_in_place(CONFIG_PATH, new_config)
-        print(
-            "Normalized presence_update_seconds to supported 10-60 second range.",
-            flush=True,
-        )
-
-    if migrated or metadata_changed:
-        write_json_in_place(SERVERS_PATH, SERVERS)
-
-    if migrated:
-        print(
-            "Migrated servers.json from default_server to default_servers.",
-            flush=True,
-        )
-    if metadata_changed:
-        print(
-            "Updated server platform metadata to v1.3.1 format.",
-            flush=True,
-        )
-        if reset_count:
-            print(
-                f"Reset {reset_count} unverified v1.3.0 platform value(s) "
-                "to Unknown. Re-add full Battlelog URLs to repair them.",
-                flush=True,
-            )
-
-
-ensure_servers_file()
-reload_runtime_config()
-
-
-def get_default_server_keys():
-    return [
-        key
-        for key in SERVERS.get("default_servers", [])
-        if key in SERVERS.get("servers", {})
-    ]
-
-
-def get_default_server_records():
-    return [
-        (key, SERVERS["servers"][key])
-        for key in get_default_server_keys()
-    ]
-
-
-def get_primary_default_server_record():
-    defaults = get_default_server_records()
-    return defaults[0][1] if defaults else None
-
-
-def get_default_server_record():
-    """Compatibility helper returning the first configured default, if any."""
-    record = get_primary_default_server_record()
-    if record is None:
-        raise RuntimeError("No default server(s) set")
-    return record
-
-
-def get_default_server_guid():
-    return str(get_default_server_record()["guid"]).strip()
-
-
-def get_default_server_name():
-    return str(get_default_server_record().get("name", "BF4 Server")).strip()
-
-
-def normalize_server_key(name):
-    key = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
-    return key or "server"
-
-
-def find_server(selector):
-    selector = selector.strip()
-    selector_lower = selector.lower()
-
-    for key, record in SERVERS.get("servers", {}).items():
-        if not isinstance(record, dict):
-            continue
-        if key.lower() == selector_lower:
-            return key, record
-        if str(record.get("name", "")).strip().lower() == selector_lower:
-            return key, record
-        if str(record.get("guid", "")).strip().lower() == selector_lower:
-            return key, record
-
-    return None, None
-
-
-def find_server_matches(selector):
-    selector = selector.strip().lower()
-    if not selector:
-        return []
-
-    exact_key, exact_record = find_server(selector)
-    if exact_key is not None:
-        return [(exact_key, exact_record)]
-
-    matches = []
-    for key, record in SERVERS.get("servers", {}).items():
-        if not isinstance(record, dict):
-            continue
-        name = str(record.get("name", key)).strip()
-        if selector in name.lower() or selector in key.lower():
-            matches.append((key, record))
-    return matches
-
-
-def unique_server_key(name):
-    base = normalize_server_key(name)
-    key = base
-    suffix = 2
-    while key in SERVERS.get("servers", {}):
-        key = f"{base}_{suffix}"
-        suffix += 1
-    return key
-
-
-def get_map_name(level_path):
-    if not level_path:
-        return "Unknown"
-    map_id = level_path.split("/")[-1]
-    return MAP_NAMES.get(map_id, map_id)
-
-
-def get_server(server_guid=None):
-    guid = server_guid or get_default_server_guid()
-    response = requests.get(
-        f"https://keeper.battlelog.com/snapshot/{guid}",
-        timeout=10,
-    )
+def get_keeper_snapshot(guid: str) -> dict:
+    response = requests.get(f"https://keeper.battlelog.com/snapshot/{guid}", timeout=10)
     response.raise_for_status()
-    return response.json()["snapshot"]
+    payload = response.json()
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        raise ValueError("Keeper response did not contain a snapshot object")
+    return snapshot
 
 
 def as_int(value):
@@ -655,3355 +183,2002 @@ def as_int(value):
         return None
 
 
-def first_int(mapping, keys):
-    if not isinstance(mapping, dict):
-        return None
-    for key in keys:
-        value = as_int(mapping.get(key))
-        if value is not None:
-            return value
-    return None
-
-
 def player_role(player):
-    if not isinstance(player, dict):
-        return None
-
-    raw_role = player.get("role")
-    if raw_role == 2:
+    raw = player.get("role") if isinstance(player, dict) else None
+    if raw == 2:
         return "commander"
-    if raw_role == 1:
+    if raw == 1:
         return "player"
-
-    for key in ("role", "playerRole", "type", "playerType", "teamRole"):
-        value = player.get(key)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if "command" in normalized:
-                return "commander"
-            if "spect" in normalized:
-                return "spectator"
-            if "player" in normalized or "soldier" in normalized:
-                return "player"
-
-    for key, label in (
-        ("isCommander", "commander"),
-        ("commander", "commander"),
-        ("isSpectator", "spectator"),
-        ("spectator", "spectator"),
-    ):
-        if player.get(key) is True or player.get(key) == 1:
-            return label
-
     return None
 
 
-def get_server_status(data=None, server_guid=None):
-    if data is None:
-        data = get_server(server_guid)
+def map_key_from_snapshot(snapshot: dict) -> str | None:
+    current = snapshot.get("currentMap")
+    if not current:
+        return None
+    return str(current).split("/")[-1]
 
-    current = data.get("currentMap")
-    teams = data.get("teamInfo", {})
+
+def map_name_for_key(map_key: str | None) -> str:
+    if not map_key:
+        return "Unknown"
+    with SessionLocal() as session:
+        row = session.get(BF4Map, map_key)
+        return row.map_name if row else map_key
+
+
+def get_server_status(snapshot: dict) -> dict:
+    teams = snapshot.get("teamInfo", {})
     if not isinstance(teams, dict):
         teams = {}
-
-    active_teams = {
-        str(key): team
-        for key, team in teams.items()
-        if str(key) != "0" and isinstance(team, dict)
-    }
-
     active_players = []
-    unassigned_players = []
-
-    for team in active_teams.values():
+    unassigned = []
+    for team_id, team in teams.items():
+        if not isinstance(team, dict):
+            continue
         players = team.get("players", {})
-        if isinstance(players, dict):
-            active_players.extend(p for p in players.values() if isinstance(p, dict))
-
-    team_zero = teams.get("0", {})
-    if isinstance(team_zero, dict):
-        players = team_zero.get("players", {})
-        if isinstance(players, dict):
-            unassigned_players.extend(p for p in players.values() if isinstance(p, dict))
-
-    commander_count = 0
-    for player in active_players + unassigned_players:
-        if player_role(player) == "commander":
-            commander_count += 1
-
-    normal_player_count = max(0, len(active_players) - commander_count)
-
-    server_info = data.get("serverInfo", {})
-    if not isinstance(server_info, dict):
-        server_info = {}
-
-    max_players = (
-        first_int(data, ("maxPlayers", "slots", "maxPlayerCount"))
-        or first_int(server_info, ("maxPlayers", "slots", "maxPlayerCount"))
-        or 64
-    )
-
-    queue = first_int(
-        data,
-        ("waitingPlayers", "queue", "queueSize", "queuedPlayers", "joiningPlayers"),
-    )
-    if queue is None:
-        queue = first_int(
-            server_info,
-            ("waitingPlayers", "queue", "queueSize", "queuedPlayers", "joiningPlayers"),
-        )
-
-    ticket_values = []
-    conquest = data.get("conquest", {})
+        if not isinstance(players, dict):
+            continue
+        target = unassigned if str(team_id) == "0" else active_players
+        target.extend(p for p in players.values() if isinstance(p, dict))
+    commanders = sum(1 for p in active_players + unassigned if player_role(p) == "commander")
+    normal_players = max(0, len(active_players) - commanders)
+    max_players = as_int(snapshot.get("maxPlayers")) or 64
+    queue = as_int(snapshot.get("waitingPlayers"))
+    tickets = []
+    conquest = snapshot.get("conquest", {})
     if isinstance(conquest, dict):
         for team in conquest.values():
             if isinstance(team, dict):
                 value = as_int(team.get("tickets"))
                 if value is not None:
-                    ticket_values.append(value)
-
-    if not ticket_values:
-        rush = data.get("rush", {})
-        attackers = rush.get("attackers", {}) if isinstance(rush, dict) else {}
-        value = as_int(attackers.get("tickets")) if isinstance(attackers, dict) else None
-        if value is not None:
-            ticket_values.append(value)
-
+                    tickets.append(value)
+    rush = snapshot.get("rush", {})
+    if not tickets and isinstance(rush, dict):
+        attackers = rush.get("attackers", {})
+        if isinstance(attackers, dict):
+            value = as_int(attackers.get("tickets"))
+            if value is not None:
+                tickets.append(value)
+    key = map_key_from_snapshot(snapshot)
     return {
-        "map_id": current,
-        "map_name": get_map_name(current),
-        "players": normal_player_count,
+        "map_key": key,
+        "map_name": map_name_for_key(key),
+        "players": normal_players,
         "max_players": max_players,
         "queue": queue,
-        "commanders": commander_count,
-        "unassigned": len(unassigned_players),
-        "min_tickets": min(ticket_values) if ticket_values else None,
+        "commanders": commanders,
+        "min_tickets": min(tickets) if tickets else None,
     }
 
 
 def display_value(value):
-    return str(value) if value is not None else "Unavailable"
+    return "Unavailable" if value is None else str(value)
 
 
-def build_message(title, status, server_name=None):
-    if title == "BF4 Map Change":
-        display_server = server_name or get_default_server_name()
-        message = (
-            f"🎮 **{title}**\n"
-            f"🖥️ Server: **{display_server}**\n"
-            f"🗺️ Now Playing: **{status['map_name']}**\n"
-            f"👥 Players: **{status['players']}/{status['max_players']}**"
-        )
-    else:
-        message = (
-            f"🎮 **{title}**\n"
-            f"🗺️ Current Map: **{status['map_name']}**\n"
-            f"👥 Players: **{status['players']}/{status['max_players']}**"
-            f"\n⏳ Queue: **{display_value(status.get('queue'))}**"
-            f"\n🎖️ Commanders: **{display_value(status.get('commanders'))}**"
-            f"\n🎟️ Minimum tickets remaining: "
-            f"**{display_value(status.get('min_tickets'))}**"
-        )
-
-    return message
+def build_status_message(title: str, status: dict) -> str:
+    return (
+        f"🎮 **{title}**\n"
+        f"🗺️ Current Map: **{status['map_name']}**\n"
+        f"👥 Players: **{status['players']}/{status['max_players']}**\n"
+        f"⏳ Queue: **{display_value(status.get('queue'))}**\n"
+        f"🎖️ Commanders: **{display_value(status.get('commanders'))}**\n"
+        f"🎟️ Minimum tickets remaining: **{display_value(status.get('min_tickets'))}**"
+    )
 
 
-FACTION_LABELS = {
-    0: "US",
-    1: "RU",
-    2: "CN",
-}
+def build_map_announcement(server_name: str, status: dict) -> str:
+    return (
+        "🎮 **BF4 Map Change**\n"
+        f"🖥️ Server: **{server_name}**\n"
+        f"🗺️ Now Playing: **{status['map_name']}**\n"
+        f"👥 Players: **{status['players']}/{status['max_players']}**"
+    )
 
 
 def player_display_name(player):
     if not isinstance(player, dict):
         return "Unknown"
-    for key in ("name", "personaName"):
-        value = player.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return "Unknown"
+    return str(player.get("name") or player.get("personaName") or "Unknown").strip()
 
 
 def faction_label(value):
-    faction_id = as_int(value)
-    return FACTION_LABELS.get(faction_id)
+    return FACTION_LABELS.get(as_int(value))
 
 
-def keeper_team_rosters(data):
-    """
-    Return Keeper team rosters in the API-provided player order.
-    Team 0/unassigned is intentionally omitted.
-    """
-    teams = data.get("teamInfo", {})
+def keeper_team_rosters(snapshot: dict):
+    teams = snapshot.get("teamInfo", {})
     if not isinstance(teams, dict):
         return []
-
     result = []
     for team_id, team in teams.items():
         if str(team_id) == "0" or not isinstance(team, dict):
             continue
-
         players = team.get("players", {})
-        names = []
-        if isinstance(players, dict):
-            for player in players.values():
-                if isinstance(player, dict):
-                    names.append(player_display_name(player))
-
+        names = [
+            player_display_name(player)
+            for player in (players.values() if isinstance(players, dict) else [])
+            if isinstance(player, dict)
+        ]
         result.append({
             "team_id": str(team_id),
             "faction": faction_label(team.get("faction")),
             "names": names,
             "numbered": False,
         })
-
-    def team_key(item):
-        team_id = item["team_id"]
-        try:
-            return (0, int(team_id))
-        except (TypeError, ValueError):
-            return (1, str(team_id))
-
-    return sorted(result, key=team_key)
+    return sorted(result, key=lambda x: int(x["team_id"]) if x["team_id"].isdigit() else 99)
 
 
-def keeper_player_candidates(data):
-    """
-    Return player names suitable for locating a PC server through BFLIST.
-    Prefer normal players and skip commanders where Keeper exposes the role.
-    """
-    candidates = []
-    seen = set()
-    teams = data.get("teamInfo", {})
-    if not isinstance(teams, dict):
-        return candidates
-
-    for team_id, team in teams.items():
-        if str(team_id) == "0" or not isinstance(team, dict):
-            continue
-        players = team.get("players", {})
-        if not isinstance(players, dict):
-            continue
-
-        for player in players.values():
-            if not isinstance(player, dict):
-                continue
-            role = player_role(player)
-            if role == "commander":
-                continue
-            name = player_display_name(player)
+def keeper_player_candidates(snapshot: dict):
+    seen, names = set(), []
+    for team in keeper_team_rosters(snapshot):
+        for name in team["names"]:
             key = name.casefold()
-            if name != "Unknown" and key not in seen:
+            if key not in seen and name != "Unknown":
                 seen.add(key)
-                candidates.append(name)
+                names.append(name)
+    return names
 
-    return candidates
 
-
-def get_bflist_server_for_guid(server_guid, keeper_data):
-    """
-    Resolve a live PC server through BFLIST using one of Keeper's player names.
-
-    BFLIST's v2 single-server endpoint is keyed by IP:port, while its
-    player-current-server endpoint returns the full server object including
-    GUID and scoreboard data. We verify the returned GUID before using it.
-    """
-    target_guid = str(server_guid or "").strip().lower()
-    if not target_guid:
-        return None
-
-    # Try several names in case a player lookup is unavailable or ambiguous.
-    for name in keeper_player_candidates(keeper_data)[:12]:
+def get_bflist_server_for_guid(guid: str, snapshot: dict):
+    target = guid.lower()
+    for name in keeper_player_candidates(snapshot)[:12]:
         try:
             response = requests.get(
-                "https://api.bflist.io/v2/bf4/players/"
-                f"{quote(name, safe='')}/server",
+                f"https://api.bflist.io/v2/bf4/players/{quote(name, safe='')}/server",
                 timeout=6,
             )
             if response.status_code != 200:
                 continue
             server = response.json()
-            if not isinstance(server, dict):
-                continue
-            if str(server.get("guid", "")).strip().lower() != target_guid:
-                continue
-            if not isinstance(server.get("players"), list):
-                continue
-            return server
+            if (
+                isinstance(server, dict)
+                and str(server.get("guid", "")).lower() == target
+                and isinstance(server.get("players"), list)
+            ):
+                return server
         except (requests.RequestException, ValueError, TypeError):
             continue
-
     return None
 
 
-def bflist_team_rosters(bflist_server, keeper_data):
-    """
-    Return verified PC scoreboard order from BFLIST.
+def get_bflist_server_cached(guid: str, snapshot: dict):
+    now = time.monotonic()
+    cached = BFLIST_CACHE.get(guid)
+    if cached and now - cached[0] <= BFLIST_CACHE_SECONDS:
+        return cached[1]
+    result = get_bflist_server_for_guid(guid, snapshot)
+    BFLIST_CACHE[guid] = (now, result)
+    return result
 
-    Only normal Player entries are included. Each team is sorted by score
-    descending and numbered from 01 within that team.
-    """
-    keeper_teams = {
-        item["team_id"]: item
-        for item in keeper_team_rosters(keeper_data)
-    }
 
+def bflist_team_rosters(bflist_server: dict, snapshot: dict):
+    factions = {t["team_id"]: t.get("faction") for t in keeper_team_rosters(snapshot)}
     grouped = {}
-    players = bflist_server.get("players", [])
-    if not isinstance(players, list):
-        return []
-
-    for player in players:
+    for player in bflist_server.get("players", []):
         if not isinstance(player, dict):
             continue
-
-        player_type = as_int(player.get("type"))
-        type_label = str(player.get("typeLabel", "")).strip().lower()
-        if player_type not in (None, 0):
+        ptype = as_int(player.get("type"))
+        label = str(player.get("typeLabel", "")).lower()
+        if ptype not in (None, 0) or (label and label != "player"):
             continue
-        if type_label and type_label != "player":
+        tid = as_int(player.get("team"))
+        if tid is None or tid <= 0:
             continue
-
-        team_id_value = as_int(player.get("team"))
-        if team_id_value is None or team_id_value <= 0:
-            continue
-        team_id = str(team_id_value)
-
-        grouped.setdefault(team_id, []).append({
+        grouped.setdefault(str(tid), []).append({
             "name": player_display_name(player),
             "score": as_int(player.get("score")) or 0,
+            "kills": as_int(player.get("kills")) or 0,
+            "deaths": as_int(player.get("deaths")) or 0,
         })
-
     result = []
-    all_team_ids = sorted(
-        set(keeper_teams) | set(grouped),
-        key=lambda value: (
-            0,
-            int(value),
-        ) if str(value).isdigit() else (1, str(value)),
-    )
-
-    for team_id in all_team_ids:
+    for team_id in sorted(set(factions) | set(grouped), key=lambda x: int(x) if x.isdigit() else 99):
         rows = grouped.get(team_id, [])
-        rows.sort(
-            key=lambda row: (
-                -row["score"],
-                row["name"].casefold(),
-            )
-        )
-        result.append({
-            "team_id": team_id,
-            "faction": keeper_teams.get(team_id, {}).get("faction"),
-            "names": [row["name"] for row in rows],
-            "numbered": True,
-        })
-
+        rows.sort(key=lambda r: (-r["score"], r["name"].casefold()))
+        for i, row in enumerate(rows, 1):
+            row["place"] = i
+            row["kdr"] = row["kills"] / row["deaths"] if row["deaths"] else float(row["kills"])
+        result.append({"team_id": team_id, "faction": factions.get(team_id), "rows": rows})
     return result
 
 
-def bflist_scoreboard_teams(bflist_server, keeper_data):
-    """
-    Return rich PC scoreboard rows from BFLIST, with Keeper faction labels.
-    Only normal Player entries are included.
-    """
-    keeper_teams = {
-        item["team_id"]: item
-        for item in keeper_team_rosters(keeper_data)
-    }
-
-    grouped = {}
-    players = bflist_server.get("players", [])
-    if not isinstance(players, list):
-        return []
-
-    for player in players:
-        if not isinstance(player, dict):
-            continue
-
-        player_type = as_int(player.get("type"))
-        type_label = str(player.get("typeLabel", "")).strip().lower()
-        if player_type not in (None, 0):
-            continue
-        if type_label and type_label != "player":
-            continue
-
-        team_id_value = as_int(player.get("team"))
-        if team_id_value is None or team_id_value <= 0:
-            continue
-
-        kills = as_int(player.get("kills")) or 0
-        deaths = as_int(player.get("deaths")) or 0
-        score = as_int(player.get("score")) or 0
-        kdr = (kills / deaths) if deaths > 0 else float(kills)
-
-        team_id = str(team_id_value)
-        grouped.setdefault(team_id, []).append({
-            "name": player_display_name(player),
-            "score": score,
-            "kills": kills,
-            "deaths": deaths,
-            "kdr": kdr,
-        })
-
-    result = []
-    all_team_ids = sorted(
-        set(keeper_teams) | set(grouped),
-        key=lambda value: (
-            0,
-            int(value),
-        ) if str(value).isdigit() else (1, str(value)),
-    )
-
-    for team_id in all_team_ids:
-        rows = grouped.get(team_id, [])
-        rows.sort(
-            key=lambda row: (
-                -row["score"],
-                row["name"].casefold(),
-            )
-        )
-        for index, row in enumerate(rows, start=1):
-            row["place"] = index
-
-        result.append({
-            "team_id": team_id,
-            "faction": keeper_teams.get(team_id, {}).get("faction"),
-            "rows": rows,
-        })
-
-    return result
-
-
-def rich_team_header(team):
+def roster_header(team, rows_key="names"):
     label = f"TEAM {team['team_id']}"
-    faction = team.get("faction")
-    if faction:
-        label += f" - {faction}"
-    return f"{label} ({len(team.get('rows', []))})"
+    if team.get("faction"):
+        label += f" - {team['faction']}"
+    return f"{label} ({len(team.get(rows_key, []))})"
 
 
-def format_score(value):
-    return f"{int(value):,}"
+def compact_roster_messages(teams, server_name):
+    if not teams:
+        return [f"👥 **BF4 Players — {server_name}**\nNo team player data is available."]
+    messages = []
+    for start in range(0, len(teams), 2):
+        pair = teams[start:start + 2]
+        left = pair[0]
+        right = pair[1] if len(pair) == 2 else None
+        ln = list(left.get("names", []))
+        rn = list(right.get("names", [])) if right else []
+        if left.get("numbered"):
+            ln = [f"{i:02d}. {n}" for i, n in enumerate(ln, 1)]
+        if right and right.get("numbered"):
+            rn = [f"{i:02d}. {n}" for i, n in enumerate(rn, 1)]
+        lh, rh = roster_header(left), roster_header(right) if right else ""
+        lw = max([len(lh)] + [len(x) for x in ln] + [1])
+        rows = []
+        for i in range(max(len(ln), len(rn), 1)):
+            l = ln[i] if i < len(ln) else ""
+            r = rn[i] if i < len(rn) else ""
+            rows.append(f"{l.ljust(lw)}   {r}".rstrip() if right else l)
+        body = "\n".join([
+            f"{lh.ljust(lw)}   {rh}".rstrip() if right else lh,
+            f"{'-' * lw}   {'-' * len(rh)}" if right else "-" * lw,
+            *rows,
+        ])
+        messages.append(f"👥 **BF4 Players — {server_name}**\n```text\n{body}\n```")
+    return split_messages(messages, 1900)
 
 
 def mobile_scoreboard_messages(teams, server_name):
-    """Render rich BFLIST scoreboard teams vertically for mobile readability."""
     messages = []
     for team in teams:
-        header = rich_team_header(team)
         rows = team.get("rows", [])
-
-        name_width = max(
-            [4] + [len(row["name"]) for row in rows] + [1]
-        )
-        name_width = min(name_width, 28)
-
-        column_header = (
-            f"{'PL':>2}  "
-            f"{'NAME'.ljust(name_width)}  "
-            f"{'SCORE':>7}  "
-            f"{'K':>3}  "
-            f"{'D':>3}  "
-            f"{'KDR':>5}"
-        )
-        divider = "-" * len(column_header)
-
-        formatted_rows = []
-        for row in rows:
-            name = row["name"]
-            if len(name) > name_width:
-                name = name[:max(1, name_width - 1)] + "…"
-            formatted_rows.append(
-                f"{row['place']:02d}  "
-                f"{name.ljust(name_width)}  "
-                f"{format_score(row['score']):>7}  "
-                f"{row['kills']:>3}  "
-                f"{row['deaths']:>3}  "
-                f"{row['kdr']:>5.2f}"
+        name_width = min(28, max([4] + [len(r["name"]) for r in rows] + [1]))
+        columns = f"{'PL':>2}  {'NAME'.ljust(name_width)}  {'SCORE':>7}  {'K':>3}  {'D':>3}  {'KDR':>5}"
+        rendered = []
+        for r in rows:
+            name = r["name"] if len(r["name"]) <= name_width else r["name"][:name_width - 1] + "…"
+            rendered.append(
+                f"{r['place']:02d}  {name.ljust(name_width)}  {r['score']:>7,}  "
+                f"{r['kills']:>3}  {r['deaths']:>3}  {r['kdr']:>5.2f}"
             )
-
+        header = roster_header(team, "rows")
         prefix = f"👥 **BF4 Player Stats — {server_name}**\n"
-        current = []
-        for row in formatted_rows:
-            candidate = current + [row]
-            body = "\n".join(
-                [header, divider, column_header] + candidate
-            )
-            message = prefix + "```text\n" + body + "\n```"
-            if current and len(message) > 1900:
-                body = "\n".join(
-                    [header, divider, column_header] + current
-                )
-                messages.append(
-                    prefix + "```text\n" + body + "\n```"
-                )
-                current = [row]
-            else:
-                current = candidate
-
-        body = "\n".join(
-            [header, divider, column_header] + current
-        )
-        messages.append(
-            prefix + "```text\n" + body + "\n```"
-        )
-
+        messages.extend(chunk_table(prefix, [header, "-" * len(columns), columns], rendered, 1750))
     return messages
 
 
-def wide_scoreboard_messages(teams, server_name, message_limit=1750):
-    """Render desktop scoreboards in pre-sized chunks below Discord limits."""
+def wide_scoreboard_messages(teams, server_name):
     if not teams:
         return []
-
     messages = []
-    for pair_start in range(0, len(teams), 2):
-        pair = teams[pair_start:pair_start + 2]
+    for start in range(0, len(teams), 2):
+        pair = teams[start:start + 2]
         left = pair[0]
         right = pair[1] if len(pair) == 2 else None
 
         def prepare(team):
             rows = team.get("rows", [])
-            name_width = max(
-                [4] + [len(row["name"]) for row in rows] + [1]
-            )
-            # Keep the total two-team view within practical Discord width.
-            name_width = min(name_width, 20)
-            col = (
-                f"{'PL':>2} "
-                f"{'NAME'.ljust(name_width)} "
-                f"{'SCORE':>7} "
-                f"{'K':>3} "
-                f"{'D':>3} "
-                f"{'KDR':>5}"
-            )
+            width = min(20, max([4] + [len(r["name"]) for r in rows] + [1]))
+            cols = f"{'PL':>2} {'NAME'.ljust(width)} {'SCORE':>7} {'K':>3} {'D':>3} {'KDR':>5}"
             rendered = []
-            for row in rows:
-                name = row["name"]
-                if len(name) > name_width:
-                    name = name[:max(1, name_width - 1)] + "…"
+            for r in rows:
+                name = r["name"] if len(r["name"]) <= width else r["name"][:width - 1] + "…"
                 rendered.append(
-                    f"{row['place']:02d} "
-                    f"{name.ljust(name_width)} "
-                    f"{format_score(row['score']):>7} "
-                    f"{row['kills']:>3} "
-                    f"{row['deaths']:>3} "
-                    f"{row['kdr']:>5.2f}"
+                    f"{r['place']:02d} {name.ljust(width)} {r['score']:>7,} "
+                    f"{r['kills']:>3} {r['deaths']:>3} {r['kdr']:>5.2f}"
                 )
-            return rich_team_header(team), col, rendered
+            return roster_header(team, "rows"), cols, rendered
 
-        left_header, left_cols, left_rows = prepare(left)
-        if right:
-            right_header, right_cols, right_rows = prepare(right)
-        else:
-            right_header, right_cols, right_rows = "", "", []
-
-        left_width = max(
-            len(left_header),
-            len(left_cols),
-            *(len(row) for row in left_rows),
-        )
-        right_width = (
-            max(
-                len(right_header),
-                len(right_cols),
-                *(len(row) for row in right_rows),
-            )
-            if right
-            else 0
-        )
-
-        header_line = (
-            f"{left_header.ljust(left_width)}   {right_header}".rstrip()
-            if right
-            else left_header
-        )
-        divider_line = (
-            f"{'-' * left_width}   {'-' * right_width}"
-            if right
-            else "-" * left_width
-        )
-        cols_line = (
-            f"{left_cols.ljust(left_width)}   {right_cols}".rstrip()
-            if right
-            else left_cols
-        )
-
-        row_count = max(len(left_rows), len(right_rows), 1)
-        rendered_rows = []
-        for index in range(row_count):
-            lrow = left_rows[index] if index < len(left_rows) else ""
-            rrow = right_rows[index] if index < len(right_rows) else ""
-            if right:
-                rendered_rows.append(
-                    f"{lrow.ljust(left_width)}   {rrow}".rstrip()
-                )
-            else:
-                rendered_rows.append(lrow)
-
-        prefix = f"👥 **BF4 Player Stats — {server_name}**\n"
-        current = []
-        for row in rendered_rows:
-            candidate = current + [row]
-            body = "\n".join(
-                [header_line, divider_line, cols_line] + candidate
-            )
-            message = prefix + "```text\n" + body + "\n```"
-            if current and len(message) > message_limit:
-                body = "\n".join(
-                    [header_line, divider_line, cols_line] + current
-                )
-                messages.append(
-                    prefix + "```text\n" + body + "\n```"
-                )
-                current = [row]
-            else:
-                current = candidate
-
-        body = "\n".join(
-            [header_line, divider_line, cols_line] + current
-        )
-        messages.append(
-            prefix + "```text\n" + body + "\n```"
-        )
-
+        lh, lc, lr = prepare(left)
+        rh, rc, rr = prepare(right) if right else ("", "", [])
+        lw = max([len(lh), len(lc)] + [len(x) for x in lr] + [1])
+        rw = max([len(rh), len(rc)] + [len(x) for x in rr] + [1]) if right else 0
+        fixed = [
+            f"{lh.ljust(lw)}   {rh}".rstrip() if right else lh,
+            f"{'-' * lw}   {'-' * rw}" if right else "-" * lw,
+            f"{lc.ljust(lw)}   {rc}".rstrip() if right else lc,
+        ]
+        rows = []
+        for i in range(max(len(lr), len(rr), 1)):
+            l = lr[i] if i < len(lr) else ""
+            r = rr[i] if i < len(rr) else ""
+            rows.append(f"{l.ljust(lw)}   {r}".rstrip() if right else l)
+        messages.extend(chunk_table(f"👥 **BF4 Player Stats — {server_name}**\n", fixed, rows, 1750))
     return messages
 
 
-def roster_header(team):
-    label = f"TEAM {team['team_id']}"
-    faction = team.get("faction")
-    if faction:
-        label += f" - {faction}"
-    return f"{label} ({len(team.get('names', []))})"
+def chunk_table(prefix, fixed_lines, rows, limit):
+    chunks, current = [], []
+    for row in rows:
+        candidate = current + [row]
+        text = prefix + "```text\n" + "\n".join(fixed_lines + candidate) + "\n```"
+        if current and len(text) > limit:
+            chunks.append(prefix + "```text\n" + "\n".join(fixed_lines + current) + "\n```")
+            current = [row]
+        else:
+            current = candidate
+    chunks.append(prefix + "```text\n" + "\n".join(fixed_lines + current) + "\n```")
+    return chunks
 
 
-def roster_display_names(team):
-    names = list(team.get("names", []))
-    if not team.get("numbered"):
-        return names
+def split_messages(messages, limit=1900):
+    result = []
+    for message in messages:
+        if len(message) <= limit:
+            result.append(message)
+            continue
+        lines, current = message.splitlines(), []
+        for line in lines:
+            candidate = "\n".join(current + [line])
+            if current and len(candidate) > limit:
+                result.append("\n".join(current))
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            result.append("\n".join(current))
+    return result
 
-    width = max(2, len(str(max(len(names), 1))))
+
+def current_guild_name(guild):
+    return guild.name if guild else None
+
+
+def current_channel_name(channel):
+    return getattr(channel, "name", None)
+
+
+def current_user_name(user):
+    return getattr(user, "display_name", None) or getattr(user, "name", None)
+
+
+def audit_command(
+    *,
+    guild,
+    channel,
+    user,
+    command_name,
+    command_type,
+    success,
+    started,
+    result_code=None,
+    error=None,
+    target_type=None,
+    target_id=None,
+    target_name=None,
+    metadata=None,
+):
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    row = CommandAudit(
+        created_at=utcnow(),
+        guild_id=getattr(guild, "id", None),
+        guild_name=current_guild_name(guild),
+        channel_id=getattr(channel, "id", None),
+        channel_name=current_channel_name(channel),
+        user_id=getattr(user, "id", None),
+        user_name=current_user_name(user),
+        command_name=command_name,
+        command_type=command_type,
+        target_type=target_type,
+        target_id=str(target_id) if target_id is not None else None,
+        target_name=target_name,
+        success=success,
+        result_code=result_code,
+        error_type=type(error).__name__ if error else None,
+        duration_ms=duration_ms,
+        request_metadata=metadata,
+    )
+    try:
+        with SessionLocal.begin() as session:
+            session.add(row)
+        log.info(
+            "Command %s guild=%s channel=%s user=%s command=%s result=%s duration_ms=%s",
+            "success" if success else "failure",
+            getattr(guild, "id", None), getattr(channel, "id", None),
+            getattr(user, "id", None), command_name, result_code, duration_ms
+        )
+    except Exception as exc:
+        log.error(
+            "Command audit write failed guild=%s user=%s command=%s error=%s message=%r",
+            getattr(guild, "id", None), getattr(user, "id", None),
+            command_name, type(exc).__name__, str(exc)
+        )
+
+
+def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
+    now = utcnow()
+    created = False
+    rejoined = False
+    with SessionLocal.begin() as session:
+        row = session.get(Guild, discord_guild.id)
+        if row is None:
+            row = Guild(
+                guild_id=discord_guild.id,
+                guild_name=discord_guild.name,
+                joined_at=now,
+                left_at=None,
+            )
+            session.add(row)
+            created = True
+        else:
+            row.guild_name = discord_guild.name
+            if row.left_at is not None:
+                row.left_at = None
+                rejoined = True
+
+        settings = session.get(GuildSettings, discord_guild.id)
+        if settings is None:
+            session.add(GuildSettings(
+                guild_id=discord_guild.id,
+                announcement_channel_id=0,
+                management_min_role_id=0,
+                status_min_role_id=0,
+            ))
+
+        aaa = session.get(BF4Server, AAA_GUID)
+        if aaa is None:
+            aaa = BF4Server(
+                server_guid=AAA_GUID,
+                server_name=AAA_NAME,
+                platform="PC",
+                battlelog_url=f"https://battlelog.battlefield.com/bf4/servers/show/pc/{AAA_GUID}/",
+                platform_source="bundled",
+            )
+            session.add(aaa)
+
+        gs = session.get(GuildServer, (discord_guild.id, AAA_GUID))
+        if gs is None and created:
+            session.add(GuildServer(
+                guild_id=discord_guild.id,
+                server_guid=AAA_GUID,
+                display_name=AAA_NAME,
+                is_default=True,
+            ))
+
+        locker = session.get(GuildMapRolePing, (discord_guild.id, LOCKER_KEY))
+        if locker is None and created:
+            session.add(GuildMapRolePing(
+                guild_id=discord_guild.id,
+                map_key=LOCKER_KEY,
+                role_id=0,
+                message=LOCKER_MESSAGE,
+            ))
+
+    log.info(
+        "Guild bootstrap guild=%s name=%r created=%s rejoined=%s aaa_default=%s",
+        discord_guild.id, discord_guild.name, created, rejoined, created
+    )
+
+
+def mark_guild_left(discord_guild: discord.Guild):
+    with SessionLocal.begin() as session:
+        row = session.get(Guild, discord_guild.id)
+        if row:
+            row.guild_name = discord_guild.name
+            row.left_at = utcnow()
+    log.info("Guild left guild=%s name=%r retention_days=%s", discord_guild.id, discord_guild.name, GUILD_RETENTION_DAYS)
+
+
+def get_settings(guild_id: int) -> GuildSettings:
+    with SessionLocal() as session:
+        row = session.get(GuildSettings, guild_id)
+        if row is None:
+            raise RuntimeError(f"Guild settings missing for guild {guild_id}")
+        session.expunge(row)
+        return row
+
+
+def listen_channel_ids(guild_id: int) -> set[int]:
+    with SessionLocal() as session:
+        return set(session.scalars(
+            select(GuildListenChannel.channel_id).where(GuildListenChannel.guild_id == guild_id)
+        ).all())
+
+
+def has_role_or_higher(member: discord.Member, required_role_id: int, zero_allows=False):
+    if member.id == member.guild.owner_id or member.guild_permissions.administrator:
+        return True
+    if int(required_role_id) == 0:
+        return bool(zero_allows)
+    role = member.guild.get_role(int(required_role_id))
+    return bool(role and member.top_role >= role)
+
+
+def can_manage(member: discord.Member):
+    return has_role_or_higher(member, get_settings(member.guild.id).management_min_role_id)
+
+
+def management_channel_allowed(interaction_or_message):
+    guild = interaction_or_message.guild
+    if guild is None:
+        return False
+    settings = get_settings(guild.id)
+    listens = listen_channel_ids(guild.id)
+    allowed = set(listens)
+    if settings.announcement_channel_id:
+        allowed.add(settings.announcement_channel_id)
+    # Bootstrap exception: managers need somewhere to configure the first channel.
+    if not allowed:
+        return True
+    return interaction_or_message.channel.id in allowed
+
+
+def can_use_status(message: discord.Message):
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return False
+    settings = get_settings(message.guild.id)
+    return (
+        message.channel.id in listen_channel_ids(message.guild.id)
+        and has_role_or_higher(message.author, settings.status_min_role_id, zero_allows=True)
+    )
+
+
+def sorted_guild_servers(guild_id: int):
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildServer, BF4Server)
+            .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+            .where(GuildServer.guild_id == guild_id)
+        ).all()
+        data = [(gs, bf) for gs, bf in rows]
+    return sorted(
+        data,
+        key=lambda item: (
+            PLATFORM_SORT_ORDER.get(normalize_platform_label(item[1].platform), 99),
+            item[0].display_name.casefold(),
+        )
+    )
+
+
+def find_guild_server(guild_id: int, selector: str):
+    selector = selector.strip().casefold()
+    rows = sorted_guild_servers(guild_id)
+    exact = [
+        item for item in rows
+        if item[0].display_name.casefold() == selector
+        or item[0].server_guid.casefold() == selector
+    ]
+    if exact:
+        return exact
     return [
-        f"{index:0{width}d}. {name}"
-        for index, name in enumerate(names, start=1)
+        item for item in rows
+        if selector in item[0].display_name.casefold()
+        or selector in item[0].server_guid.casefold()
     ]
 
 
-def build_player_roster_messages(teams, server_name, source_label=None):
-    """
-    Build one or more Discord-safe side-by-side team roster messages.
-
-    Numbering is only used for BFLIST-backed PC scoreboard order. Keeper
-    fallback/console output remains unnumbered to avoid implying rank.
-    """
-    if not teams:
-        return [
-            f"👥 **BF4 Players — {server_name}**\n"
-            "No team player data is available for this server."
-        ]
-
-    messages = []
-    for pair_start in range(0, len(teams), 2):
-        pair = teams[pair_start:pair_start + 2]
-        left = pair[0]
-        right = pair[1] if len(pair) == 2 else None
-
-        left_header = roster_header(left)
-        right_header = roster_header(right) if right else ""
-        left_names = roster_display_names(left)
-        right_names = roster_display_names(right) if right else []
-
-        left_width = max(
-            [len(left_header)] + [len(name) for name in left_names] + [1]
-        )
-        right_width = max(
-            [len(right_header)] + [len(name) for name in right_names] + [1]
-        )
-
-        row_count = max(len(left_names), len(right_names), 1)
-        rows = []
-        for index in range(row_count):
-            left_name = left_names[index] if index < len(left_names) else ""
-            right_name = right_names[index] if index < len(right_names) else ""
-            if right:
-                rows.append(
-                    f"{left_name.ljust(left_width)}   "
-                    f"{right_name.ljust(right_width)}".rstrip()
-                )
-            else:
-                rows.append(left_name)
-
-        header_line = (
-            f"{left_header.ljust(left_width)}   {right_header}".rstrip()
-            if right
-            else left_header
-        )
-        divider_line = (
-            f"{'-' * left_width}   {'-' * len(right_header)}"
-            if right
-            else "-" * left_width
-        )
-
-        prefix = f"👥 **BF4 Players — {server_name}**\n"
-        if source_label:
-            prefix += f"*{source_label}*\n"
-
-        current_rows = []
-        for row in rows:
-            candidate_rows = current_rows + [row]
-            body = "\n".join(
-                [header_line, divider_line] + candidate_rows
-            )
-            candidate = prefix + "```text\n" + body + "\n```"
-            if current_rows and len(candidate) > 1900:
-                body = "\n".join(
-                    [header_line, divider_line] + current_rows
-                )
-                messages.append(
-                    prefix + "```text\n" + body + "\n```"
-                )
-                current_rows = [row]
-            else:
-                current_rows = candidate_rows
-
-        body = "\n".join(
-            [header_line, divider_line] + current_rows
-        )
-        messages.append(
-            prefix + "```text\n" + body + "\n```"
-        )
-
-    return messages
+def get_default_guild_servers(guild_id: int):
+    return [(gs, bf) for gs, bf in sorted_guild_servers(guild_id) if gs.is_default]
 
 
+def platform_server_list(guild_id: int, include_guid=False):
+    rows = sorted_guild_servers(guild_id)
+    if not rows:
+        return "None"
+    labels = [f"({normalize_platform_label(bf.platform)})" for gs, bf in rows]
+    width = max(map(len, labels))
+    lines = []
+    for label, (gs, bf) in zip(labels, rows):
+        marker = " (default)" if gs.is_default else ""
+        guid = f" — {bf.server_guid}" if include_guid else ""
+        lines.append(f"{label.ljust(width)} - {gs.display_name}{guid}{marker}")
+    return "\n".join(lines)
 
-def compact_player_sample(player):
-    if not isinstance(player, dict):
-        return {}
-    interesting = (
-        "name", "personaName", "role", "playerRole", "type", "playerType",
-        "teamRole", "isCommander", "commander", "isSpectator", "spectator",
-        "teamId", "squadId",
+
+def resolve_channel_arguments(guild: discord.Guild, raw: str):
+    resolved = []
+    seen = set()
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+
+    for token in tokens:
+        match = re.search(r"\d{15,22}", token)
+        channel = guild.get_channel(int(match.group(0))) if match else None
+        if channel is None:
+            exact = [
+                item for item in guild.text_channels
+                if item.name.casefold() == token.lstrip("#").casefold()
+            ]
+            channel = exact[0] if len(exact) == 1 else None
+        if channel and channel.id not in seen:
+            seen.add(channel.id)
+            resolved.append(channel)
+    return resolved
+
+
+def map_matches(search: str):
+    needle = search.strip().casefold()
+    with SessionLocal() as session:
+        rows = session.scalars(select(BF4Map)).all()
+        exact = [r for r in rows if r.map_name.casefold() == needle or r.map_key.casefold() == needle]
+        if exact:
+            return exact
+        return [r for r in rows if needle in r.map_name.casefold() or needle in r.map_key.casefold()]
+
+
+def configured_map_matches(guild_id: int, search: str):
+    needle = search.strip().casefold()
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildMapRolePing, BF4Map)
+            .join(BF4Map, GuildMapRolePing.map_key == BF4Map.map_key)
+            .where(GuildMapRolePing.guild_id == guild_id)
+        ).all()
+    exact = [x for x in rows if x[1].map_name.casefold() == needle or x[1].map_key.casefold() == needle]
+    if exact:
+        return exact
+    return [x for x in rows if needle in x[1].map_name.casefold() or needle in x[1].map_key.casefold()]
+
+
+def map_roles_text(guild: discord.Guild):
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildMapRolePing, BF4Map)
+            .join(BF4Map, GuildMapRolePing.map_key == BF4Map.map_key)
+            .where(GuildMapRolePing.guild_id == guild.id)
+            .order_by(BF4Map.map_name)
+        ).all()
+    lines = []
+    for ping, map_row in rows:
+        role = guild.get_role(ping.role_id) if ping.role_id else None
+        role_text = f"@{role.name} ({ping.role_id})" if role else str(ping.role_id)
+        lines.append(f'{map_row.map_name} — {role_text} - "{ping.message}"')
+    return "\n".join(lines) if lines else "None"
+
+
+async def prepare_management(interaction: discord.Interaction):
+    command_name = getattr(
+        getattr(interaction, "command", None),
+        "qualified_name",
+        "unknown",
     )
-    return {key: player.get(key) for key in interesting if key in player}
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("⛔ Management commands require a Discord server.", ephemeral=True)
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name=command_name,
+            command_type="slash",
+            success=False,
+            started=time.perf_counter(),
+            result_code="guild_required",
+        )
+        return False
+    if not can_manage(interaction.user):
+        await interaction.response.send_message("⛔ You do not have permission to use that command.", ephemeral=True)
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name=command_name,
+            command_type="slash",
+            success=False,
+            started=time.perf_counter(),
+            result_code="permission_denied",
+        )
+        return False
+    if not management_channel_allowed(interaction):
+        await interaction.response.send_message(
+            "⛔ Management commands may only be used in the configured announcement/listen channels.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name=command_name,
+            command_type="slash",
+            success=False,
+            started=time.perf_counter(),
+            result_code="channel_not_allowed",
+        )
+        return False
+    log.info(
+        "Command invoked guild=%s channel=%s user=%s command=%s",
+        interaction.guild.id,
+        getattr(interaction.channel, "id", None),
+        interaction.user.id,
+        command_name,
+    )
+    await interaction.response.defer(ephemeral=True)
+    return True
 
 
-def build_debug_report(data):
-    teams = data.get("teamInfo", {})
-    if not isinstance(teams, dict):
-        teams = {}
-
-    team_summary = {}
-    samples = []
-    role_histogram = {}
-    role_by_team = {}
-
-    for team_id, team in teams.items():
-        if not isinstance(team, dict):
+def command_choice_list(guild_id: int, current: str, *, defaults=None):
+    needle = current.casefold().strip()
+    result = []
+    for gs, bf in sorted_guild_servers(guild_id):
+        if defaults is True and not gs.is_default:
             continue
-
-        players = team.get("players", {})
-        count = len(players) if isinstance(players, dict) else 0
-        team_summary[str(team_id)] = {
-            "player_count": count,
-            "team_keys": sorted(team.keys()),
-        }
-
-        if not isinstance(players, dict):
+        if defaults is False and gs.is_default:
             continue
+        label = f"({normalize_platform_label(bf.platform)}) {gs.display_name}"
+        if needle and needle not in f"{label} {bf.server_guid}".casefold():
+            continue
+        result.append(app_commands.Choice(name=label[:100], value=bf.server_guid))
+        if len(result) >= 25:
+            break
+    return result
 
-        team_roles = {}
-        for player in players.values():
-            if not isinstance(player, dict):
-                continue
 
-            raw_role = player.get("role")
-            role_key = repr(raw_role)
-            role_histogram[role_key] = role_histogram.get(role_key, 0) + 1
-            team_roles[role_key] = team_roles.get(role_key, 0) + 1
-
-            sample = compact_player_sample(player)
-            if sample and len(samples) < 12:
-                samples.append(sample)
-
-        role_by_team[str(team_id)] = team_roles
-
-    keywords = ("queue", "waiting", "spect", "command", "player", "slot", "capacity")
-    candidate_top_level = {
-        key: value
-        for key, value in data.items()
-        if any(word in key.lower() for word in keywords)
-        and key != "teamInfo"
-        and isinstance(value, (str, int, float, bool, type(None), list, dict))
-    }
-
+def build_debug_report(snapshot: dict):
+    teams = snapshot.get("teamInfo", {})
+    summary = {}
+    if isinstance(teams, dict):
+        for tid, team in teams.items():
+            players = team.get("players", {}) if isinstance(team, dict) else {}
+            summary[str(tid)] = {
+                "player_count": len(players) if isinstance(players, dict) else 0,
+                "faction": team.get("faction") if isinstance(team, dict) else None,
+            }
     report = {
-        "top_level_keys": sorted(data.keys()),
-        "candidate_top_level": candidate_top_level,
-        "teamInfo_summary": team_summary,
-        "role_histogram": role_histogram,
-        "role_by_team": role_by_team,
-        "player_samples": samples,
-        "calculated_status": get_server_status(data),
+        "top_level_keys": sorted(snapshot.keys()),
+        "teamInfo_summary": summary,
+        "calculated_status": get_server_status(snapshot),
     }
-
     text = json.dumps(report, indent=2, ensure_ascii=False, default=str)
-    if len(text) > 1850:
-        text = text[:1850] + "\n...TRUNCATED..."
-    return f"```json\n{text}\n```"
+    return f"```json\n{text[:1800]}\n```"
+
+
+def refresh_latest_version():
+    global LATEST_VERSION, VERSION_CHECK_ERROR
+    try:
+        response = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",
+            headers={"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        LATEST_VERSION = str(response.json().get("tag_name") or "").strip() or None
+        VERSION_CHECK_ERROR = None
+        log.info("Version check installed=%s latest=%s", BOT_VERSION, LATEST_VERSION)
+    except Exception as exc:
+        VERSION_CHECK_ERROR = type(exc).__name__
+        log.warning("Version check failed error=%s message=%r", type(exc).__name__, str(exc))
+
+
+def version_text():
+    if not LATEST_VERSION:
+        return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: unavailable"
+    if LATEST_VERSION == BOT_VERSION:
+        return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: **{LATEST_VERSION}**\nYou're up to date."
+    return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: **{LATEST_VERSION}**\n⬆️ **Update available!**"
+
+
+def legacy_paths():
+    return RUNTIME_DIR / "config.json", RUNTIME_DIR / "servers.json"
+
+
+def legacy_import_state():
+    with SessionLocal() as session:
+        return session.get(MigrationState, LEGACY_IMPORT_KEY)
+
+
+def set_legacy_state(status: str, target_guild_id=None):
+    with SessionLocal.begin() as session:
+        row = session.get(MigrationState, LEGACY_IMPORT_KEY)
+        if row is None:
+            row = MigrationState(
+                migration_key=LEGACY_IMPORT_KEY,
+                status=status,
+                target_guild_id=target_guild_id,
+                updated_at=utcnow(),
+            )
+            session.add(row)
+        else:
+            row.status = status
+            row.target_guild_id = target_guild_id
+            row.updated_at = utcnow()
+
+
+def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
+    config_path, servers_path = legacy_paths()
+    state = legacy_import_state()
+    if state and state.status == "completed":
+        if LEGACY_IMPORT_GUILD_ID:
+            log.info("Legacy import already complete; LEGACY_IMPORT_GUILD_ID can be removed from .env")
+        return True
+
+    if not config_path.exists() and not servers_path.exists():
+        set_legacy_state("completed", None)
+        log.info("Legacy import complete discovered=0 reason='no legacy JSON files'")
+        return True
+
+    if LEGACY_IMPORT_GUILD_ID:
+        try:
+            target_id = int(LEGACY_IMPORT_GUILD_ID)
+        except ValueError:
+            log.error("Legacy import blocked reason='invalid LEGACY_IMPORT_GUILD_ID'")
+            return False
+        target = discord.utils.get(connected_guilds, id=target_id)
+        if target is None:
+            log.error(
+                "Legacy import blocked target_guild=%s connected_guilds=%s reason='target not connected'",
+                target_id, len(connected_guilds)
+            )
+            return False
+    elif len(connected_guilds) == 1:
+        target = connected_guilds[0]
+        target_id = target.id
+    else:
+        log.error(
+            "Legacy import blocked connected_guilds=%s reason='LEGACY_IMPORT_GUILD_ID required'",
+            len(connected_guilds)
+        )
+        return False
+
+    log.info("Legacy import started guild=%s name=%r", target.id, target.name)
+    set_legacy_state("in_progress", target.id)
+    imported_servers = listen_count = map_count = 0
+    try:
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        servers = json.loads(servers_path.read_text()) if servers_path.exists() else {}
+        default_keys = set(servers.get("default_servers", []))
+        if "default_server" in servers and not default_keys:
+            default_keys.add(servers["default_server"])
+
+        with SessionLocal.begin() as session:
+            # Legacy import replaces the bootstrap guild-scoped defaults so the
+            # migrated guild exactly reflects its v1.x files. Global BF4 server
+            # catalog rows are intentionally retained.
+            session.execute(delete(GuildServerState).where(GuildServerState.guild_id == target.id))
+            session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == target.id))
+            session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == target.id))
+            session.execute(delete(GuildServer).where(GuildServer.guild_id == target.id))
+
+            settings = session.get(GuildSettings, target.id)
+            if settings is None:
+                settings = GuildSettings(guild_id=target.id)
+                session.add(settings)
+            settings.announcement_channel_id = int(config.get("announcement_channel_id", 0) or 0)
+            settings.management_min_role_id = int(config.get("management_min_role_id", 0) or 0)
+            settings.status_min_role_id = int(config.get("status_min_role_id", 0) or 0)
+
+            for channel_id in config.get("listen_channel_id", []):
+                channel_id = int(channel_id or 0)
+                if channel_id and session.get(GuildListenChannel, (target.id, channel_id)) is None:
+                    session.add(GuildListenChannel(guild_id=target.id, channel_id=channel_id))
+                    listen_count += 1
+
+            for key, record in servers.get("servers", {}).items():
+                if not isinstance(record, dict):
+                    continue
+                guid = str(record.get("guid", "")).strip().lower()
+                if not guid:
+                    continue
+                global_server = session.get(BF4Server, guid)
+                if global_server is None:
+                    global_server = BF4Server(
+                        server_guid=guid,
+                        server_name=str(record.get("name", key)),
+                        platform=normalize_platform_label(record.get("platform", "Unknown")),
+                        battlelog_url=record.get("battlelog_url"),
+                        platform_source=record.get("platform_source") or "legacy_import",
+                    )
+                    session.add(global_server)
+                relation = session.get(GuildServer, (target.id, guid))
+                if relation is None:
+                    session.add(GuildServer(
+                        guild_id=target.id,
+                        server_guid=guid,
+                        display_name=str(record.get("name", key)),
+                        is_default=key in default_keys,
+                    ))
+                    imported_servers += 1
+                else:
+                    relation.display_name = str(record.get("name", key))
+                    relation.is_default = key in default_keys
+
+            for map_name, entry in config.get("map_role_pings", {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                map_row = session.scalar(select(BF4Map).where(func.lower(BF4Map.map_name) == map_name.lower()))
+                if map_row is None:
+                    log.warning("Legacy import map unresolved guild=%s map=%r", target.id, map_name)
+                    continue
+                ping = session.get(GuildMapRolePing, (target.id, map_row.map_key))
+                message = str(entry.get("message") or f"{map_row.map_name} is now live!")
+                role_id = int(entry.get("role_id", 0) or 0)
+                if ping is None:
+                    session.add(GuildMapRolePing(
+                        guild_id=target.id, map_key=map_row.map_key, role_id=role_id, message=message
+                    ))
+                else:
+                    ping.role_id = role_id
+                    ping.message = message
+                map_count += 1
+
+        set_legacy_state("completed", target.id)
+        log.info(
+            "Legacy import complete guild=%s imported_servers=%s listen_channels=%s map_roles=%s",
+            target.id, imported_servers, listen_count, map_count
+        )
+        if LEGACY_IMPORT_GUILD_ID:
+            log.info("LEGACY_IMPORT_GUILD_ID is no longer required and can be removed from .env")
+        return True
+    except Exception as exc:
+        set_legacy_state("in_progress", target.id)
+        log.error(
+            "Legacy import failed guild=%s error=%s message=%r",
+            target.id, type(exc).__name__, str(exc)
+        )
+        return False
 
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-tree = discord.app_commands.CommandTree(client)
-
-LAST_MAPS = {}
-LAST_DEFAULT_STATUSES = {}
-NO_DEFAULT_ANNOUNCED = False
-watcher_started = False
-PENDING_STATUS_SELECTIONS = {}
+tree = app_commands.CommandTree(client)
 
 
-async def send_status(channel, title="BF4 Server Status", server_guid=None):
-    status = get_server_status(server_guid=server_guid)
-    await channel.send(build_message(title, status))
-
-
-async def delete_old_map_announcements(channel, server_name=None):
+async def delete_discord_message(guild_id, channel_id, message_id):
+    guild = client.get_guild(guild_id)
+    channel = guild.get_channel(channel_id) if guild else None
+    if not channel:
+        log.warning("Delete previous message unresolved guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+        return False
     try:
-        server_marker = (
-            f"Server: **{server_name}**"
-            if server_name
-            else None
-        )
-        async for message in channel.history(limit=100):
-            if (
-                message.author.id == client.user.id
-                and AUTO_ANNOUNCEMENT_MARKER in message.content
-                and (
-                    server_marker is None
-                    or server_marker in message.content
-                )
-            ):
-                await message.delete()
-    except discord.Forbidden:
-        print(
-            "ERROR: Missing Read Message History or Manage Messages permission",
-            flush=True,
-        )
-    except discord.HTTPException as error:
-        print(f"ERROR deleting old announcements: {error}", flush=True)
-
-
-async def delete_no_default_notices(channel):
-    if channel is None or client.user is None:
-        return
-    try:
-        async for message in channel.history(limit=100):
-            if message.author.id != client.user.id:
-                continue
-            if (
-                NO_DEFAULT_MARKER in message.content
-                or "No default server(s) set" in message.content
-            ):
-                await message.delete()
-    except discord.Forbidden:
-        print(
-            "ERROR: Missing Read Message History or Manage Messages permission "
-            "while cleaning no-default notice",
-            flush=True,
-        )
-    except discord.HTTPException as error:
-        print(
-            f"ERROR deleting no-default notice: {error}",
-            flush=True,
-        )
-
-
-async def post_no_default_notice(channel):
-    global NO_DEFAULT_ANNOUNCED
-    if channel is None:
-        return
-    await delete_no_default_notices(channel)
-    await channel.send(
-        "⚠️ **No default server(s) set**" + NO_DEFAULT_MARKER
-    )
-    NO_DEFAULT_ANNOUNCED = True
-    print("No default server(s) set", flush=True)
-
-
-async def delete_message_later(message, delay_seconds):
-    try:
-        await asyncio.sleep(delay_seconds)
+        message = await channel.fetch_message(message_id)
         await message.delete()
+        log.info("Deleted previous message guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+        return True
+    except discord.NotFound:
+        log.info("Previous message already absent guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+        return True
+    except discord.Forbidden:
+        log.warning("Forbidden deleting previous message guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+        return False
+    except Exception as exc:
+        log.error(
+            "Delete previous message failed guild=%s channel=%s message=%s error=%s message_text=%r",
+            guild_id, channel_id, message_id, type(exc).__name__, str(exc)
+        )
+        return False
+
+
+async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *, map_change=True):
+    settings = get_settings(guild_id)
+    if not settings.announcement_channel_id:
+        return None
+    guild = client.get_guild(guild_id)
+    channel = guild.get_channel(settings.announcement_channel_id) if guild else None
+    if not channel:
+        log.warning("Announcement channel unresolved guild=%s channel=%s", guild_id, settings.announcement_channel_id)
+        return None
+
+    with SessionLocal() as session:
+        state = session.get(GuildServerState, (guild_id, gs.server_guid))
+        old_channel = state.announcement_channel_id if state else None
+        old_message = state.announcement_message_id if state else None
+    if old_channel and old_message:
+        await delete_discord_message(guild_id, old_channel, old_message)
+
+    try:
+        sent = await channel.send(build_map_announcement(gs.display_name, status))
+        with SessionLocal.begin() as session:
+            state = session.get(GuildServerState, (guild_id, gs.server_guid))
+            if state is None:
+                state = GuildServerState(guild_id=guild_id, server_guid=gs.server_guid)
+                session.add(state)
+            state.last_map_key = status["map_key"]
+            state.announcement_channel_id = channel.id
+            state.announcement_message_id = sent.id
+        log.info(
+            "Announcement posted guild=%s channel=%s message=%s server=%s map=%s",
+            guild_id, channel.id, sent.id, gs.server_guid, status["map_key"]
+        )
+        await maybe_send_map_role(guild_id, channel, status["map_key"])
+        return sent
+    except Exception as exc:
+        log.error(
+            "Announcement failed guild=%s channel=%s server=%s error=%s message=%r",
+            guild_id, channel.id, gs.server_guid, type(exc).__name__, str(exc)
+        )
+        return None
+
+
+async def maybe_send_map_role(guild_id, channel, map_key):
+    if not map_key:
+        return
+    with SessionLocal() as session:
+        ping = session.get(GuildMapRolePing, (guild_id, map_key))
+    if not ping or not ping.role_id:
+        return
+    try:
+        await channel.send(
+            f"<@&{ping.role_id}> {ping.message}",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        log.info("Map role ping sent guild=%s channel=%s map=%s role=%s", guild_id, channel.id, map_key, ping.role_id)
+    except Exception as exc:
+        log.error(
+            "Map role ping failed guild=%s channel=%s map=%s role=%s error=%s message=%r",
+            guild_id, channel.id, map_key, ping.role_id, type(exc).__name__, str(exc)
+        )
+
+
+async def monitor_cycle():
+    global FRESH_SERVER_CACHE
+    with SessionLocal() as session:
+        relations = session.scalars(select(GuildServer)).all()
+        unique_guids = sorted({row.server_guid for row in relations})
+    references = len(relations)
+    duplicate_avoided = max(0, references - len(unique_guids))
+    log.info(
+        "Monitor cycle started references=%s unique_servers=%s duplicate_lookups_avoided=%s",
+        references, len(unique_guids), duplicate_avoided
+    )
+    fresh = {}
+    failures = 0
+    for index, guid in enumerate(unique_guids, 1):
+        try:
+            snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
+            fresh[guid] = snapshot
+            LAST_SUCCESS_CACHE[guid] = snapshot
+        except Exception as exc:
+            failures += 1
+            log.warning(
+                "Monitor server failed server=%s progress=%s/%s error=%s message=%r",
+                guid, index, len(unique_guids), type(exc).__name__, str(exc)
+            )
+    FRESH_SERVER_CACHE = fresh
+
+    with SessionLocal() as session:
+        default_rows = session.scalars(select(GuildServer).where(GuildServer.is_default.is_(True))).all()
+        detached = [(r.guild_id, r.server_guid, r.display_name) for r in default_rows]
+
+    for guild_id, guid, display_name in detached:
+        snapshot = fresh.get(guid)
+        if snapshot is None:
+            continue
+        status = get_server_status(snapshot)
+        with SessionLocal() as session:
+            state = session.get(GuildServerState, (guild_id, guid))
+            previous = state.last_map_key if state else None
+        if previous is None:
+            with SessionLocal.begin() as session:
+                state = session.get(GuildServerState, (guild_id, guid))
+                if state is None:
+                    state = GuildServerState(guild_id=guild_id, server_guid=guid)
+                    session.add(state)
+                state.last_map_key = status["map_key"]
+            log.info("Monitor state seeded guild=%s server=%s map=%s", guild_id, guid, status["map_key"])
+        elif status["map_key"] != previous:
+            gs = GuildServer(guild_id=guild_id, server_guid=guid, display_name=display_name, is_default=True)
+            await post_automatic_announcement(guild_id, gs, status)
+
+    player_total = sum(get_server_status(snapshot)["players"] for snapshot in fresh.values())
+    log.info(
+        "Monitor cycle complete references=%s unique_servers=%s duplicate_lookups_avoided=%s succeeded=%s failed=%s players=%s",
+        references, len(unique_guids), duplicate_avoided, len(fresh), failures, player_total
+    )
+
+
+async def monitor_loop():
+    while not client.is_closed():
+        started = time.perf_counter()
+        try:
+            await monitor_cycle()
+        except Exception as exc:
+            log.error("Monitor cycle fatal error=%s message=%r", type(exc).__name__, str(exc))
+        elapsed = time.perf_counter() - started
+        await asyncio.sleep(max(1, CHECK_INTERVAL_SECONDS - elapsed))
+
+
+async def presence_loop():
+    index = 0
+    while not client.is_closed():
+        try:
+            with SessionLocal() as session:
+                unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
+            players = sum(get_server_status(s)["players"] for s in FRESH_SERVER_CACHE.values())
+            activities = [
+                f"Tracking {unique_count} BF4 servers",
+                f"{players:,} players across tracked servers",
+            ]
+            await client.change_presence(activity=discord.CustomActivity(name=activities[index % 2]))
+            index += 1
+        except Exception as exc:
+            log.warning("Presence update failed error=%s message=%r", type(exc).__name__, str(exc))
+        await asyncio.sleep(PRESENCE_UPDATE_SECONDS)
+
+
+async def version_loop():
+    while not client.is_closed():
+        await asyncio.to_thread(refresh_latest_version)
+        await asyncio.sleep(VERSION_CHECK_INTERVAL_SECONDS)
+
+
+async def guild_cleanup_once():
+    cutoff = utcnow() - timedelta(days=GUILD_RETENTION_DAYS)
+    with SessionLocal() as session:
+        eligible = session.scalars(select(Guild).where(Guild.left_at.is_not(None), Guild.left_at <= cutoff)).all()
+        targets = [(g.guild_id, g.guild_name, g.left_at) for g in eligible]
+    log.info("Guild cleanup started eligible=%s cutoff=%s", len(targets), cutoff.isoformat())
+    deleted_count = failed = 0
+    for index, (guild_id, guild_name, left_at) in enumerate(targets, 1):
+        try:
+            with SessionLocal.begin() as session:
+                counts = {
+                    "listen_channels": session.scalar(select(func.count()).select_from(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id)) or 0,
+                    "guild_servers": session.scalar(select(func.count()).select_from(GuildServer).where(GuildServer.guild_id == guild_id)) or 0,
+                    "map_roles": session.scalar(select(func.count()).select_from(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id)) or 0,
+                    "server_states": session.scalar(select(func.count()).select_from(GuildServerState).where(GuildServerState.guild_id == guild_id)) or 0,
+                }
+                session.execute(delete(GuildServerState).where(GuildServerState.guild_id == guild_id))
+                session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id))
+                session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id))
+                session.execute(delete(GuildServer).where(GuildServer.guild_id == guild_id))
+                session.execute(delete(GuildSettings).where(GuildSettings.guild_id == guild_id))
+                session.execute(delete(Guild).where(Guild.guild_id == guild_id))
+            deleted_count += 1
+            log.info(
+                "Guild cleanup deleted progress=%s/%s guild=%s name=%r left_at=%s related=%s",
+                index, len(targets), guild_id, guild_name, left_at, counts
+            )
+        except Exception as exc:
+            failed += 1
+            log.error(
+                "Guild cleanup failed progress=%s/%s guild=%s error=%s message=%r",
+                index, len(targets), guild_id, type(exc).__name__, str(exc)
+            )
+    log.info("Guild cleanup complete eligible=%s deleted=%s failed=%s", len(targets), deleted_count, failed)
+
+
+def seconds_until_midnight_utc():
+    now = utcnow()
+    tomorrow = (now + timedelta(days=1)).date()
+    target = datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc)
+    return max(1, (target - now).total_seconds())
+
+
+async def guild_cleanup_loop():
+    while not client.is_closed():
+        await asyncio.sleep(seconds_until_midnight_utc())
+        await guild_cleanup_once()
+
+
+async def delete_later(message, seconds):
+    await asyncio.sleep(seconds)
+    try:
+        await message.delete()
+        log.info("Manual announcement deleted guild=%s channel=%s message=%s", message.guild.id, message.channel.id, message.id)
     except discord.NotFound:
         pass
-    except discord.Forbidden:
-        print(
-            "WARNING: Could not delete a manual announcement after its "
-            "cleanup timer; missing permission.",
-            flush=True,
+    except Exception as exc:
+        log.warning(
+            "Manual announcement cleanup failed guild=%s channel=%s message=%s error=%s",
+            message.guild.id, message.channel.id, message.id, type(exc).__name__
         )
-    except discord.HTTPException as error:
-        print(
-            f"WARNING: Manual announcement cleanup failed: {error}",
-            flush=True,
-        )
-
-
-def schedule_manual_announcement_cleanup(message):
-    asyncio.create_task(
-        delete_message_later(
-            message,
-            MANUAL_ANNOUNCEMENT_TTL_SECONDS,
-        )
-    )
-
-
-async def post_server_announcement(
-    channel,
-    key,
-    record,
-    *,
-    manual=False,
-    seed_cache=True,
-):
-    """Post current map-style status for one saved server."""
-    server_name = str(record.get("name", key))
-    server_guid = str(record.get("guid", "")).strip()
-    status = await asyncio.to_thread(
-        get_server_status,
-        None,
-        server_guid,
-    )
-
-    if not manual:
-        await delete_old_map_announcements(channel, server_name)
-
-    content = (
-        build_message(
-            "BF4 Map Change",
-            status,
-            server_name=server_name,
-        )
-        + version_update_notice()
-    )
-    if not manual:
-        content += AUTO_ANNOUNCEMENT_MARKER
-
-    sent_message = await channel.send(content)
-
-    if manual:
-        schedule_manual_announcement_cleanup(sent_message)
-    elif seed_cache:
-        LAST_MAPS[key] = status["map_id"]
-        LAST_DEFAULT_STATUSES[key] = status
-
-    return sent_message, status
-
-
-async def activate_default_server(key):
-    """Seed and immediately announce a newly activated default server."""
-    global NO_DEFAULT_ANNOUNCED
-    record = SERVERS["servers"][key]
-    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-    channel = client.get_channel(announcement_id) if announcement_id else None
-
-    if channel is not None:
-        await delete_no_default_notices(channel)
-        NO_DEFAULT_ANNOUNCED = False
-        await post_server_announcement(
-            channel,
-            key,
-            record,
-            manual=False,
-            seed_cache=True,
-        )
-    else:
-        # Seed the watcher cache even if announcements are unavailable.
-        status = await asyncio.to_thread(
-            get_server_status,
-            None,
-            str(record.get("guid", "")).strip(),
-        )
-        LAST_MAPS[key] = status["map_id"]
-        LAST_DEFAULT_STATUSES[key] = status
-
-
-async def deactivate_default_server(key, record):
-    """Immediately remove a former default's current announcement/cache."""
-    global NO_DEFAULT_ANNOUNCED
-    server_name = str(record.get("name", key))
-    LAST_MAPS.pop(key, None)
-    LAST_DEFAULT_STATUSES.pop(key, None)
-
-    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-    channel = client.get_channel(announcement_id) if announcement_id else None
-    if channel is not None:
-        await delete_old_map_announcements(channel, server_name)
-        if not get_default_server_keys():
-            await post_no_default_notice(channel)
-
-
-def build_map_role_ping(map_name):
-    ping_config = CONFIG.get("map_role_pings", {}).get(map_name)
-    if not isinstance(ping_config, dict):
-        return "", discord.AllowedMentions.none()
-
-    role_id = as_int(ping_config.get("role_id"))
-    if not role_id:
-        return "", discord.AllowedMentions.none()
-
-    message = str(ping_config.get("message", f"{map_name} is now live!"))
-    content = f"<@&{role_id}> {message}\n"
-    allowed_mentions = discord.AllowedMentions(
-        roles=True,
-        users=False,
-        everyone=False,
-        replied_user=False,
-    )
-    return content, allowed_mentions
-
-
-async def map_check_loop():
-    global NO_DEFAULT_ANNOUNCED
-    await client.wait_until_ready()
-    print("Server watcher started", flush=True)
-
-    while not client.is_closed():
-        try:
-            channel_id = int(CONFIG["announcement_channel_id"])
-            channel = client.get_channel(channel_id) if channel_id else None
-            default_keys = get_default_server_keys()
-
-            if channel_id and channel is None:
-                print(f"ERROR: Announcement channel {channel_id} not found", flush=True)
-
-            if not default_keys:
-                LAST_MAPS.clear()
-                LAST_DEFAULT_STATUSES.clear()
-                if channel is not None and not NO_DEFAULT_ANNOUNCED:
-                    await post_no_default_notice(channel)
-            else:
-                if channel is not None and NO_DEFAULT_ANNOUNCED:
-                    await delete_no_default_notices(channel)
-                NO_DEFAULT_ANNOUNCED = False
-                active_keys = set(default_keys)
-
-                for stale_key in list(LAST_MAPS):
-                    if stale_key not in active_keys:
-                        LAST_MAPS.pop(stale_key, None)
-                        LAST_DEFAULT_STATUSES.pop(stale_key, None)
-
-                for key in default_keys:
-                    record = SERVERS["servers"][key]
-                    server_name = str(record.get("name", key))
-                    server_guid = str(record.get("guid", "")).strip()
-
-                    try:
-                        status = await asyncio.to_thread(
-                            get_server_status,
-                            None,
-                            server_guid,
-                        )
-                    except Exception as error:
-                        print(
-                            f"ERROR polling {server_name}: "
-                            f"{type(error).__name__}: {error}",
-                            flush=True,
-                        )
-                        continue
-
-                    LAST_DEFAULT_STATUSES[key] = status
-                    print(
-                        f"Current map [{server_name}]: {status['map_name']}",
-                        flush=True,
-                    )
-
-                    old_map = LAST_MAPS.get(key)
-                    LAST_MAPS[key] = status["map_id"]
-
-                    if (
-                        channel is not None
-                        and old_map is not None
-                        and old_map != status["map_id"]
-                    ):
-                        await delete_old_map_announcements(channel, server_name)
-                        ping_text, allowed_mentions = build_map_role_ping(
-                            status["map_name"]
-                        )
-                        announcement = (
-                            ping_text
-                            + build_message(
-                                "BF4 Map Change",
-                                status,
-                                server_name=server_name,
-                            )
-                            + version_update_notice()
-                            + AUTO_ANNOUNCEMENT_MARKER
-                        )
-                        await channel.send(
-                            announcement,
-                            allowed_mentions=allowed_mentions,
-                        )
-                        print(
-                            f"Announcement sent [{server_name}]: "
-                            f"{status['map_name']}",
-                            flush=True,
-                        )
-
-        except Exception as error:
-            print(f"ERROR: {type(error).__name__}: {error}", flush=True)
-
-        await asyncio.sleep(int(CONFIG["check_interval_seconds"]))
-
-
-async def presence_rotation_loop():
-    await client.wait_until_ready()
-    index = 0
-
-    while not client.is_closed():
-        try:
-            activities = []
-            for key in get_default_server_keys():
-                record = SERVERS["servers"].get(key, {})
-                status = LAST_DEFAULT_STATUSES.get(key)
-                if not status:
-                    continue
-                server_name = str(record.get("name", key))
-                activities.extend([
-                    f"{server_name} • {status['map_name']}",
-                    f"{server_name} currently has {status['players']} players",
-                ])
-
-            activities.append(f"BF4 Server Watcher {BOT_VERSION}")
-            activity_text = activities[index % len(activities)]
-            index += 1
-
-            await client.change_presence(
-                activity=discord.CustomActivity(name=activity_text)
-            )
-        except Exception as error:
-            print(
-                f"WARNING: Presence update failed: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-
-        await asyncio.sleep(int(CONFIG.get("presence_update_seconds", 30)))
 
 
 @client.event
-async def on_ready():
-    global watcher_started
-    print(f"READY: Logged in as {client.user} ({BOT_VERSION})", flush=True)
-    for guild in client.guilds:
-        for warning in configuration_warnings(guild):
-            print(warning, flush=True)
-    if watcher_started:
-        return
-    watcher_started = True
-
+async def on_guild_join(guild):
     try:
-        synced = await tree.sync()
-        synced_names = ", ".join(
-            f"/{command.name}"
-            for command in synced
-        )
-        print(
-            f"Slash commands synced: {len(synced)}"
-            + (f" — {synced_names}" if synced_names else ""),
-            flush=True,
-        )
-    except Exception as error:
-        print(f"WARNING: Slash command sync failed: {type(error).__name__}: {error}", flush=True)
-
-    asyncio.create_task(map_check_loop())
-    asyncio.create_task(version_check_loop())
-    asyncio.create_task(presence_rotation_loop())
+        ensure_guild_record(guild, joining=True)
+    except Exception as exc:
+        log.error("Guild join bootstrap failed guild=%s error=%s message=%r", guild.id, type(exc).__name__, str(exc))
 
 
-def has_role_or_higher(member, required_role_id, zero_allows=False):
-    if not isinstance(member, discord.Member):
-        return False
-
-    if member.id == member.guild.owner_id or member.guild_permissions.administrator:
-        return True
-
-    required_role_id = int(required_role_id)
-    if required_role_id == 0:
-        return bool(zero_allows)
-
-    required_role = member.guild.get_role(required_role_id)
-    if required_role is None:
-        print(f"ERROR: Required Discord role {required_role_id} was not found", flush=True)
-        return False
-
-    return member.top_role >= required_role
+@client.event
+async def on_guild_remove(guild):
+    try:
+        mark_guild_left(guild)
+    except Exception as exc:
+        log.error("Guild leave state failed guild=%s error=%s message=%r", guild.id, type(exc).__name__, str(exc))
 
 
-def can_manage(member):
-    return has_role_or_higher(member, CONFIG["management_min_role_id"])
-
-
-def listen_channel_ids():
-    ids = set()
-    for value in CONFIG.get("listen_channel_id", [0]):
+@client.event
+async def on_guild_update(before, after):
+    if before.name != after.name:
         try:
-            channel_id = int(value)
-        except (TypeError, ValueError):
-            continue
-        if channel_id:
-            ids.add(channel_id)
-    return ids
+            ensure_guild_record(after)
+            log.info("Guild name updated guild=%s old=%r new=%r", after.id, before.name, after.name)
+        except Exception as exc:
+            log.error("Guild name update failed guild=%s error=%s", after.id, type(exc).__name__)
 
 
-def command_channel_allowed(message):
-    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-    listens = listen_channel_ids()
-    if can_manage(message.author):
-        return message.channel.id == announcement_id or message.channel.id in listens
-    return message.channel.id in listens
-
-
-def can_use_status_commands(message):
-    status_role_id = int(CONFIG.get("status_min_role_id", 0))
-    return has_role_or_higher(message.author, status_role_id, zero_allows=True)
-
-
-def format_channel_setting(guild, channel_id):
-    try:
-        channel_id = int(channel_id)
-    except (TypeError, ValueError):
-        return f"Invalid channel ID ({channel_id!r})"
-    channel = guild.get_channel(channel_id) if guild and channel_id else None
-    return f"#{channel.name} ({channel_id})" if channel else str(channel_id)
-
-
-def format_role_setting(guild, role_id):
-    try:
-        role_id = int(role_id)
-    except (TypeError, ValueError):
-        return f"Invalid role ID ({role_id!r})"
-    role = guild.get_role(role_id) if guild and role_id else None
-    return f"@{role.name} ({role_id})" if role else str(role_id)
-
-
-def format_server_records(records, include_guids=True, mark_defaults=True):
-    rows = []
-    default_keys = set(get_default_server_keys())
-
-    for key, record in sorted_server_items(records):
-        if not isinstance(record, dict):
-            continue
-        platform = platform_display_label(record)
-        name = str(record.get("name", key))
-        guid = str(record.get("guid", "missing GUID"))
-        marker = " (default)" if mark_defaults and key in default_keys else ""
-        rows.append((platform, name, guid, marker))
-
-    if not rows:
-        return "None"
-
-    platform_width = max(len(row[0]) for row in rows)
-    name_width = max(len(row[1]) for row in rows)
-
-    lines = []
-    for platform, name, guid, marker in rows:
-        if include_guids:
-            lines.append(
-                f"{platform.ljust(platform_width)} - "
-                f"{name.ljust(name_width)} — {guid}{marker}"
-            )
-        else:
-            lines.append(
-                f"{platform.ljust(platform_width)} - {name}{marker}"
-            )
-    return "\n".join(lines)
-
-
-def current_default_server_text():
-    defaults = get_default_server_records()
-    if not defaults:
-        return "No default server(s) set"
-    return format_server_records(
-        defaults,
-        include_guids=True,
-        mark_defaults=False,
-    )
-
-
-def current_server_list_text(include_guids=True):
-    return format_server_records(
-        SERVERS.get("servers", {}).items(),
-        include_guids=include_guids,
-        mark_defaults=True,
-    )
-
-
-
-
-def current_map_role_list_text(guild):
-    lines = []
-    for map_name, entry in CONFIG.get("map_role_pings", {}).items():
-        if not isinstance(entry, dict):
-            continue
-        role_text = format_role_setting(
-            guild,
-            entry.get("role_id", 0),
-        )
-        message_text = " ".join(
-            str(
-                entry.get("message")
-                or f"{map_name} is now live!"
-            ).splitlines()
-        )
-        lines.append(
-            f'{map_name} — {role_text} - "{message_text}"'
-        )
-    return "\n".join(lines) if lines else "None"
-
-
-def map_name_matches(query):
-    query = query.strip().lower()
-    names = sorted(set(str(name) for name in MAP_NAMES.values()))
-    exact = [name for name in names if name.lower() == query]
-    if exact:
-        return exact
-    return [name for name in names if query in name.lower()]
-
-
-def configuration_warnings(guild):
-    warnings = []
-    channel_id = int(CONFIG.get("announcement_channel_id", 0))
-    if channel_id == 0:
-        detail = (
-            " If listen_channel_id is also [0], no Discord commands can be used to fix this; "
-            "edit config.json on the host first."
-            if not listen_channel_ids() else ""
-        )
-        warnings.append(
-            "WARNING: announcement_channel_id is 0. Automatic map-change announcements "
-            "and manager commands in the announcement channel are disabled until corrected." + detail
-        )
-    elif guild is None or guild.get_channel(channel_id) is None:
-        warnings.append(
-            f"WARNING: announcement_channel_id {channel_id} does not exist in this Discord server. "
-            "Automatic map-change announcements are disabled until corrected."
-        )
-
-    for listen_id in sorted(listen_channel_ids()):
-        if guild is None or guild.get_channel(listen_id) is None:
-            warnings.append(
-                f"WARNING: listen_channel_id contains {listen_id}, which does not exist in this Discord server."
-            )
-
-    status_role_id = int(CONFIG.get("status_min_role_id", 0))
-    if status_role_id and (guild is None or guild.get_role(status_role_id) is None):
-        warnings.append(
-            f"WARNING: status_min_role_id {status_role_id} does not exist in this Discord server. "
-            "!status is restricted to Administrators/server owner until corrected."
-        )
-    return warnings
-
-
-def resolve_channel_argument(guild, value):
-    value = value.strip()
-    mention = re.fullmatch(r"<#(\d{15,22})>", value)
-    if mention:
-        channel_id = int(mention.group(1))
-        channel = guild.get_channel(channel_id) if guild else None
-        return channel, []
-
-    if re.fullmatch(r"\d{15,22}", value):
-        channel_id = int(value)
-        channel = guild.get_channel(channel_id) if guild else None
-        return channel, []
-
-    name = value[1:] if value.startswith("#") else value
-    matches = [
-        channel for channel in getattr(guild, "channels", [])
-        if getattr(channel, "name", "").lower() == name.lower()
-    ]
-    if len(matches) == 1:
-        return matches[0], matches
-    return None, matches
-
-
-
-def parse_channel_arguments(guild, payload):
-    try:
-        tokens = shlex.split(payload)
-    except ValueError as error:
-        return [], [], [f"Could not parse channel list: {error}"]
-
-    resolved = []
-    ambiguous = []
-    missing = []
-    seen = set()
-    for token in tokens:
-        channel, matches = resolve_channel_argument(guild, token)
-        if channel is not None:
-            if channel.id not in seen:
-                resolved.append(channel)
-                seen.add(channel.id)
-        elif len(matches) > 1:
-            ambiguous.append((token, matches))
-        else:
-            missing.append(token)
-    return resolved, ambiguous, missing
-
-
-def current_listen_channel_text(guild):
-    ids = sorted(listen_channel_ids())
-    if not ids:
-        return "0 (no regular-user command channel configured)"
-    return "\n".join(format_channel_setting(guild, channel_id) for channel_id in ids)
-
-def configured_map_role_matches(query):
-    query = query.strip().strip('"').strip("'").lower()
-    names = [name for name, entry in CONFIG.get("map_role_pings", {}).items() if isinstance(entry, dict)]
-    exact = [name for name in names if name.lower() == query]
-    if exact:
-        return exact
-    return sorted(name for name in names if query in name.lower())
-
-
-def build_help_messages(member):
-    guild = member.guild if isinstance(member, discord.Member) else None
-
-    def safe(label, func, fallback="Unavailable"):
-        try:
-            value = func()
-            return f"{label}{value}"
-        except Exception as error:
-            print(
-                f"HELP DISPLAY WARNING: {label.strip()} "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-            return f"{label}{fallback}"
-
-    user_help = "\n".join([
-        f"🤖 **BF4 Server Watcher Help — {BOT_VERSION}**",
-        "",
-        "**User commands**",
-        "`!help` — show this help message.",
-        "`!list` — list configured server names.",
-        "`!status [server-name]` — show the default server(s), or a saved server by exact/partial name.",
-        "`!status <server-name> players` — show a side-by-side player list broken down by team.",
-        "`!version` — show the bot version and update status.",
-    ])
-
-    messages = [user_help]
-
-    if not can_manage(member):
-        return messages
-
-    management_help = "\n".join([
-        "**Management slash commands**",
-        "`/status all` — show status for every configured server.",
-        "`/status server` — choose one configured server; optionally show players with Mobile (default) or Wide layout.",
-        "`/announce` or `!announce` — temporarily post current default-server status; manual announcements delete after 10 minutes.",
-        "`/debug` — show Keeper diagnostic information for a selected saved server.",
-        "`/reload` — reload `config.json` and `servers.json`.",
-        "`/addserver` — add one or more servers from full Battlelog server URLs; optional `make_default` applies to all successful additions.",
-        "`/delserver` — select and immediately delete a configured non-default server.",
-        "`/renameserver` — select a configured server and give it a new display name.",
-        "`/defaultserver add|remove|list` — manage zero, one, or multiple default servers with autocomplete.",
-        "`/setannouncementchannel` — change the announcement channel.",
-        "`/addlistenchannel` — add one or more regular-user command channels.",
-        "`/dellistenchannel` — immediately remove one or more regular-user command channels.",
-        "`/setmanagementrole` — change the management minimum role.",
-        "`/setstatusrole` — change the minimum role for `!status`; use `0` to allow everyone in listen channels.",
-        "`/setinterval` — change the polling interval (minimum 10 seconds).",
-        "`/setpresenceupdate` — change presence rotation timing; values are clamped to 10–60 seconds.",
-        "`/setmaprole` — immediately set or disable a map-specific role/message.",
-        "`/editmaprole` — edit an existing map role; optionally replace its role and edit its current message in a pre-filled dialog.",
-        "`/delmaprole` — immediately delete a configured map role ping.",
-    ])
-
-    current_config = "\n\n".join([
-        "**Current configuration**",
-        safe("**Servers:**\n```text\n", lambda: current_server_list_text() + "\n```"),
-        safe("**Default servers:**\n```text\n", lambda: current_default_server_text() + "\n```"),
-        safe(
-            "**Announcement channel:**\n",
-            lambda: format_channel_setting(
-                guild,
-                CONFIG.get("announcement_channel_id", 0),
-            ),
-        ),
-        safe(
-            "**Listen channels:**\n",
-            lambda: current_listen_channel_text(guild),
-        ),
-        safe(
-            "**Management minimum role:**\n",
-            lambda: format_role_setting(
-                guild,
-                CONFIG.get("management_min_role_id", 0),
-            ),
-        ),
-        safe(
-            "**Status minimum role:**\n",
-            lambda: format_role_setting(
-                guild,
-                CONFIG.get("status_min_role_id", 0),
-            ),
-        ),
-        safe(
-            "**Polling interval:** ",
-            lambda: f"{CONFIG.get('check_interval_seconds', 'Unavailable')} seconds",
-        ),
-        safe(
-            "**Presence update interval:** ",
-            lambda: f"{CONFIG.get('presence_update_seconds', 30)} seconds",
-        ),
-        safe(
-            "**Map role pings:**\n",
-            lambda: current_map_role_list_text(guild),
-        ),
-    ])
-
-    messages.extend([management_help, current_config])
-    return messages
-
-
-
-def split_discord_message(text, limit=1900):
-    chunks = []
-    current = []
-    current_len = 0
-
-    for original_line in text.splitlines():
-        line_parts = [
-            original_line[i:i + limit]
-            for i in range(0, len(original_line), limit)
-        ] or [""]
-
-        for line in line_parts:
-            extra = len(line) + (1 if current else 0)
-            if current and current_len + extra > limit:
-                chunks.append("\n".join(current))
-                current = [line]
-                current_len = len(line)
-            else:
-                current.append(line)
-                current_len += extra
-
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
-
-
-def parse_discord_id(value):
-    match = re.search(r"(\d{15,22})", value)
-    if match:
-        return int(match.group(1))
-    if value.strip() == "0":
-        return 0
-    raise ValueError("Expected a Discord channel/role mention or numeric ID")
-
-
-def valid_guid(value):
-    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value))
-
-
-def save_config():
-    validate_config(CONFIG)
-    write_json_in_place(CONFIG_PATH, CONFIG)
-
-
-def save_servers():
-    validate_servers(SERVERS)
-    write_json_in_place(SERVERS_PATH, SERVERS)
-
-
-async def require_management(message, command_name):
-    if can_manage(message.author):
-        return True
-    await message.channel.send(f"⛔ You do not have permission to use `{command_name}`.")
-    return False
-
-
-async def handle_management_command(message, raw, lowered):
-    if lowered == "!reload":
-        if not await require_management(message, "!reload"):
-            return True
-        reload_runtime_config()
-        lines = [f"✅ Configuration reloaded. Interval: **{CONFIG['check_interval_seconds']} seconds**."]
-        lines.extend(f"⚠️ {warning}" for warning in configuration_warnings(message.guild))
-        await message.channel.send("\n".join(lines))
-        return True
-
-    if lowered.startswith("!setdefaultserver"):
-        await message.channel.send(
-            "ℹ️ v1.3.0 uses `/defaultserver add`, `/defaultserver remove`, "
-            "and `/defaultserver list`."
-        )
-        return True
-
-    if lowered.startswith("!setannouncementchannel"):
-        if not await require_management(message, "!setannouncementchannel"):
-            return True
-        parts = raw.split(maxsplit=1)
-        if len(parts) != 2:
-            await message.channel.send(
-                "Usage: `!setannouncementchannel <#channel-or-id-or-name>`\n"
-                f"Current: {format_channel_setting(message.guild, CONFIG['announcement_channel_id'])}"
-            )
-            return True
-        channel, matches = resolve_channel_argument(message.guild, parts[1])
-        if channel is None:
-            if len(matches) > 1:
-                choices = "\n".join(f"#{c.name} — `{c.id}`" for c in matches)
-                await message.channel.send(
-                    "⚠️ Multiple channels have that name. Use a channel mention or numeric ID:\n" + choices
-                )
-            else:
-                await message.channel.send("⚠️ That Discord channel could not be found in this server.")
-            return True
-        CONFIG["announcement_channel_id"] = channel.id
-        save_config()
-        await message.channel.send(
-            f"✅ Announcement channel updated to **#{channel.name}** (`{channel.id}`)."
-        )
-        return True
-
-    if lowered.startswith("!addlistenchannel"):
-        if not await require_management(message, "!addlistenchannel"):
-            return True
-        payload = raw[len("!addlistenchannel"):].strip()
-        if not payload:
-            await message.channel.send(
-                "Usage: `!addlistenchannel <channel> [channel...]`\n"
-                "Each channel may be a mention, numeric ID, or exact channel name. Quote names containing spaces.\n"
-                "Current listen channels:\n" + current_listen_channel_text(message.guild)
-            )
-            return True
-        channels, ambiguous, missing = parse_channel_arguments(message.guild, payload)
-        current = [int(x) for x in CONFIG.get("listen_channel_id", [0]) if int(x) != 0]
-        added = []
-        already = []
-        for channel in channels:
-            if channel.id in current:
-                already.append(channel)
-            else:
-                current.append(channel.id)
-                added.append(channel)
-        if added:
-            CONFIG["listen_channel_id"] = current or [0]
-            save_config()
-        lines = []
-        if added:
-            lines.append("✅ Added listen channels:\n" + "\n".join(f"#{c.name} (`{c.id}`)" for c in added))
-        if already:
-            lines.append("Already configured:\n" + "\n".join(f"#{c.name} (`{c.id}`)" for c in already))
-        for token, matches in ambiguous:
-            lines.append(
-                f"⚠️ Multiple channels matched **{token}**:\n" +
-                "\n".join(f"#{c.name} — `{c.id}`" for c in matches)
-            )
-        if missing:
-            lines.append("⚠️ Could not resolve:\n" + "\n".join(missing))
-        if not lines:
-            lines.append("⚠️ No channels were added.")
-        lines.append("Current listen channels:\n" + current_listen_channel_text(message.guild))
-        await message.channel.send("\n".join(lines))
-        return True
-
-    if lowered.startswith("!setmanagementrole"):
-        if not await require_management(message, "!setmanagementrole"):
-            return True
-        parts = raw.split(maxsplit=1)
-        if len(parts) != 2:
-            await message.channel.send(
-                "Usage: `!setmanagementrole <@role-or-id>`\n"
-                f"Current: {format_role_setting(message.guild, CONFIG['management_min_role_id'])}"
-            )
-            return True
-        CONFIG["management_min_role_id"] = parse_discord_id(parts[1])
-        save_config()
-        await message.channel.send("✅ Management minimum role updated in `config.json`.")
-        return True
-
-    if lowered.startswith("!setstatusrole"):
-        if not await require_management(message, "!setstatusrole"):
-            return True
-        parts = raw.split(maxsplit=1)
-        if len(parts) != 2:
-            await message.channel.send(
-                "Usage: `!setstatusrole <@role-or-id>` (`0` allows everyone in this channel)\n"
-                f"Current: {format_role_setting(message.guild, CONFIG['status_min_role_id'])}"
-            )
-            return True
-        role_id = parse_discord_id(parts[1])
-        CONFIG["status_min_role_id"] = role_id
-        save_config()
-        if role_id == 0:
-            detail = " `!status` is now available to everyone in configured listen channels."
-        elif message.guild.get_role(role_id) is None:
-            detail = " ⚠️ That role does not exist here; `!status` is restricted to Administrators/server owner until corrected."
-        else:
-            detail = ""
-        await message.channel.send("✅ Status minimum role updated in `config.json`." + detail)
-        return True
-
-    if lowered.startswith("!setinterval"):
-        if not await require_management(message, "!setinterval"):
-            return True
-        parts = raw.split(maxsplit=1)
-        try:
-            seconds = int(parts[1]) if len(parts) == 2 else 0
-        except ValueError:
-            seconds = 0
-        if seconds < 10:
-            await message.channel.send(
-                "Usage: `!setinterval <seconds>` (minimum 10)\n"
-                f"Current: {CONFIG['check_interval_seconds']} seconds"
-            )
-            return True
-        CONFIG["check_interval_seconds"] = seconds
-        save_config()
-        await message.channel.send(f"✅ Check interval updated to **{seconds} seconds**.")
-        return True
-
-    return False
-
-
-
-class InteractionChannelProxy:
-    def __init__(self, interaction):
-        self._interaction = interaction
-        self.id = interaction.channel_id
-
-    async def send(self, content, **kwargs):
-        return await self._interaction.followup.send(content, **kwargs)
-
-
-class InteractionMessageProxy:
-    def __init__(self, interaction):
-        self.author = interaction.user
-        self.guild = interaction.guild
-        self.channel = InteractionChannelProxy(interaction)
-
-
-async def prepare_management_interaction(interaction, ephemeral=False):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            "⛔ Management commands can only be used inside a Discord server.",
-            ephemeral=True,
-        )
-        return None
-
-    if not can_manage(interaction.user):
-        await interaction.response.send_message(
-            "⛔ You do not have permission to use that management command.",
-            ephemeral=True,
-        )
-        return None
-
-    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-    allowed_ids = listen_channel_ids()
-    if announcement_id:
-        allowed_ids.add(announcement_id)
-
-    if interaction.channel_id not in allowed_ids:
-        await interaction.response.send_message(
-            "⛔ Management commands may only be used in the configured announcement "
-            "channel or a configured listen channel.",
-            ephemeral=True,
-        )
-        return None
-
-    await interaction.response.defer(ephemeral=ephemeral)
-    return InteractionMessageProxy(interaction)
-
-
-async def run_legacy_management_backend(interaction, raw_command):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-    handled = await handle_management_command(
-        proxy,
-        raw_command,
-        raw_command.lower(),
-    )
-    if not handled:
-        await interaction.followup.send("⚠️ Management command backend did not handle that request.")
-
-
-status_group = discord.app_commands.Group(
-    name="status",
-    description="Administrative server status commands",
-)
-
-
-@status_group.command(
-    name="all",
-    description="Show status for every configured BF4 server",
-)
-async def slash_status_all(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(
-        interaction,
-        ephemeral=True,
-    )
-    if proxy is None:
-        return
-
-    server_count = len(SERVERS.get("servers", {}))
-    await interaction.followup.send(
-        f"Fetching status for **{server_count}** configured server(s)...",
-        ephemeral=True,
-    )
-
+async def send_clean_chunks(interaction, chunks):
     channel = interaction.channel
     if channel is None:
-        await interaction.followup.send(
-            "⚠️ The current Discord channel could not be resolved.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("⚠️ Current channel could not be resolved.", ephemeral=True)
         return
-
-    for key, record in sorted_server_items():
-        server_name = str(record.get("name", key))
-        server_guid = str(record.get("guid", "")).strip()
-        marker = (
-            " (default)"
-            if key in set(get_default_server_keys())
-            else ""
-        )
-        try:
-            status = await asyncio.to_thread(
-                get_server_status,
-                None,
-                server_guid,
-            )
-            await channel.send(
-                build_message(
-                    f"BF4 Server Status — {server_name}{marker}",
-                    status,
-                )
-            )
-        except Exception as error:
-            await channel.send(
-                f"⚠️ **{server_name}{marker}** — "
-                f"status lookup failed: `{type(error).__name__}`"
-            )
-
-
-async def send_clean_status_chunks(
-    interaction: discord.Interaction,
-    chunks,
-):
-    """
-    Send scoreboard/roster chunks as normal channel messages, then remove the
-    deferred interaction response so Discord does not render follow-ups as
-    reply-style continuations.
-    """
-    channel = interaction.channel
-    if channel is None:
-        await interaction.followup.send(
-            "⚠️ The current Discord channel could not be resolved.",
-            ephemeral=True,
-        )
-        return False
-
+    for chunk in chunks:
+        await channel.send(chunk)
     try:
-        for chunk in chunks:
-            await channel.send(chunk)
-        try:
-            await interaction.delete_original_response()
-        except discord.NotFound:
-            pass
-        return True
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "⚠️ I could not post the player output in this channel.",
-            ephemeral=True,
-        )
-        return False
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"⚠️ Player output failed: `{type(error).__name__}`",
-            ephemeral=True,
-        )
-        print(
-            f"PLAYER OUTPUT ERROR: {type(error).__name__}: {error}",
-            flush=True,
-        )
-        return False
+        await interaction.delete_original_response()
+    except discord.NotFound:
+        pass
 
 
-@status_group.command(
-    name="server",
-    description="Show status or player details for one configured BF4 server",
-)
-@discord.app_commands.describe(
-    server="Choose a configured server",
-    players="Show player details instead of the normal server status",
-    layout="Player-stat layout; Mobile is the default",
-)
-@discord.app_commands.choices(
-    layout=[
-        discord.app_commands.Choice(name="Mobile", value="mobile"),
-        discord.app_commands.Choice(name="Wide", value="wide"),
-    ]
-)
-async def slash_status_server(
-    interaction: discord.Interaction,
-    server: str,
-    players: bool = False,
-    layout: str = "mobile",
-):
-    proxy = await prepare_management_interaction(
-        interaction,
-        ephemeral=True,
-    )
-    if proxy is None:
+status_group = app_commands.Group(name="status", description="Server status commands")
+
+
+@status_group.command(name="all", description="Show status for every configured BF4 server")
+async def status_all(interaction: discord.Interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    record = SERVERS.get("servers", {}).get(server)
-    if not isinstance(record, dict):
-        await interaction.followup.send(
-            "⚠️ That server is not currently configured. "
-            "Choose one from the autocomplete list.",
-            ephemeral=True,
-        )
-        return
-
-    server_name = str(record.get("name", server))
-    server_guid = str(record.get("guid", "")).strip()
-    marker = (
-        " (default)"
-        if server in set(get_default_server_keys())
-        else ""
-    )
-
-    if not players:
-        try:
-            status = await asyncio.to_thread(
-                get_server_status,
-                None,
-                server_guid,
-            )
-            await interaction.followup.send(
-                build_message(
-                    f"BF4 Server Status — {server_name}{marker}",
-                    status,
-                ),
-                ephemeral=True,
-            )
-        except Exception as error:
-            await interaction.followup.send(
-                f"⚠️ **{server_name}{marker}** — "
-                f"status lookup failed: `{type(error).__name__}`",
-                ephemeral=True,
-            )
-        return
-
     try:
-        keeper_data = await asyncio.to_thread(
-            get_server,
-            server_guid,
-        )
-    except Exception as error:
-        await interaction.followup.send(
-            f"⚠️ Player lookup failed for **{server_name}**: "
-            f"`{type(error).__name__}`",
-            ephemeral=True,
-        )
+        rows = sorted_guild_servers(interaction.guild.id)
+        await interaction.followup.send(f"Fetching status for **{len(rows)}** configured server(s)...", ephemeral=True)
+        for gs, bf in rows:
+            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid)
+            if snapshot is None:
+                snapshot = await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+            marker = " (default)" if gs.is_default else ""
+            await interaction.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot)))
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=True, started=started, result_code="ok", metadata={"server_count": len(rows)})
+    except Exception as exc:
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=False, started=started, result_code="failed", error=exc)
+        await interaction.followup.send(f"⚠️ Status failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+@status_group.command(name="server", description="Show status or player details for one configured server")
+@app_commands.describe(server="Configured server", players="Show player details", layout="Player stat layout")
+@app_commands.choices(layout=[
+    app_commands.Choice(name="Mobile", value="mobile"),
+    app_commands.Choice(name="Wide", value="wide"),
+])
+async def status_server(interaction: discord.Interaction, server: str, players: bool = False, layout: str = "mobile"):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    platform = normalize_platform_label(
-        record.get("platform", "Unknown")
-    )
-
-    # Rich score/K/D/KDR output is PC+BFLIST only.
-    if platform == "PC":
-        bflist_server = await asyncio.to_thread(
-            get_bflist_server_for_guid,
-            server_guid,
-            keeper_data,
-        )
-        if bflist_server is not None:
-            rich_teams = bflist_scoreboard_teams(
-                bflist_server,
-                keeper_data,
-            )
-            if rich_teams:
-                formatter = (
-                    wide_scoreboard_messages
-                    if layout == "wide"
-                    else mobile_scoreboard_messages
-                )
-                scoreboard_messages = formatter(
-                    rich_teams,
-                    server_name,
-                )
-                await send_clean_status_chunks(
-                    interaction,
-                    scoreboard_messages,
-                )
+    try:
+        with SessionLocal() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            bf = session.get(BF4Server, server)
+            if not gs or not bf:
+                await interaction.followup.send("⚠️ That server is not configured for this guild.", ephemeral=True)
+                audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="server_not_found", target_type="server", target_id=server)
                 return
+            display_name, platform = gs.display_name, bf.platform
 
-        print(
-            f"BFLIST rich scoreboard unavailable for {server_name}; "
-            "using Keeper fallback.",
-            flush=True,
-        )
+        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
+        if not players:
+            marker = " (default)" if gs.is_default else ""
+            await interaction.followup.send(build_status_message(f"BF4 Server Status — {display_name}{marker}", get_server_status(snapshot)), ephemeral=True)
+        else:
+            chunks = None
+            if normalize_platform_label(platform) == "PC":
+                bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
+                if bflist:
+                    rich = bflist_team_rosters(bflist, snapshot)
+                    chunks = wide_scoreboard_messages(rich, display_name) if layout == "wide" else mobile_scoreboard_messages(rich, display_name)
+            if not chunks:
+                chunks = compact_roster_messages(keeper_team_rosters(snapshot), display_name)
+            await send_clean_chunks(interaction, chunks)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
+    except Exception as exc:
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        await interaction.followup.send(f"⚠️ Status failed: `{type(exc).__name__}`", ephemeral=True)
 
-    # Console servers and failed PC enrichment intentionally retain the
-    # existing v1.3.5 Keeper name-only side-by-side output.
-    keeper_teams = keeper_team_rosters(keeper_data)
-    roster_messages = build_player_roster_messages(
-        keeper_teams,
-        server_name,
-    )
-    await send_clean_status_chunks(
-        interaction,
-        roster_messages,
-    )
 
-
-@slash_status_server.autocomplete("server")
-async def autocomplete_status_server(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
+@status_server.autocomplete("server")
+async def status_server_autocomplete(interaction, current):
+    if not interaction.guild:
         return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "all")
+    return command_choice_list(interaction.guild.id, current)
 
 
 tree.add_command(status_group)
 
 
-@tree.command(name="announce", description="Temporarily announce all default servers")
-async def slash_announce(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+default_group = app_commands.Group(name="defaultserver", description="Manage default BF4 servers")
+
+
+@default_group.command(name="list", description="List default servers")
+async def default_list(interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
+    defaults = get_default_guild_servers(interaction.guild.id)
+    text = "\n".join(f"({normalize_platform_label(bf.platform)}) - {gs.display_name}" for gs, bf in defaults) or "No default server(s) set"
+    await interaction.followup.send(f"```text\n{text}\n```", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.list", command_type="slash", success=True, started=started, result_code="ok", metadata={"count": len(defaults)})
 
-    announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-    channel = client.get_channel(announcement_id) if announcement_id else None
-    if channel is None:
-        await interaction.followup.send(
-            "⚠️ Configured announcement channel could not be found."
-        )
+
+@default_group.command(name="add", description="Add a configured server to defaults")
+async def default_add(interaction, server: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    defaults = sorted_default_server_records()
-    if not defaults:
-        await interaction.followup.send("⚠️ No default server(s) set.")
-        return
-
-    sent = 0
-    failures = []
-    for key, record in defaults:
-        server_name = str(record.get("name", key))
-        try:
-            await post_server_announcement(
-                channel,
-                key,
-                record,
-                manual=True,
-                seed_cache=False,
-            )
-            sent += 1
-        except Exception as error:
-            failures.append(
-                f"{server_name}: {type(error).__name__}"
-            )
-
-    lines = [
-        f"✅ Posted **{sent}** temporary default-server announcement(s) "
-        f"to **#{getattr(channel, 'name', announcement_id)}**.",
-        "Manual announcements automatically delete after **10 minutes**.",
-    ]
-    if failures:
-        lines.append(
-            "⚠️ Failed:\n" + "\n".join(failures)
-        )
-    await interaction.followup.send("\n".join(lines))
-
-
-@tree.command(name="debug", description="Show Keeper diagnostics for a saved server")
-@discord.app_commands.describe(
-    server="Optional saved server; defaults to the first configured default server"
-)
-async def slash_debug(
-    interaction: discord.Interaction,
-    server: str | None = None,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-
-    if server:
-        record = SERVERS.get("servers", {}).get(server)
-        key = server
-        if not isinstance(record, dict):
-            await interaction.followup.send(
-                "⚠️ That server is not currently configured. "
-                "Choose one from the autocomplete list."
-            )
-            return
-    else:
-        defaults = get_default_server_records()
-        if not defaults:
-            await interaction.followup.send(
-                "⚠️ No default server(s) set. "
-                "Select a saved server with the `server` option."
-            )
-            return
-        key, record = defaults[0]
-
     try:
-        data = await asyncio.to_thread(
-            get_server,
-            str(record.get("guid", "")).strip(),
-        )
-        await interaction.followup.send(
-            f"Debug server: **{record.get('name', key)}**\n"
-            + build_debug_report(data)
-        )
-    except Exception as error:
-        await interaction.followup.send(
-            f"⚠️ Debug lookup failed: `{type(error).__name__}`"
-        )
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            gs.is_default = True
+            name = gs.display_name
+        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
+        await post_automatic_announcement(interaction.guild.id, GuildServer(guild_id=interaction.guild.id, server_guid=server, display_name=name, is_default=True), get_server_status(snapshot), map_change=False)
+        await interaction.followup.send(f"✅ **{name}** added to default servers.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.add", command_type="slash", success=True, started=started, result_code="default_added", target_type="server", target_id=server, target_name=name)
+    except Exception as exc:
+        await interaction.followup.send("⚠️ Could not add that default server.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.add", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
 
 
-@slash_debug.autocomplete("server")
-async def autocomplete_debug_server(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "all")
+@default_add.autocomplete("server")
+async def default_add_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current, defaults=False) if interaction.guild else []
 
 
-@tree.command(name="reload", description="Reload config.json and servers.json")
-async def slash_reload(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@default_group.command(name="remove", description="Remove a server from defaults")
+async def default_remove(interaction, server: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
     try:
-        reload_runtime_config()
-        normalize_server_platform_metadata()
-        lines = [
-            f"✅ Configuration reloaded. Interval: "
-            f"**{CONFIG['check_interval_seconds']} seconds**."
-        ]
-        lines.extend(
-            f"⚠️ {warning}"
-            for warning in configuration_warnings(interaction.guild)
-        )
-        await interaction.followup.send("\n".join(lines))
-    except Exception as error:
-        await interaction.followup.send(
-            f"⚠️ Reload failed: `{type(error).__name__}`"
-        )
-
-
-@tree.command(
-    name="addserver",
-    description="Add one or more Battlefield 4 servers using Battlelog server URLs",
-)
-@discord.app_commands.describe(
-    server_urls="Paste one or more full Battlelog server URLs, separated by spaces or new lines",
-    make_default="Also add every successfully processed server to the default-server list",
-)
-async def slash_addserver(
-    interaction: discord.Interaction,
-    server_urls: str,
-    make_default: bool = False,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-
-    references = [
-        item
-        for item in re.split(r"[\s,]+", server_urls.strip())
-        if item
-    ]
-    if not references:
-        await interaction.followup.send(
-            "⚠️ Paste at least one full Battlelog server URL."
-        )
-        return
-
-    results = []
-    activated_keys = []
-    changed = False
-
-    for reference in references:
-        parsed = parse_server_reference(reference)
-        if not parsed:
-            results.append(
-                "⚠️ Could not parse a Battlefield 4 Battlelog server URL: "
-                f"`{reference[:120]}`"
-            )
-            continue
-
-        guid = parsed["guid"]
-        existing_key, existing_record = find_server(guid)
-
-        if existing_key is not None:
-            metadata_changed = False
-
-            # Full Battlelog URLs are authoritative for platform metadata.
-            if parsed.get("platform_source") == "battlelog_url":
-                for field in (
-                    "platform",
-                    "platform_source",
-                    "battlelog_url",
-                ):
-                    value = parsed.get(field)
-                    if value and existing_record.get(field) != value:
-                        existing_record[field] = value
-                        metadata_changed = True
-
-                current_name = str(
-                    existing_record.get("name", "")
-                ).strip()
-                if not current_name or current_name.startswith("PC Server "):
-                    existing_record["name"] = parsed["name"]
-                    metadata_changed = True
-
-            newly_default = False
-            if (
-                make_default
-                and existing_key not in SERVERS["default_servers"]
-            ):
-                SERVERS["default_servers"].append(existing_key)
-                activated_keys.append(existing_key)
-                newly_default = True
-                changed = True
-
-            if metadata_changed:
-                changed = True
-
-            name = existing_record.get("name", existing_key)
-            platform = normalize_platform_label(
-                existing_record.get("platform", "Unknown")
-            )
-            if metadata_changed or newly_default:
-                detail = []
-                if metadata_changed:
-                    detail.append("platform metadata updated")
-                if newly_default:
-                    detail.append("added to defaults")
-                results.append(
-                    f"✅ Updated existing **{name}** ({platform}): "
-                    + ", ".join(detail)
-                    + "."
+        old_channel = old_message = None
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            gs.is_default = False
+            name = gs.display_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            if state:
+                old_channel, old_message = state.announcement_channel_id, state.announcement_message_id
+                session.delete(state)
+        if old_channel and old_message:
+            await delete_discord_message(interaction.guild.id, old_channel, old_message)
+        if not get_default_guild_servers(interaction.guild.id):
+            settings = get_settings(interaction.guild.id)
+            channel = interaction.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
+            if channel:
+                await channel.send("⚠️ **No default server(s) set**")
+                log.info(
+                    "No-default notice posted guild=%s channel=%s",
+                    interaction.guild.id, channel.id
                 )
-            else:
-                results.append(
-                    f"ℹ️ **{name}** ({platform}) is already configured."
+        await interaction.followup.send(f"✅ **{name}** removed from default servers.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.remove", command_type="slash", success=True, started=started, result_code="default_removed", target_type="server", target_id=server, target_name=name)
+    except Exception as exc:
+        await interaction.followup.send("⚠️ Could not remove that default server.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.remove", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+
+
+@default_remove.autocomplete("server")
+async def default_remove_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+
+
+tree.add_command(default_group)
+
+
+@tree.command(name="addserver", description="Add one or more BF4 servers from Battlelog URLs")
+async def addserver(interaction: discord.Interaction, server_urls: str, make_default: bool = False):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    refs = [x for x in re.split(r"[\s,]+", server_urls.strip()) if x]
+    added, updated, failed = [], [], []
+    activated = []
+    try:
+        for ref in refs:
+            parsed = parse_server_reference(ref)
+            if not parsed:
+                failed.append(ref[:80])
+                continue
+            guid = parsed["guid"]
+            with SessionLocal.begin() as session:
+                global_server = session.get(BF4Server, guid)
+                if global_server is None:
+                    global_server = BF4Server(
+                        server_guid=guid,
+                        server_name=parsed["name"],
+                        platform=parsed["platform"],
+                        battlelog_url=parsed.get("battlelog_url"),
+                        platform_source=parsed.get("platform_source"),
+                    )
+                    session.add(global_server)
+                else:
+                    if parsed.get("platform_source") == "battlelog_url":
+                        global_server.platform = parsed["platform"]
+                        global_server.battlelog_url = parsed.get("battlelog_url")
+                        global_server.platform_source = "battlelog_url"
+                gs = session.get(GuildServer, (interaction.guild.id, guid))
+                if gs is None:
+                    session.add(GuildServer(
+                        guild_id=interaction.guild.id,
+                        server_guid=guid,
+                        display_name=parsed["name"],
+                        is_default=make_default,
+                    ))
+                    added.append(parsed["name"])
+                    if make_default:
+                        activated.append((guid, parsed["name"]))
+                else:
+                    updated.append(gs.display_name)
+                    if make_default and not gs.is_default:
+                        gs.is_default = True
+                        activated.append((guid, gs.display_name))
+        for guid, display_name in activated:
+            try:
+                snapshot = FRESH_SERVER_CACHE.get(guid) or await asyncio.to_thread(get_keeper_snapshot, guid)
+                await post_automatic_announcement(
+                    interaction.guild.id,
+                    GuildServer(
+                        guild_id=interaction.guild.id,
+                        server_guid=guid,
+                        display_name=display_name,
+                        is_default=True,
+                    ),
+                    get_server_status(snapshot),
+                    map_change=False,
                 )
-            continue
+            except Exception as exc:
+                log.warning(
+                    "Immediate default announcement failed guild=%s server=%s error=%s message=%r",
+                    interaction.guild.id, guid, type(exc).__name__, str(exc)
+                )
 
-        name = parsed["name"]
-        key = unique_server_key(name)
-        record = {
-            "name": name,
-            "guid": guid,
-            "platform": parsed["platform"],
-            "platform_source": parsed["platform_source"],
-        }
-        if parsed.get("battlelog_url"):
-            record["battlelog_url"] = parsed["battlelog_url"]
-
-        SERVERS["servers"][key] = record
-        changed = True
-
-        if make_default:
-            SERVERS["default_servers"].append(key)
-            activated_keys.append(key)
-
-        results.append(
-            f"✅ Added **{name}** ({parsed['platform']}) — `{guid}`"
-            + (" and added to defaults." if make_default else ".")
-        )
-
-    if changed:
-        save_servers()
-
-    # New defaults are announced immediately. A failed announcement does not
-    # roll back the saved default state.
-    for key in activated_keys:
-        record = SERVERS["servers"].get(key, {})
-        try:
-            await activate_default_server(key)
-            results.append(
-                f"📣 Posted current status for "
-                f"**{record.get('name', key)}**."
-            )
-        except Exception as error:
-            results.append(
-                f"⚠️ **{record.get('name', key)}** is a default, but its "
-                f"immediate status announcement failed: "
-                f"`{type(error).__name__}`"
-            )
-
-    response_text = "\n".join(results)
-    for chunk in split_discord_message(response_text):
-        await interaction.followup.send(chunk)
-
-    for listing_chunk in split_discord_message(
-        current_server_list_text(),
-        limit=1750,
-    ):
-        await interaction.followup.send(
-            "Current servers:\n```text\n"
-            + listing_chunk
-            + "\n```"
-        )
+        lines = [f"✅ Added: {', '.join(added)}" if added else "Added: none"]
+        if updated:
+            lines.append("Existing/updated: " + ", ".join(updated))
+        if failed:
+            lines.append("⚠️ Could not parse: " + ", ".join(failed))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="addserver", command_type="slash", success=not failed, started=started, result_code="ok" if not failed else "partial", metadata={"requested": len(refs), "added": len(added), "updated": len(updated), "failed": len(failed), "make_default": make_default})
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ Add server failed: `{type(exc).__name__}`", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="addserver", command_type="slash", success=False, started=started, result_code="failed", error=exc)
 
 
-@tree.command(name="delserver", description="Delete a configured non-default BF4 server")
-@discord.app_commands.describe(server="Choose a configured server to delete")
-async def slash_delserver(
-    interaction: discord.Interaction,
-    server: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@tree.command(name="delserver", description="Delete a configured non-default server")
+async def delserver(interaction: discord.Interaction, server: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    record = SERVERS.get("servers", {}).get(server)
-    if not isinstance(record, dict):
-        await interaction.followup.send(
-            "⚠️ That server is not currently configured. "
-            "Choose one from the autocomplete list."
-        )
-        return
-
-    if server in set(get_default_server_keys()):
-        await interaction.followup.send(
-            f"⛔ **{record.get('name', server)}** is currently a default server. "
-            "Remove it with `/defaultserver remove` before deleting it."
-        )
-        return
-
-    name = str(record.get("name", server))
-    guid = str(record.get("guid", ""))
-    del SERVERS["servers"][server]
-    save_servers()
-
-    await interaction.followup.send(
-        f"✅ Removed **{name}** — `{guid}` from `servers.json`.\n"
-        "Current servers:\n```text\n"
-        + current_server_list_text(include_guids=True)
-        + "\n```"
-    )
-
-
-@slash_delserver.autocomplete("server")
-async def autocomplete_delserver(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "all")
-
-
-@tree.command(name="renameserver", description="Rename a configured BF4 server")
-@discord.app_commands.describe(
-    server="Choose a configured server",
-    new_name="New display name for the server",
-)
-async def slash_renameserver(
-    interaction: discord.Interaction,
-    server: str,
-    new_name: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-
-    record = SERVERS.get("servers", {}).get(server)
-    if not isinstance(record, dict):
-        await interaction.followup.send(
-            "⚠️ That server is not currently configured. "
-            "Choose one from the autocomplete list."
-        )
-        return
-
-    cleaned_name = re.sub(r"\s+", " ", str(new_name)).strip()
-    if not cleaned_name:
-        await interaction.followup.send("⚠️ The new server name cannot be empty.")
-        return
-    if len(cleaned_name) > 100:
-        await interaction.followup.send(
-            "⚠️ Keep the server name to **100 characters or fewer**."
-        )
-        return
-
-    old_name = str(record.get("name", server))
-    record["name"] = cleaned_name
-    save_servers()
-
-    await interaction.followup.send(
-        f"✅ Renamed **{old_name}** to **{cleaned_name}**.\n"
-        "Current servers:\n```text\n"
-        + current_server_list_text(include_guids=True)
-        + "\n```"
-    )
-
-
-@slash_renameserver.autocomplete("server")
-async def autocomplete_renameserver(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "all")
-
-
-
-def default_server_choices(current, mode):
-    current_text = str(current or "").strip().lower()
-    default_keys = set(get_default_server_keys())
-    choices = []
-
-    for key, record in sorted_server_items():
-        if mode == "add" and key in default_keys:
-            continue
-        if mode == "remove" and key not in default_keys:
-            continue
-
-        name = str(record.get("name", key))
-        platform = normalize_platform_label(record.get("platform", "Unknown"))
-        label = f"({platform}) {name}"
-        haystack = f"{key} {name} {platform}".lower()
-        if current_text and current_text not in haystack:
-            continue
-
-        choices.append(
-            discord.app_commands.Choice(
-                name=label[:100],
-                value=key,
-            )
-        )
-        if len(choices) >= 25:
-            break
-
-    return choices
-
-
-
-
-defaultserver_group = discord.app_commands.Group(
-    name="defaultserver",
-    description="Manage automatically monitored default BF4 servers",
-)
-
-
-def format_default_servers_block():
-    return "```text\n" + current_default_server_text() + "\n```"
-
-
-@defaultserver_group.command(name="add", description="Add a configured server to the default list")
-@discord.app_commands.describe(server="Choose a configured non-default server")
-async def slash_defaultserver_add(
-    interaction: discord.Interaction,
-    server: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-
-    if server not in SERVERS.get("servers", {}):
-        await interaction.followup.send(
-            "⚠️ That server is not currently configured. "
-            "Choose one from the autocomplete list."
-        )
-        return
-
-    defaults = SERVERS["default_servers"]
-    if server in defaults:
-        await interaction.followup.send(
-            "ℹ️ That server is already a default.\n"
-            + format_default_servers_block()
-        )
-        return
-
-    defaults.append(server)
-    save_servers()
-    record = SERVERS["servers"][server]
-
-    announcement_note = ""
     try:
-        await activate_default_server(server)
-        announcement_note = "\n📣 Current status was posted immediately."
-    except Exception as error:
-        announcement_note = (
-            "\n⚠️ The server was added as a default, but the immediate "
-            f"status announcement failed: `{type(error).__name__}`"
-        )
-
-    await interaction.followup.send(
-        f"✅ Added **{record.get('name', server)}** to the default servers."
-        + announcement_note
-        + "\n**Default servers:**\n"
-        + format_default_servers_block()
-    )
-
-
-@slash_defaultserver_add.autocomplete("server")
-async def autocomplete_defaultserver_add(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "add")
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            if gs.is_default:
+                await interaction.followup.send("⛔ Remove this server from defaults first.", ephemeral=True)
+                audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=False, started=started, result_code="server_is_default", target_type="server", target_id=server, target_name=gs.display_name)
+                return
+            name = gs.display_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            if state:
+                session.delete(state)
+            session.delete(gs)
+        await interaction.followup.send(f"✅ Removed **{name}** from this guild.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=True, started=started, result_code="removed", target_type="server", target_id=server, target_name=name)
+    except Exception as exc:
+        await interaction.followup.send("⚠️ Server removal failed.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
 
 
-@defaultserver_group.command(name="remove", description="Remove a server from the default list")
-@discord.app_commands.describe(server="Choose a currently configured default server")
-async def slash_defaultserver_remove(
-    interaction: discord.Interaction,
-    server: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@delserver.autocomplete("server")
+async def delserver_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+
+
+@tree.command(name="renameserver", description="Rename a configured server for this guild")
+async def renameserver(interaction: discord.Interaction, server: str, new_name: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    defaults = SERVERS["default_servers"]
-    if server not in defaults:
-        await interaction.followup.send(
-            "⚠️ That server is not currently a default. "
-            "Choose one from the autocomplete list."
-        )
-        return
-
-    record = SERVERS["servers"].get(server, {})
-    defaults.remove(server)
-    save_servers()
-
-    cleanup_note = ""
     try:
-        await deactivate_default_server(server, record)
-        cleanup_note = "\n🧹 Its current automatic announcement was removed."
-    except Exception as error:
-        LAST_MAPS.pop(server, None)
-        LAST_DEFAULT_STATUSES.pop(server, None)
-        cleanup_note = (
-            "\n⚠️ The server was removed from defaults, but announcement "
-            f"cleanup failed: `{type(error).__name__}`"
-        )
-
-    await interaction.followup.send(
-        f"✅ Removed **{record.get('name', server)}** from the default servers."
-        + cleanup_note
-        + "\n**Default servers:**\n"
-        + format_default_servers_block()
-    )
+        cleaned = re.sub(r"\s+", " ", new_name).strip()
+        if not cleaned:
+            raise ValueError("empty_name")
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            old = gs.display_name
+            gs.display_name = cleaned[:255]
+        await interaction.followup.send(f"✅ Renamed **{old}** to **{cleaned}**.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=True, started=started, result_code="renamed", target_type="server", target_id=server, target_name=cleaned)
+    except Exception as exc:
+        await interaction.followup.send("⚠️ Rename failed.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
 
 
-@slash_defaultserver_remove.autocomplete("server")
-async def autocomplete_defaultserver_remove(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-    return default_server_choices(current, "remove")
+@renameserver.autocomplete("server")
+async def renameserver_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
 
 
-@defaultserver_group.command(name="list", description="List the current default servers")
-async def slash_defaultserver_list(interaction: discord.Interaction):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@tree.command(name="setannouncementchannel", description="Set this guild's announcement channel")
+async def setannouncementchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-    await interaction.followup.send(
-        "**Default servers:**\n" + format_default_servers_block()
-    )
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, interaction.guild.id)
+        settings.announcement_channel_id = channel.id
+    await interaction.followup.send(f"✅ Announcement channel set to **#{channel.name}**.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setannouncementchannel", command_type="slash", success=True, started=started, result_code="updated", target_type="channel", target_id=channel.id, target_name=channel.name)
 
 
-tree.add_command(defaultserver_group)
-
-
-@tree.command(name="setannouncementchannel", description="Set the automatic announcement channel")
-async def slash_setannouncementchannel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-):
-    await run_legacy_management_backend(
-        interaction,
-        f"!setannouncementchannel <#{channel.id}>",
-    )
-
-
-@tree.command(name="addlistenchannel", description="Add one or more regular-user command channels")
-@discord.app_commands.describe(
-    channels="Channel mentions, IDs, or exact names separated by spaces; quote names containing spaces"
-)
-async def slash_addlistenchannel(interaction: discord.Interaction, channels: str):
-    await run_legacy_management_backend(interaction, f"!addlistenchannel {channels}")
-
-
-@tree.command(name="dellistenchannel", description="Remove one or more listen channels immediately")
-@discord.app_commands.describe(
-    channels="Channel mentions, IDs, or exact names separated by spaces; quote names containing spaces"
-)
-async def slash_dellistenchannel(
-    interaction: discord.Interaction,
-    channels: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@tree.command(name="addlistenchannel", description="Add one or more listen channels")
+async def addlistenchannel(interaction: discord.Interaction, channels: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    resolved, ambiguous, missing = parse_channel_arguments(
-        interaction.guild,
-        channels,
-    )
-    configured_ids = listen_channel_ids()
-    removable = [
-        channel
-        for channel in resolved
-        if channel.id in configured_ids
-    ]
-    not_configured = [
-        channel
-        for channel in resolved
-        if channel.id not in configured_ids
-    ]
-
-    report = []
-    if removable:
-        remove_ids = {channel.id for channel in removable}
-        remaining = [
-            int(value)
-            for value in CONFIG.get("listen_channel_id", [0])
-            if int(value) != 0 and int(value) not in remove_ids
-        ]
-        CONFIG["listen_channel_id"] = remaining or [0]
-        save_config()
-        report.append(
-            "✅ Removed listen channels:\n"
-            + "\n".join(
-                f"#{channel.name} (`{channel.id}`)"
-                for channel in removable
-            )
-        )
-
-    if not_configured:
-        report.append(
-            "Not currently configured:\n"
-            + "\n".join(
-                f"#{channel.name} (`{channel.id}`)"
-                for channel in not_configured
-            )
-        )
-
-    for token, matches in ambiguous:
-        report.append(
-            f"⚠️ Multiple channels matched **{token}**:\n"
-            + "\n".join(
-                f"#{channel.name} — `{channel.id}`"
-                for channel in matches
-            )
-        )
-
-    if missing:
-        report.append("⚠️ Could not resolve:\n" + "\n".join(missing))
-
-    if not report:
-        report.append("⚠️ No configured listen channels were selected.")
-
-    report.append(
-        "Current listen channels:\n"
-        + current_listen_channel_text(interaction.guild)
-    )
-    await interaction.followup.send("\n".join(report))
+    resolved = resolve_channel_arguments(interaction.guild, channels)
+    added = 0
+    with SessionLocal.begin() as session:
+        for channel in resolved:
+            if session.get(GuildListenChannel, (interaction.guild.id, channel.id)) is None:
+                session.add(GuildListenChannel(guild_id=interaction.guild.id, channel_id=channel.id))
+                added += 1
+    await interaction.followup.send(f"✅ Added **{added}** listen channel(s).", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="addlistenchannel", command_type="slash", success=True, started=started, result_code="updated", metadata={"resolved": len(resolved), "added": added})
 
 
-
-@tree.command(name="setmanagementrole", description="Set the minimum ServerWatcher management role")
-@discord.app_commands.describe(
-    role="Management role; leave blank to restrict management to Discord Administrators/server owner"
-)
-async def slash_setmanagementrole(
-    interaction: discord.Interaction,
-    role: discord.Role | None = None,
-):
-    value = str(role.id) if role else "0"
-    await run_legacy_management_backend(interaction, f"!setmanagementrole {value}")
-
-
-@tree.command(name="setstatusrole", description="Set the minimum role for normal !status use")
-@discord.app_commands.describe(
-    role="Status role; leave blank to allow everyone in configured listen channels"
-)
-async def slash_setstatusrole(
-    interaction: discord.Interaction,
-    role: discord.Role | None = None,
-):
-    value = str(role.id) if role else "0"
-    await run_legacy_management_backend(interaction, f"!setstatusrole {value}")
-
-
-@tree.command(name="setinterval", description="Set BF4 polling interval in seconds")
-async def slash_setinterval(interaction: discord.Interaction, seconds: int):
-    await run_legacy_management_backend(interaction, f"!setinterval {seconds}")
-
-
-@tree.command(
-    name="setpresenceupdate",
-    description="Set Discord presence rotation interval in seconds",
-)
-@discord.app_commands.describe(
-    seconds="Requested interval in seconds; values are clamped to 10-60",
-)
-async def slash_setpresenceupdate(
-    interaction: discord.Interaction,
-    seconds: int,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@tree.command(name="dellistenchannel", description="Remove one or more listen channels")
+async def dellistenchannel(interaction: discord.Interaction, channels: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    requested = int(seconds)
-    effective = max(10, min(60, requested))
-    CONFIG["presence_update_seconds"] = effective
-    save_config()
-
-    if requested < 10:
-        await interaction.followup.send(
-            f"⚠️ **{requested} seconds** is below the minimum presence update interval.\n"
-            f"Presence update interval set to the minimum: **{effective} seconds**."
-        )
-    elif requested > 60:
-        await interaction.followup.send(
-            f"⚠️ **{requested} seconds** exceeds the maximum presence update interval.\n"
-            f"Presence update interval set to the maximum: **{effective} seconds**."
-        )
-    else:
-        await interaction.followup.send(
-            f"✅ Presence update interval set to **{effective} seconds**."
-        )
+    resolved = resolve_channel_arguments(interaction.guild, channels)
+    ids = [channel.id for channel in resolved]
+    removed = 0
+    if ids:
+        with SessionLocal.begin() as session:
+            result = session.execute(delete(GuildListenChannel).where(
+                GuildListenChannel.guild_id == interaction.guild.id,
+                GuildListenChannel.channel_id.in_(ids),
+            ))
+            removed = result.rowcount or 0
+    await interaction.followup.send(f"✅ Removed **{removed}** listen channel(s).", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="dellistenchannel", command_type="slash", success=True, started=started, result_code="updated", metadata={"resolved": len(resolved), "removed": removed})
 
 
-@tree.command(name="setmaprole", description="Set a map-specific role ping immediately")
-@discord.app_commands.describe(
-    map_search="Full or partial BF4 map name",
-    role="Discord role to ping; leave blank only when disable is true",
-    message="Optional custom map-live message",
-    disable="Disable the map ping by setting role ID to 0",
-)
-async def slash_setmaprole(
-    interaction: discord.Interaction,
-    map_search: str,
-    role: discord.Role | None = None,
-    message: str | None = None,
-    disable: bool = False,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
+@tree.command(name="setmanagementrole", description="Set this guild's management minimum role")
+async def setmanagementrole(interaction: discord.Interaction, role: discord.Role | None = None):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
+    role_id = role.id if role else 0
+    with SessionLocal.begin() as session:
+        session.get(GuildSettings, interaction.guild.id).management_min_role_id = role_id
+    await interaction.followup.send(f"✅ Management minimum role set to **{role.name if role else '0 (Administrators/server owner)'}**.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmanagementrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
-    if not disable and role is None:
-        await interaction.followup.send(
-            "⚠️ Select a role, or set `disable` to true."
-        )
+
+@tree.command(name="setstatusrole", description="Set minimum role for normal !status")
+async def setstatusrole(interaction: discord.Interaction, role: discord.Role | None = None):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
+    role_id = role.id if role else 0
+    with SessionLocal.begin() as session:
+        session.get(GuildSettings, interaction.guild.id).status_min_role_id = role_id
+    await interaction.followup.send(f"✅ Status role set to **{role.name if role else '0 (everyone in listen channels)'}**.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setstatusrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
-    matches = map_name_matches(map_search)
-    if not matches:
-        await interaction.followup.send(
-            f"⚠️ No map in `maps.json` matched **{map_search}**. "
-            "Try a more recognizable part of the map name."
-        )
+
+@tree.command(name="setmaprole", description="Create or replace a map-specific role ping")
+async def setmaprole(interaction: discord.Interaction, map_search: str, role: discord.Role | None = None, message: str | None = None, disable: bool = False):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-    if len(matches) > 1:
-        await interaction.followup.send(
-            f"⚠️ Multiple maps matched **{map_search}**:\n"
-            + "\n".join(matches)
-            + "\nPlease use a more specific map search."
-        )
+    matches = map_matches(map_search)
+    if len(matches) != 1:
+        await interaction.followup.send("⚠️ Map search must resolve to exactly one BF4 map.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmaprole", command_type="slash", success=False, started=started, result_code="map_ambiguous")
         return
-
-    map_name = matches[0]
-    role_id = 0 if disable else role.id
-    entry = {"role_id": role_id}
-    if message:
-        entry["message"] = message
-
-    CONFIG["map_role_pings"][map_name] = entry
-    save_config()
-
-    role_text = (
-        "Disabled (0)"
-        if role_id == 0
-        else format_role_setting(interaction.guild, role_id)
-    )
-    message_text = message or f"{map_name} is now live!"
-    await interaction.followup.send(
-        f"✅ Map role ping updated for **{map_name}**.\n"
-        f"Role: **{role_text}**\n"
-        f"Message: **{message_text}**"
-        + ("" if message else " *(default)*")
-        + "\nCurrent map role pings:\n"
-        + current_map_role_list_text(interaction.guild)
-    )
-
-
-async def validate_modal_management_interaction(
-    interaction: discord.Interaction,
-):
-    """Validate a management interaction without deferring, so a modal can open."""
-    if (
-        interaction.guild is None
-        or not isinstance(interaction.user, discord.Member)
-    ):
-        await interaction.response.send_message(
-            "⛔ Management commands can only be used inside a Discord server.",
-            ephemeral=True,
-        )
-        return False
-
-    if not can_manage(interaction.user):
-        await interaction.response.send_message(
-            "⛔ You do not have permission to use that management command.",
-            ephemeral=True,
-        )
-        return False
-
-    announcement_id = int(
-        CONFIG.get("announcement_channel_id", 0)
-    )
-    allowed_ids = listen_channel_ids()
-    if announcement_id:
-        allowed_ids.add(announcement_id)
-
-    if interaction.channel_id not in allowed_ids:
-        await interaction.response.send_message(
-            "⛔ Management commands may only be used in the configured "
-            "announcement channel or a configured listen channel.",
-            ephemeral=True,
-        )
-        return False
-
-    return True
+    map_row = matches[0]
+    role_id = 0 if disable else (role.id if role else 0)
+    text = message or f"{map_row.map_name} is now live!"
+    with SessionLocal.begin() as session:
+        ping = session.get(GuildMapRolePing, (interaction.guild.id, map_row.map_key))
+        if ping is None:
+            session.add(GuildMapRolePing(guild_id=interaction.guild.id, map_key=map_row.map_key, role_id=role_id, message=text))
+        else:
+            ping.role_id, ping.message = role_id, text
+    await interaction.followup.send(f"✅ Map role updated for **{map_row.map_name}**.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmaprole", command_type="slash", success=True, started=started, result_code="updated", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
 
 
 class EditMapRoleModal(discord.ui.Modal):
-    def __init__(
-        self,
-        map_name: str,
-        guild: discord.Guild,
-        replacement_role_id: int | None,
-    ):
-        self.map_name = map_name
-        self.guild = guild
-        self.replacement_role_id = replacement_role_id
-
-        entry = CONFIG.get("map_role_pings", {}).get(
-            map_name,
-            {},
-        )
-        current_message = str(
-            entry.get("message")
-            or f"{map_name} is now live!"
-        )
-
-        super().__init__(
-            title=f"Edit map role — {map_name}"[:45]
-        )
-
-        self.message_input = discord.ui.TextInput(
-            label="Map ping message",
-            style=discord.TextStyle.paragraph,
-            default=current_message[:4000],
-            required=True,
-            min_length=1,
-            max_length=4000,
-        )
+    def __init__(self, guild_id, map_key, map_name, role_id, current_message):
+        super().__init__(title=f"Edit map role — {map_name}"[:45])
+        self.guild_id, self.map_key, self.map_name, self.role_id = guild_id, map_key, map_name, role_id
+        self.message_input = discord.ui.TextInput(label="Map ping message", style=discord.TextStyle.paragraph, default=current_message[:4000], max_length=4000)
         self.add_item(self.message_input)
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction,
-    ):
-        entry = CONFIG.get("map_role_pings", {}).get(
-            self.map_name
-        )
-        if not isinstance(entry, dict):
-            await interaction.response.send_message(
-                f"⚠️ The map role for **{self.map_name}** no longer exists.",
-                ephemeral=True,
+    async def on_submit(self, interaction):
+        started = time.perf_counter()
+        try:
+            with SessionLocal.begin() as session:
+                ping = session.get(GuildMapRolePing, (self.guild_id, self.map_key))
+                if ping is None:
+                    await interaction.response.send_message("⚠️ Map role no longer exists.", ephemeral=True)
+                    audit_command(
+                        guild=interaction.guild,
+                        channel=interaction.channel,
+                        user=interaction.user,
+                        command_name="editmaprole.submit",
+                        command_type="modal",
+                        success=False,
+                        started=started,
+                        result_code="map_missing",
+                        target_type="map",
+                        target_id=self.map_key,
+                        target_name=self.map_name,
+                    )
+                    return
+                if self.role_id is not None:
+                    ping.role_id = self.role_id
+                ping.message = str(self.message_input.value).strip()
+            await interaction.response.send_message(f"✅ Updated map role ping for **{self.map_name}**.", ephemeral=True)
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="editmaprole.submit",
+                command_type="modal",
+                success=True,
+                started=started,
+                result_code="updated",
+                target_type="map",
+                target_id=self.map_key,
+                target_name=self.map_name,
             )
+        except Exception as exc:
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="editmaprole.submit",
+                command_type="modal",
+                success=False,
+                started=started,
+                result_code="failed",
+                error=exc,
+                target_type="map",
+                target_id=self.map_key,
+                target_name=self.map_name,
+            )
+            raise
+
+
+@tree.command(name="editmaprole", description="Edit an existing map-role ping")
+async def editmaprole(interaction: discord.Interaction, map_name: str, role: discord.Role | None = None):
+    started = time.perf_counter()
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not can_manage(interaction.user) or not management_channel_allowed(interaction):
+        await interaction.response.send_message("⛔ You cannot use that command here.", ephemeral=True)
+        return
+    matches = configured_map_matches(interaction.guild.id, map_name)
+    if len(matches) != 1:
+        await interaction.response.send_message("⚠️ Choose one configured map.", ephemeral=True)
+        return
+    ping, map_row = matches[0]
+    await interaction.response.send_modal(EditMapRoleModal(interaction.guild.id, map_row.map_key, map_row.map_name, role.id if role else None, ping.message))
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="editmaprole", command_type="slash", success=True, started=started, result_code="modal_opened", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
+
+
+@editmaprole.autocomplete("map_name")
+async def editmaprole_autocomplete(interaction, current):
+    if not interaction.guild:
+        return []
+    rows = configured_map_matches(interaction.guild.id, current or "")
+    return [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
+
+
+@tree.command(name="delmaprole", description="Delete a configured map-role ping")
+async def delmaprole(interaction: discord.Interaction, map_search: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    matches = configured_map_matches(interaction.guild.id, map_search)
+    if len(matches) != 1:
+        await interaction.followup.send("⚠️ Map search must resolve to one configured map.", ephemeral=True)
+        return
+    ping, map_row = matches[0]
+    with SessionLocal.begin() as session:
+        session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == interaction.guild.id, GuildMapRolePing.map_key == map_row.map_key))
+    await interaction.followup.send(f"✅ Removed map role ping for **{map_row.map_name}**.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delmaprole", command_type="slash", success=True, started=started, result_code="removed", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
+
+
+@tree.command(name="debug", description="Show Keeper diagnostics for a configured server")
+async def debug(interaction: discord.Interaction, server: str | None = None):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    if server is None:
+        defaults = get_default_guild_servers(interaction.guild.id)
+        if not defaults:
+            await interaction.followup.send("⚠️ No default server(s) set.", ephemeral=True)
             return
-
-        if self.replacement_role_id is not None:
-            entry["role_id"] = self.replacement_role_id
-
-        entry["message"] = str(self.message_input.value).strip()
-        save_config()
-
-        role_text = (
-            "Disabled (0)"
-            if int(entry.get("role_id", 0) or 0) == 0
-            else format_role_setting(
-                self.guild,
-                entry.get("role_id", 0),
-            )
-        )
-
-        await interaction.response.send_message(
-            f"✅ Updated map role ping for **{self.map_name}**.\n"
-            f"Role: **{role_text}**\n"
-            f'Message: **"{entry["message"]}"**\n'
-            "Current map role pings:\n"
-            + current_map_role_list_text(self.guild),
-            ephemeral=True,
-        )
+        server = defaults[0][0].server_guid
+    try:
+        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
+        with SessionLocal() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+        await interaction.followup.send(f"Debug server: **{gs.display_name if gs else server}**\n{build_debug_report(snapshot)}", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server)
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ Debug failed: `{type(exc).__name__}`", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
 
 
-@tree.command(
-    name="editmaprole",
-    description="Edit an existing map-role ping",
-)
-@discord.app_commands.describe(
-    map_name="Choose an existing configured map role",
-    role="Optional replacement role; leave blank to keep the current role",
-)
-async def slash_editmaprole(
-    interaction: discord.Interaction,
-    map_name: str,
-    role: discord.Role | None = None,
-):
-    if not await validate_modal_management_interaction(
-        interaction
-    ):
+@debug.autocomplete("server")
+async def debug_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+
+
+@tree.command(name="announce", description="Temporarily announce all default servers")
+async def announce(interaction: discord.Interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
         return
-
-    matches = configured_map_role_matches(map_name)
-    if not matches:
-        await interaction.response.send_message(
-            f"⚠️ No configured map role ping matched **{map_name}**.",
-            ephemeral=True,
-        )
+    defaults = get_default_guild_servers(interaction.guild.id)
+    settings = get_settings(interaction.guild.id)
+    channel = interaction.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
+    if not channel:
+        await interaction.followup.send("⚠️ Announcement channel is not configured.", ephemeral=True)
         return
-    if len(matches) > 1:
-        await interaction.response.send_message(
-            f"⚠️ Multiple configured maps matched **{map_name}**:\n"
-            + "\n".join(matches)
-            + "\nChoose one from the autocomplete list.",
-            ephemeral=True,
-        )
-        return
-
-    resolved_map = matches[0]
-    await interaction.response.send_modal(
-        EditMapRoleModal(
-            resolved_map,
-            interaction.guild,
-            role.id if role is not None else None,
-        )
-    )
+    sent = 0
+    for gs, bf in defaults:
+        try:
+            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+            msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
+            asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
+            sent += 1
+        except Exception as exc:
+            log.warning("Manual announce failed guild=%s server=%s error=%s", interaction.guild.id, bf.server_guid, type(exc).__name__)
+    await interaction.followup.send(f"✅ Posted **{sent}** temporary announcement(s).", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="announce", command_type="slash", success=True, started=started, result_code="posted", metadata={"sent": sent})
 
 
-@slash_editmaprole.autocomplete("map_name")
-async def autocomplete_editmaprole(
-    interaction: discord.Interaction,
-    current: str,
-):
-    if not isinstance(interaction.user, discord.Member):
-        return []
-    if not can_manage(interaction.user):
-        return []
-
-    current_text = str(current or "").strip().casefold()
-    choices = []
-    for map_name in sorted(
-        name
-        for name, entry
-        in CONFIG.get("map_role_pings", {}).items()
-        if isinstance(entry, dict)
-    ):
-        if (
-            current_text
-            and current_text not in map_name.casefold()
-        ):
-            continue
-        choices.append(
-            discord.app_commands.Choice(
-                name=map_name[:100],
-                value=map_name,
-            )
-        )
-        if len(choices) >= 25:
-            break
-    return choices
-
-
-@tree.command(name="delmaprole", description="Delete a configured map role ping immediately")
-@discord.app_commands.describe(map_search="Full or partial configured map name")
-async def slash_delmaprole(
-    interaction: discord.Interaction,
-    map_search: str,
-):
-    proxy = await prepare_management_interaction(interaction)
-    if proxy is None:
-        return
-
-    matches = configured_map_role_matches(map_search)
-    if not matches:
-        await interaction.followup.send(
-            f"⚠️ No configured map role ping matched **{map_search}**."
-        )
-        return
-    if len(matches) > 1:
-        await interaction.followup.send(
-            f"⚠️ Multiple configured maps matched **{map_search}**:\n"
-            + "\n".join(matches)
-            + "\nPlease use a more specific map search."
-        )
-        return
-
-    map_name = matches[0]
-    CONFIG["map_role_pings"].pop(map_name, None)
-    save_config()
-    await interaction.followup.send(
-        f"✅ Removed map role ping for **{map_name}**.\n"
-        "Current map role pings:\n"
-        + current_map_role_list_text(interaction.guild)
-    )
+def help_messages(member: discord.Member):
+    basic = "\n".join([
+        f"🤖 **BF4 Server Watcher Help — {BOT_VERSION}**",
+        "",
+        "**User commands**",
+        "`!help` — show this help message.",
+        "`!list` — list configured server names for this Discord server.",
+        "`!status [server-name]` — show default server(s), or one configured server.",
+        "`!status <server-name> players` — show a team player roster.",
+        "`!version` — show installed/latest version.",
+    ])
+    if not can_manage(member):
+        return [basic]
+    settings = get_settings(member.guild.id)
+    mgmt = "\n".join([
+        "**Management slash commands**",
+        "`/status all` — show status for all servers configured for this guild.",
+        "`/status server` — one server, optionally with player details.",
+        "`/announce` or `!announce` — temporary default-server announcements.",
+        "`/debug` — Keeper diagnostics.",
+        "`/addserver`, `/delserver`, `/renameserver` — manage this guild's servers.",
+        "`/defaultserver add|remove|list` — manage this guild's defaults.",
+        "`/setannouncementchannel` — set announcement channel.",
+        "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
+        "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",
+        "`/setmaprole`, `/editmaprole`, `/delmaprole` — manage map role pings.",
+        "",
+        f"Global polling interval: **{CHECK_INTERVAL_SECONDS} seconds** (.env)",
+        f"Global presence interval: **{PRESENCE_UPDATE_SECONDS} seconds** (.env)",
+    ])
+    config = "\n\n".join([
+        "**Current guild configuration**",
+        f"**Servers:**\n```text\n{platform_server_list(member.guild.id, include_guid=True)}\n```",
+        f"**Announcement channel:** {settings.announcement_channel_id}",
+        "**Listen channels:** " + (", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id))) or "None"),
+        f"**Management minimum role:** {settings.management_min_role_id}",
+        f"**Status minimum role:** {settings.status_min_role_id}",
+        f"**Map role pings:**\n{map_roles_text(member.guild)}",
+    ])
+    return [basic, mgmt, config]
 
 
 @client.event
-async def on_message(message):
-    if message.author.bot:
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None or not isinstance(message.author, discord.Member):
         return
-
     raw = message.content.strip()
-    command = raw.lower()
-
+    command = raw.split(maxsplit=1)[0].lower() if raw else ""
+    if command not in {"!help", "!list", "!status", "!version", "!announce"}:
+        return
+    started = time.perf_counter()
     try:
-        if not command.startswith("!"):
-            return
-
-        if not command_channel_allowed(message):
+        if command == "!version":
+            if message.channel.id not in listen_channel_ids(message.guild.id) and not (can_manage(message.author) and management_channel_allowed(message)):
+                return
+            await asyncio.to_thread(refresh_latest_version)
+            await message.channel.send(version_text())
+            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="version", command_type="prefix", success=True, started=started, result_code="ok")
             return
 
         if command == "!help":
-            try:
-                for help_message in build_help_messages(message.author):
-                    for chunk in split_discord_message(help_message):
-                        await message.channel.send(chunk)
-            except Exception as error:
-                print(f"HELP ERROR: {type(error).__name__}: {error}", flush=True)
-                await message.channel.send(
-                    f"⚠️ Help rendering failed: `{type(error).__name__}`. "
-                    "Check container logs for details."
-                )
+            if message.channel.id not in listen_channel_ids(message.guild.id) and not (can_manage(message.author) and management_channel_allowed(message)):
+                return
+            for chunk in help_messages(message.author):
+                await message.channel.send(chunk)
+            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="help", command_type="prefix", success=True, started=started, result_code="ok")
+            return
+
+        if command == "!list":
+            if message.channel.id not in listen_channel_ids(message.guild.id):
+                return
+            await message.channel.send(f"```text\n{platform_server_list(message.guild.id)}\n```")
+            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="list", command_type="prefix", success=True, started=started, result_code="ok")
             return
 
         if command == "!announce":
-            if not await require_management(message, "!announce"):
+            if not can_manage(message.author) or not management_channel_allowed(message):
                 return
-
-            announcement_id = int(CONFIG.get("announcement_channel_id", 0))
-            channel = client.get_channel(announcement_id)
-            if channel is None:
-                await message.channel.send(
-                    "⚠️ Configured announcement channel could not be found."
-                )
+            settings = get_settings(message.guild.id)
+            channel = message.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
+            if not channel:
+                await message.channel.send("⚠️ Announcement channel is not configured.")
                 return
-
-            defaults = sorted_default_server_records()
-            if not defaults:
-                await message.channel.send("⚠️ No default server(s) set.")
-                return
-
             sent = 0
-            failures = []
-            for key, record in defaults:
-                server_name = str(record.get("name", key))
-                try:
-                    await post_server_announcement(
-                        channel,
-                        key,
-                        record,
-                        manual=True,
-                        seed_cache=False,
-                    )
-                    sent += 1
-                except Exception as error:
-                    failures.append(
-                        f"{server_name}: {type(error).__name__}"
-                    )
-
-            summary = (
-                f"✅ Posted **{sent}** temporary announcement(s). "
-                "They will automatically delete after **10 minutes**."
-            )
-            if failures:
-                summary += "\n⚠️ Failed:\n" + "\n".join(failures)
-            await message.channel.send(summary)
+            for gs, bf in get_default_guild_servers(message.guild.id):
+                snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
+                asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
+                sent += 1
+            await message.channel.send(f"✅ Posted **{sent}** temporary announcement(s).")
+            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="announce", command_type="prefix", success=True, started=started, result_code="posted", metadata={"sent": sent})
             return
 
-
-        if command == "!list":
-            listing = current_server_list_text(include_guids=False)
-            await message.channel.send(
-                "Configured servers:\n```text\n" + listing + "\n```"
-            )
-            return
-
-
-        if command == "!status" or command.startswith("!status "):
+        if command == "!status":
+            if not can_use_status(message):
+                return
             payload = raw[len("!status"):].strip()
-            players_requested = False
+            players = bool(re.search(r"\s+players$", payload, flags=re.I))
+            selector = re.sub(r"\s+players$", "", payload, flags=re.I).strip() if players else payload
+            pending_key = (message.guild.id, message.author.id)
 
-            if payload.lower() == "players":
-                players_requested = True
-                selector = ""
-            elif re.search(r"\s+players$", payload, flags=re.IGNORECASE):
-                players_requested = True
-                selector = re.sub(
-                    r"\s+players$",
-                    "",
-                    payload,
-                    flags=re.IGNORECASE,
-                ).strip()
-            else:
-                selector = payload
-
-            if selector.lower() == "all":
-                if players_requested:
+            if selector.isdigit() and pending_key in PENDING_STATUS_SELECTIONS:
+                pending = PENDING_STATUS_SELECTIONS[pending_key]
+                choice = int(selector)
+                guids = pending.get("guids", [])
+                if choice < 1 or choice > len(guids):
                     await message.channel.send(
-                        "⚠️ The `players` option requires one saved server. "
-                        "Use `!status <server-name> players`."
-                    )
-                elif can_manage(message.author):
-                    await message.channel.send(
-                        "ℹ️ Use `/status all` for the management all-server status command."
-                    )
-                else:
-                    await message.channel.send(
-                        "⚠️ Server **all** was not found. "
-                        "Use `!list` to see configured servers."
-                    )
-                return
-
-            if not can_use_status_commands(message):
-                await message.channel.send(
-                    "⛔ You do not have the required role to use that command."
-                )
-                return
-
-            # Numbered selections preserve whether the original ambiguous
-            # request asked for the team player roster.
-            if (
-                selector.isdigit()
-                and message.author.id in PENDING_STATUS_SELECTIONS
-            ):
-                pending = PENDING_STATUS_SELECTIONS[message.author.id]
-                if isinstance(pending, dict):
-                    choices = pending.get("keys", [])
-                    players_requested = (
-                        players_requested
-                        or bool(pending.get("players"))
-                    )
-                else:
-                    # Compatibility with any in-memory pre-v1.3.4 selection.
-                    choices = pending
-
-                selection = int(selector)
-                if selection < 1 or selection > len(choices):
-                    await message.channel.send(
-                        f"⚠️ Choose a number from **1** to **{len(choices)}**."
+                        f"⚠️ Choose a number from **1** to **{len(guids)}**."
                     )
                     return
+                selector = guids[choice - 1]
+                players = bool(pending.get("players"))
+                PENDING_STATUS_SELECTIONS.pop(pending_key, None)
 
-                key = choices[selection - 1]
-                record = SERVERS["servers"][key]
-                PENDING_STATUS_SELECTIONS.pop(
-                    message.author.id,
-                    None,
-                )
-
-            elif selector:
-                matches = find_server_matches(selector)
+            if not selector:
+                defaults = get_default_guild_servers(message.guild.id)
+                if not defaults:
+                    await message.channel.send("No default server(s) set")
+                    return
+                for gs, bf in defaults:
+                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                    await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name} (default)", get_server_status(snapshot)))
+                audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="defaults", metadata={"count": len(defaults)})
+                return
+            matches = find_guild_server(message.guild.id, selector)
+            if len(matches) != 1:
                 if not matches:
-                    await message.channel.send(
-                        f"⚠️ Server **{selector}** was not found in `servers.json`.\n"
-                        "Use `!list` to see configured servers."
-                    )
-                    return
-
-                if len(matches) > 1:
-                    PENDING_STATUS_SELECTIONS[message.author.id] = {
-                        "keys": [key for key, _ in matches],
-                        "players": players_requested,
+                    await message.channel.send(f"⚠️ Server **{selector}** was not found.")
+                else:
+                    PENDING_STATUS_SELECTIONS[pending_key] = {
+                        "guids": [bf.server_guid for gs, bf in matches],
+                        "players": players,
                     }
-                    lines = [
-                        f"{index}. {record.get('name', key)}"
-                        for index, (key, record)
-                        in enumerate(matches, start=1)
-                    ]
                     suffix = (
                         "\nThe selected server will show its team player list."
-                        if players_requested
-                        else ""
+                        if players else ""
                     )
                     await message.channel.send(
-                        f"Multiple servers matched **{selector}**:\n"
-                        + "\n".join(lines)
+                        "Multiple servers matched:\n"
+                        + "\n".join(
+                            f"{i}. {gs.display_name}"
+                            for i, (gs, bf) in enumerate(matches, 1)
+                        )
                         + "\nReply with `!status <number>` to select one."
                         + suffix
                     )
-                    return
-
-                key, record = matches[0]
-
-            else:
-                if players_requested:
-                    await message.channel.send(
-                        "Usage: `!status <server-name> players`\n"
-                        "Use `!list` to see configured servers."
-                    )
-                    return
-
-                defaults = sorted_default_server_records()
-                if not defaults:
-                    await message.channel.send(
-                        "No default server(s) set"
-                    )
-                    return
-
-                for key, record in defaults:
-                    server_name = str(
-                        record.get("name", key)
-                    )
-                    server_guid = str(
-                        record.get("guid", "")
-                    ).strip()
-                    try:
-                        status = await asyncio.to_thread(
-                            get_server_status,
-                            None,
-                            server_guid,
-                        )
-                        await message.channel.send(
-                            build_message(
-                                f"BF4 Server Status — "
-                                f"{server_name} (default)",
-                                status,
-                            )
-                        )
-                    except Exception as error:
-                        await message.channel.send(
-                            f"⚠️ **{server_name} (default)** — "
-                            f"status lookup failed: "
-                            f"`{type(error).__name__}`"
-                        )
                 return
-
-            server_name = str(record.get("name", key))
-            server_guid = str(
-                record.get("guid", "")
-            ).strip()
-            marker = (
-                " (default)"
-                if key in set(get_default_server_keys())
-                else ""
-            )
-
-            if players_requested:
-                # Keeper remains the universal source for team/faction data.
-                # PC servers additionally use BFLIST when available to obtain
-                # verified scoreboard order and score-based numbering.
-                keeper_data = await asyncio.to_thread(
-                    get_server,
-                    server_guid,
-                )
-                platform = normalize_platform_label(
-                    record.get("platform", "Unknown")
-                )
-
+            gs, bf = matches[0]
+            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+            if players:
                 teams = None
-                if platform == "PC":
-                    bflist_server = await asyncio.to_thread(
-                        get_bflist_server_for_guid,
-                        server_guid,
-                        keeper_data,
-                    )
-                    if bflist_server is not None:
-                        teams = bflist_team_rosters(
-                            bflist_server,
-                            keeper_data,
-                        )
-                    else:
-                        print(
-                            f"BFLIST roster unavailable for {server_name}; "
-                            "using Keeper fallback.",
-                            flush=True,
-                        )
-
+                if normalize_platform_label(bf.platform) == "PC":
+                    bflist = await asyncio.to_thread(get_bflist_server_cached, bf.server_guid, snapshot)
+                    if bflist:
+                        rich = bflist_team_rosters(bflist, snapshot)
+                        teams = []
+                        for team in rich:
+                            teams.append({
+                                "team_id": team["team_id"],
+                                "faction": team["faction"],
+                                "names": [r["name"] for r in team["rows"]],
+                                "numbered": True,
+                            })
                 if not teams:
-                    teams = keeper_team_rosters(keeper_data)
+                    teams = keeper_team_rosters(snapshot)
+                for chunk in compact_roster_messages(teams, gs.display_name):
+                    await message.channel.send(chunk)
+            else:
+                marker = " (default)" if gs.is_default else ""
+                await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot)))
+            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="ok", target_type="server", target_id=bf.server_guid, target_name=gs.display_name, metadata={"players": players})
+    except Exception as exc:
+        log.error(
+            "Prefix command failed guild=%s channel=%s user=%s command=%s error=%s message=%r",
+            message.guild.id, message.channel.id, message.author.id, command, type(exc).__name__, str(exc)
+        )
+        audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name=command.lstrip("!"), command_type="prefix", success=False, started=started, result_code="failed", error=exc)
+        try:
+            await message.channel.send(f"⚠️ Command failed: `{type(exc).__name__}`")
+        except Exception:
+            pass
 
-                for roster_message in build_player_roster_messages(
-                    teams,
-                    server_name,
-                ):
-                    await message.channel.send(roster_message)
-                return
 
-            status = await asyncio.to_thread(
-                get_server_status,
-                None,
-                server_guid,
+@tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    log.error(
+        "Slash command error guild=%s channel=%s user=%s command=%s error=%s message=%r",
+        getattr(interaction.guild, "id", None),
+        getattr(interaction.channel, "id", None),
+        getattr(interaction.user, "id", None),
+        getattr(getattr(interaction, "command", None), "qualified_name", None),
+        type(error).__name__,
+        str(error),
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"⚠️ Command failed: `{type(error).__name__}`",
+                ephemeral=True,
             )
-            await message.channel.send(
-                build_message(
-                    f"BF4 Server Status — "
-                    f"{server_name}{marker}",
-                    status,
-                )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ Command failed: `{type(error).__name__}`",
+                ephemeral=True,
             )
-            return
+    except Exception:
+        pass
 
 
-        if command == "!version":
-            await refresh_version_info()
-            await message.channel.send(version_command_text())
-            return
+@client.event
+async def on_ready():
+    global watcher_started
+    log.info("READY bot=%s version=%s guilds=%s", client.user, BOT_VERSION, len(client.guilds))
+    if watcher_started:
+        return
+    watcher_started = True
 
-    except Exception as error:
-        print(f"COMMAND ERROR ({command}): {error}", flush=True)
-        await message.channel.send(f"⚠️ Command failed: `{type(error).__name__}`")
+    try:
+        for guild in client.guilds:
+            ensure_guild_record(guild)
+        log.info("Guild reconciliation complete guilds=%s", len(client.guilds))
+    except Exception as exc:
+        log.critical("Guild reconciliation failed error=%s message=%r", type(exc).__name__, str(exc))
+        return
+
+    if not run_legacy_import(list(client.guilds)):
+        log.critical("Legacy import blocked/failed; background watcher not started")
+        return
+
+    try:
+        synced = await tree.sync()
+        log.info("Slash commands synced count=%s names=%s", len(synced), ",".join(f"/{c.name}" for c in synced))
+    except Exception as exc:
+        log.error("Slash command sync failed error=%s message=%r", type(exc).__name__, str(exc))
+
+    asyncio.create_task(monitor_loop())
+    asyncio.create_task(version_loop())
+    asyncio.create_task(presence_loop())
+    asyncio.create_task(guild_cleanup_loop())
+    log.info(
+        "Background jobs started poll_seconds=%s presence_seconds=%s guild_cleanup='00:00 UTC'",
+        CHECK_INTERVAL_SECONDS, PRESENCE_UPDATE_SECONDS
+    )
 
 
-client.run(TOKEN)
+def main():
+    log.info("Startup version=%s runtime_dir=%s", BOT_VERSION, RUNTIME_DIR)
+    wait_for_database()
+    log.info("Database startup check complete")
+    client.run(TOKEN)
+
+
+if __name__ == "__main__":
+    main()

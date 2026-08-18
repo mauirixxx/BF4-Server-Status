@@ -1,10 +1,27 @@
-# BF4 Server Watcher v1.3.8
+# BF4 Server Watcher v2.0.0
 
-A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status in Discord.
+A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
+
+v2.0.0 is a major architecture release. Guild configuration and BF4 server relationships are stored in SQL instead of runtime JSON files. PostgreSQL is the primary database target; MySQL/MariaDB are also supported.
+
+## Major v2 changes
+
+- One bot instance can serve multiple Discord guilds independently.
+- PostgreSQL-backed multi-guild configuration and state through SQLAlchemy.
+- MySQL/MariaDB compatibility through SQLAlchemy/PyMySQL.
+- Alembic schema migrations run before the bot starts.
+- No runtime `config.json`, `servers.json`, or `maps.json`.
+- Existing v1.x `config.json` / `servers.json` installations can be imported automatically.
+- Keeper/API polling is globally deduplicated by BF4 server GUID.
+- Automatic announcement message IDs/state are persisted in the database across restarts.
+- Command-audit history is stored permanently and independently of normal Docker logs.
+- Structured operational logging uses Python's `logging` module.
+- Global Discord presence reports aggregate unique-server/player totals instead of one guild's defaults.
+- `/reload`, `/setinterval`, and `/setpresenceupdate` are removed.
 
 ## Setup
 
-The examples below assume BF4 Server Watcher is installed at `/opt/bf4-serverstatus`. If you install it somewhere else, replace that path with your chosen installation directory.
+The examples below assume BF4 Server Watcher is installed at `/opt/bf4-serverstatus`.
 
 Clone the repository:
 
@@ -14,20 +31,33 @@ git clone https://github.com/mauirixxx/BF4-Server-Status.git bf4-serverstatus
 cd /opt/bf4-serverstatus
 ```
 
-Create the local runtime files:
+Create the local environment file:
 
 ```bash
 cp .env.example .env
-cp config.example.json config.json
 ```
 
-Set the real Discord bot token in `.env`:
+Edit `.env`:
 
-```text
+```env
 DISCORD_TOKEN=your_real_discord_bot_token
+DATABASE_URL=postgresql+psycopg://bf4_serverwatcher:PASSWORD@host.docker.internal:5432/bf4_serverwatcher
+CHECK_INTERVAL_SECONDS=69
+PRESENCE_UPDATE_SECONDS=30
+LOG_LEVEL=INFO
 ```
 
-Edit `config.json` with your Discord channel/role IDs. `servers.example.json` ships with AAA as the initial default server. On first startup, ServerWatcher copies it to writable `servers.json` if that file does not already exist.
+### Global environment settings
+
+`DISCORD_TOKEN` is the Discord bot token.
+
+`DATABASE_URL` points ServerWatcher and Alembic at the database. PostgreSQL is the primary target; MySQL and MariaDB URLs are documented in `DATABASE.md`.
+
+`CHECK_INTERVAL_SECONDS` is the global shared polling cadence. Every unique BF4 server is looked up at most once per polling cycle and the result is reused for every guild that tracks that server.
+
+`PRESENCE_UPDATE_SECONDS` controls the bot-wide Discord presence rotation. Presence rotates between the total number of unique BF4 servers tracked and the total current players from fresh successful snapshots.
+
+`LOG_LEVEL` defaults to `INFO`.
 
 Build and start:
 
@@ -37,11 +67,25 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-Live `.env`, `config.json`, and `servers.json` are intentionally excluded from release bundles and Git.
+The container runs:
 
-### Updating to a new release
+```text
+alembic upgrade head
+```
 
-Before updating, review `CHANGELOG.md`. Compare the example JSON files for new settings, but **do not overwrite** your live `.env`, `config.json`, or `servers.json`.
+before starting the bot. If migrations fail, ServerWatcher does not start.
+
+## Upgrading from v1.x
+
+BF4 Server Watcher v2.0.0 changes configuration storage from JSON files to a database and adds multi-guild support.
+
+Existing v1.x installations should read **`MIGRATION.md` before upgrading**. It covers database preparation, the automatic `config.json` / `servers.json` import, the temporary `LEGACY_IMPORT_GUILD_ID` setting for multi-guild migrations, verification, and rollback considerations.
+
+The old JSON files are preserved after import but are no longer authoritative runtime configuration.
+
+## Updating v2.x
+
+Before updating, review `CHANGELOG.md` and `.env.example` for new global deployment settings.
 
 ```bash
 cd /opt/bf4-serverstatus
@@ -53,23 +97,193 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-If you installed ServerWatcher elsewhere, substitute your installation directory.
+Alembic applies any required schema upgrades automatically before the bot starts.
 
-### v1.2.x to v1.3.0 server-registry migration
+## Database architecture
 
-v1.3.0 changes the server registry from one default server to an array of default servers. Existing public v1.2.x installations are migrated automatically:
+ServerWatcher separates global BF4 data from guild-specific configuration.
 
-```json
-"default_server": "aaa"
+### Global BF4 servers
+
+`bf4_servers` stores one row per BF4 server GUID:
+
+```text
+server_guid        PRIMARY KEY
+server_name
+platform
+battlelog_url
+platform_source
 ```
 
-becomes:
+Global rows are retained even if no guild currently references them. This preserves known metadata for future guilds.
 
-```json
-"default_servers": ["aaa"]
+### Guild server relationships
+
+`guild_servers` links a Discord guild to a global BF4 server:
+
+```text
+guild_id
+server_guid
+display_name
+is_default
+
+PRIMARY KEY (guild_id, server_guid)
 ```
 
-Saved server entries are preserved. v1.3.0 also attempts to backfill a missing `platform` field for pre-existing servers.
+Two guilds can track the same BF4 server under different display names. The BF4 server is still polled only once per global cycle.
+
+There is no enabled/disabled state. If a guild tracks a server, the relationship exists; `/delserver` removes it.
+
+### Guild settings
+
+Guild scalar settings are stored in `guild_settings`:
+
+```text
+guild_id                  PRIMARY KEY
+announcement_channel_id
+management_min_role_id
+status_min_role_id
+```
+
+Listen channels use `guild_listen_channels`, and map-role configuration uses `guild_map_role_pings`.
+
+### Static BF4 maps
+
+The old `maps.json` catalog is stored in the static `bf4_maps` table:
+
+```text
+map_key      PRIMARY KEY
+map_name
+```
+
+The catalog is seeded by the initial Alembic migration.
+
+### Persistent announcement state
+
+`guild_server_state` stores per-guild/per-server automatic announcement state including the last map and the previous Discord announcement message ID. This lets ServerWatcher cleanly replace/delete old automatic announcements after a restart.
+
+## New-guild bootstrap
+
+When ServerWatcher joins a Discord guild, it creates that guild's database state immediately.
+
+New guild defaults are:
+
+```text
+Announcement channel: 0 (not configured)
+Listen channels: none
+Management minimum role: 0
+Status minimum role: 0
+```
+
+Every new guild automatically starts with **AAA** as a default BF4 server:
+
+```text
+AAA
+28773abe-e620-4d36-9512-c6f4b128f0ad
+PC
+```
+
+All guilds share the same global AAA record.
+
+New guilds also receive this disabled map-role entry:
+
+```text
+Map: Operation Locker
+Role ID: 0
+Message: Operation Locker is now live!
+```
+
+A `role_id` of `0` means the ping is disabled until an administrator assigns a real Discord role.
+
+Because a newly joined guild initially has no configured announcement/listen channels, management commands are allowed for managers during bootstrap until the first command channel is configured.
+
+## Guild lifecycle and retention
+
+The `guilds` table stores:
+
+```text
+guild_id
+guild_name
+joined_at
+left_at
+```
+
+`joined_at` preserves the first time the bot joined the guild.
+
+When the bot leaves a guild, `left_at` is set and the guild's state is retained for 30 days. If the bot rejoins during that period, `left_at` is cleared and the existing configuration is reused.
+
+At **00:00 UTC every day**, ServerWatcher transactionally deletes guild-scoped state for guilds that have been absent for at least 30 days.
+
+Global `bf4_servers`, `bf4_maps`, and **all command-audit history are retained**.
+
+Current guild names are reconciled with Discord and updated in current-state tables. Historical names captured in command auditing are never rewritten.
+
+## Shared polling and API usage
+
+`CHECK_INTERVAL_SECONDS` is global.
+
+Each cycle:
+
+1. Gather every `guild_servers` reference.
+2. Deduplicate by BF4 `server_guid`.
+3. Perform at most one Keeper lookup per unique server.
+4. Reuse the fresh snapshot for every guild referencing that server.
+5. Process map changes independently for each guild/default relationship.
+
+A cycle log looks conceptually like:
+
+```text
+Monitor cycle complete references=84 unique_servers=31 duplicate_lookups_avoided=53 succeeded=29 failed=2 players=1287
+```
+
+Successful results replace the fresh cache. Failed lookups may leave an older snapshot available only for diagnostics; stale data is never treated as a fresh map change.
+
+The global presence player total includes only successful fresh snapshots from the current cycle.
+
+## Operational logging
+
+ServerWatcher uses Python's `logging` module with timestamped, concise, Docker-friendly messages visible through:
+
+```bash
+docker logs -f BF4_ServerWatcher
+```
+
+Important lifecycle events, guild IDs, channel IDs, user IDs, BF4 server GUIDs, message IDs, progress counts, success paths, failures, retries/backoff, and cleanup results are logged where relevant.
+
+Tight polling loops use cycle summaries rather than excessive per-item success noise.
+
+Secrets, database passwords, Discord tokens, cookies, raw HTML, and sensitive returned payloads are not logged.
+
+Discord/UI responses remain separate from operational logs.
+
+## Permanent command auditing
+
+Command auditing is durable database metadata and is separate from stdout operational logging.
+
+Audit rows include name snapshots captured at command time:
+
+```text
+guild_id
+guild_name
+channel_id
+channel_name
+user_id
+user_name
+command_name
+command_type
+target_type
+target_id
+target_name
+success
+result_code
+error_type
+duration_ms
+request_metadata
+```
+
+Returned bot output is not stored.
+
+Audit history is retained indefinitely, including after a guild's 30-day configuration cleanup. Audit rows intentionally do not rely on cascading foreign keys to current guild state.
 
 ## Discord requirements
 
@@ -86,53 +300,35 @@ Recommended bot permissions:
 
 The bot itself does not require Administrator permission.
 
-**New to Discord bots? Read `DISCORD.md`.** It contains step-by-step Developer Portal, permissions, invite, channel, and role setup instructions.
+See **`DISCORD.md`** for Discord application, invite, permission, guild bootstrap, channel, and role setup.
 
-Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` is intentionally retained alongside `/announce`.
-
-ServerWatcher syncs its slash commands with Discord at startup. v1.3.2 logs the names Discord accepted during sync, which helps distinguish a stale Discord client command cache from an actual registration problem.
+Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` remains as a management chat alias.
 
 ## Announcement and listen channels
 
-`announcement_channel_id` is the protected destination for automatic map-change announcements and manual announcements.
+Announcement/listen channel settings are per guild and stored in the database.
 
-`listen_channel_id` is an array of channels where non-management users may use general commands:
+The announcement channel is the protected destination for automatic map-change announcements and temporary manual announcements.
 
-```json
-{
-  "announcement_channel_id": 111111111111111111,
-  "listen_channel_id": [
-    222222222222222222,
-    333333333333333333
-  ]
-}
-```
+Listen channels are where regular users may run normal commands.
 
-The default:
-
-```json
-"listen_channel_id": [0]
-```
-
-means no regular-user command channel is configured.
-
-Regular users cannot invoke commands in the announcement channel. Managers may use management commands in the announcement channel or configured listen channels.
+Managers may use management commands in the announcement channel or configured listen channels. During initial guild bootstrap, managers may configure the first channel even though none exists yet.
 
 ## Tested Battlefield platforms
 
-BF4 Server Watcher has been successfully tested with Battlefield 4 servers on:
+BF4 Server Watcher has been tested with:
 
 - **PC**
-- **PlayStation 4 / PlayStation 5 backward compatibility** — displayed as `PS4/5`
-- **Xbox** — displayed as `XBox`
+- **PlayStation 4 / PlayStation 5 backward compatibility** — `PS4/5`
+- **Xbox** — `XBox`
 
-The normal snapshot-based status fields have been observed working across these tested platforms, including map, players, queue, commanders, and minimum tickets when supplied by the server snapshot.
+Snapshot status fields include map, players, queue, commanders, and minimum tickets when supplied by the server snapshot.
 
 ## Server platform detection
 
-`/addserver` is the normal way to add BF4 servers. Paste one or more **full Battlelog server URLs** into the command. ServerWatcher extracts the GUID, server name, and platform from each URL.
+`/addserver` accepts one or more Battlelog BF4 server URLs and extracts the GUID/platform information.
 
-Example Battlelog platform segments are interpreted as:
+Battlelog platform segments map to:
 
 ```text
 /pc/       -> PC
@@ -141,23 +337,11 @@ Example Battlelog platform segments are interpreted as:
 /xbox360/  -> XBox
 ```
 
-Full Battlelog URLs are required in the documented workflow because the Keeper snapshot does not provide reliable platform metadata and a GUID by itself cannot reliably distinguish console platforms.
-
-v1.3.0 used an unreliable raw-GUID platform probe that could incorrectly label console servers as PC. On the first v1.3.1 load, unverified v1.3.0 `PC` values are reset to `Unknown` rather than guessed. The bundled AAA record remains known PC, and explicit PS4/5/XBox values are preserved.
-
-To repair an existing server whose platform becomes `Unknown`, run `/addserver` with that server's full Battlelog URL. If the GUID already exists, ServerWatcher updates the existing record's platform metadata instead of creating a duplicate.
-
-Saved URL-derived records include platform provenance and the Battlelog URL so future releases do not need to guess the platform again.
+A full Battlelog URL remains the documented way to add console servers because a raw GUID does not reliably identify console platform.
 
 ## Multiple default servers
 
-v1.3.0 supports **zero, one, or multiple default servers**.
-
-Fresh installations begin with AAA:
-
-```json
-"default_servers": ["aaa"]
-```
+Every guild independently supports zero, one, or multiple default BF4 servers.
 
 Use:
 
@@ -167,282 +351,160 @@ Use:
 /defaultserver list
 ```
 
-The `add` and `remove` commands provide Discord autocomplete lists populated from `servers.json`. `add` shows non-default servers; `remove` shows currently default servers.
+A map change on one guild's default server does not require any other server/guild to change.
 
-Zero defaults is valid. When no defaults are configured:
+Adding a server to defaults performs an immediate current-status announcement when an announcement channel is configured. Removing a default deletes its persisted current automatic announcement state/message.
 
-```text
-!status
-```
-
-returns:
+When the final default is removed, the guild announcement channel receives:
 
 ```text
 No default server(s) set
 ```
 
-The announcement channel receives `No default server(s) set` once when the watcher detects the empty-default state. ServerWatcher continues checking every `check_interval_seconds` and automatically resumes monitoring after a default is added.
+## Adding and renaming servers
 
-Named `!status <server>` lookups and `/status all` continue to work with zero defaults.
+Use `/addserver` with one or more Battlelog server URLs. Multiple URLs may be separated by spaces or new lines.
 
-Each default server is monitored independently. A map change on one default server does not require the others to change, and old automatic announcements are cleaned up per server rather than globally.
+`make_default:true` adds every successfully processed server to the current guild's default list.
 
-When `/defaultserver add` activates a server, ServerWatcher immediately fetches its current status, posts its current automatic announcement, and seeds the watcher cache so the next polling cycle does not create a false map-change announcement.
+If a global `bf4_servers` row already exists for that GUID, ServerWatcher reuses it rather than creating a duplicate.
 
-When `/defaultserver remove` removes a server, its current automatic announcement and cached watcher state are removed immediately. If that leaves zero defaults, the announcement channel receives the normal `No default server(s) set` notice.
+`/renameserver` changes only the guild-specific `display_name`; it does not rename the global BF4 server for other communities.
 
-## Adding servers
+`/delserver` removes only the current guild's relationship. The global BF4 server metadata is retained.
 
-Use `/addserver` and paste one or more full Battlelog server URLs into `server_urls`.
+## Platform-aware lists
 
-For a single server, either Battlelog URL form is accepted:
-
-```text
-/addserver server_urls:https://battlelog.battlefield.com/bf4/servers/show/pc/<guid>/
-/addserver server_urls:https://battlelog.battlefield.com/bf4/servers/show/ps4/<guid>/<server-name>/
-```
-
-If the short URL matches a GUID already saved in `servers.json`, the existing custom server name is preserved while the platform metadata is repaired. A newly added short URL receives a safe generated name that can be changed with `/renameserver`.
-
-For multiple servers, paste several URLs separated by spaces or new lines. The command processes each URL independently, so one invalid or duplicate item does not abort the entire batch.
-
-If `make_default:true` is selected, every successfully processed server is also added to `default_servers` and receives an immediate current-status announcement.
-
-If a supplied URL matches a GUID already stored in `servers.json`, ServerWatcher uses the URL to repair/update that existing record's trusted platform metadata rather than creating a duplicate.
-
-## Platform-aware server lists
-
-`!list` displays platform labels in a fixed-width code block:
+`!list` displays the current guild's configured servers ordered:
 
 ```text
-(PC)      - AAA (default)
-(PS4/5)   - Sloth Alliance Classics
-(XBox)    - Jokers Funhouse
-(Unknown) - Unverified Server
+PC -> PS4/5 -> XBox -> Unknown
 ```
 
-Multi-server displays are consistently sorted **PC → PS4/5 → XBox → Unknown**, then alphabetically by server name. The administrator's `!help` current-configuration list, `/addserver`, `/delserver`, `/renameserver`, `/defaultserver`, `/status all`, and plain multi-default `!status` use the same ordering/formatting conventions.
+then alphabetically by guild display name.
 
 ## Team player roster
 
-The normal user `!status` command supports an optional `players` view:
+Regular users can request:
 
 ```text
 !status flubber players
 ```
 
-Roster headings always retain the BF4 team number and add Keeper's faction value when recognized:
+Headings retain team number and faction when available:
 
 ```text
 TEAM 1 - US (32)        TEAM 2 - RU (31)
 ```
 
-BF4 faction IDs are displayed as `US`, `RU`, or `CN`. If faction data is missing or unrecognized, ServerWatcher falls back to `TEAM 1 (32)` / `TEAM 2 (31)` rather than guessing.
+For PC servers, ServerWatcher attempts BFLIST enrichment and verifies the returned server GUID before using score-ordered roster data. If BFLIST is unavailable, PC falls back to Keeper.
 
-### PC servers
+PlayStation/Xbox use Keeper's returned team order.
 
-For saved servers whose platform is `PC`, ServerWatcher first fetches the Keeper snapshot for universal team/faction data, then attempts BFLIST enrichment for the current scoreboard.
-
-When BFLIST is available, only normal player entries are used, each team is sorted by score from highest to lowest, commanders/non-player entries are excluded, and the displayed positions are numbered:
-
-```text
-TEAM 1 - US (32)             TEAM 2 - RU (31)
-------------------------     ------------------------
-01. PlayerOne                01. PlayerAlpha
-02. PlayerTwo                02. PlayerBravo
-```
-
-BFLIST's BF4 v2 single-server endpoint is keyed by IP:port, so ServerWatcher resolves a PC server by querying the BFLIST current-server endpoint for one of the live player names from Keeper and verifies that the returned server GUID matches the saved GUID before using its scoreboard data.
-
-If BFLIST cannot be resolved or queried, the command gracefully falls back to Keeper's `teamInfo` order. Keeper fallback is intentionally **not numbered**, because that returned order is not guaranteed to be the live score leaderboard.
-
-### PlayStation and Xbox servers
-
-PS4/5 and XBox rosters continue to use Keeper only. Players remain grouped by active team in Keeper's returned order and are not numbered. The faction-aware `TEAM 1 - US/RU/CN` headings still apply when Keeper supplies a recognized faction value.
-
-Team `0` / unassigned entries are not shown. Player role information is not displayed.
-
-The `players` option uses the same `status_min_role_id` and listen-channel permissions as the existing user `!status` command. Partial server-name matching and the numbered server-selection flow remain supported.
-
-## Status role behavior
-
-`status_min_role_id` controls normal `!status` access inside configured listen channels:
-
-- `0` — anyone in an allowed listen channel may use `!status`.
-- Valid role ID — that role, higher roles, Administrators, and the server owner may use `!status`.
-- Invalid/nonexistent nonzero role ID — only Administrators and the server owner may use `!status` until corrected.
-
-## Version checking
-
-ServerWatcher checks the GitHub repository at startup and every 24 hours.
-
-`!version` also performs an immediate fresh check before responding. If that refresh fails, the last successful cached result is preserved.
-
-When a newer version is known, automatic map-change announcements include the available and installed versions.
-
-## User commands
-
-- `!help` — user help; managers also receive management commands and current configuration.
-- `!list` — platform-aware list of configured server names.
-- `!status` — status for every configured default server, or `No default server(s) set`.
-- `!status <server-name>` — exact/partial saved-server lookup with per-user numbered selection for ambiguous matches.
-- `!status <server-name> players` — user-accessible side-by-side player roster broken down by active team. This uses the same server snapshot data and does not display player roles.
-- `!version` — installed/latest version and update status.
-- `!announce` — management-only chat alias for `/announce`; manually posted announcements automatically delete after 10 minutes.
-
-## Management commands
-
-Management slash commands require `management_min_role_id` or higher. Discord Administrators and the server owner always bypass that role threshold.
-
-- `/status all` — status for every configured server.
-- `/status server server:<selection> [players:true] [layout:Mobile|Wide]` — status for one saved server, with optional rich player stats. Mobile is the default layout.
-- `/announce` — temporarily post current map-style status for every default server; each manual announcement automatically deletes after 10 minutes.
-- `/debug [server:<selection>]` — Keeper diagnostics for any saved server using autocomplete; with no selection it uses the first configured default.
-- `/reload` — reload configuration/server registry and normalize saved platform metadata without guessing from raw GUIDs.
-- `/addserver server_urls:<Battlelog URLs> [make_default:true]` — add or repair one or more servers from full Battlelog URLs. URLs may be separated by spaces or new lines. `make_default:true` applies to every successfully processed server.
-- `/delserver server:<selection>` — immediately delete a non-default server using autocomplete. Current default servers must be removed from the default list first.
-- `/renameserver server:<selection> new_name:<name>` — rename a saved server without changing its GUID, platform, Battlelog metadata, or default status.
-- `/defaultserver add server:<selection>` — add a server to defaults using autocomplete.
-- `/defaultserver remove server:<selection>` — remove a server from defaults using autocomplete.
-- `/defaultserver list` — list current defaults.
-- `/setannouncementchannel channel:<channel>` — set the automatic announcement channel.
-- `/addlistenchannel channels:<channel list>` — add one or more listen channels.
-- `/dellistenchannel channels:<channel list>` — immediately remove one or more listen channels.
-- `/setmanagementrole [role:<role>]`
-- `/setstatusrole [role:<role>]`
-- `/setinterval seconds:<seconds>`
-- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]` — create or replace a map-role configuration immediately.
-- `/editmaprole map_name:<selection> [role:<role>]` — select an existing configured map via autocomplete, optionally choose a replacement role, then edit the current message in a pre-filled modal. Leaving the role blank preserves the existing role.
-- `/delmaprole map_search:<map>` — delete the selected configured map-role mapping immediately.
-
-## Editing map-role pings
-
-`/editmaprole` is for changing an existing configured map-role ping without deleting/recreating it.
-
-The `map_name` option autocompletes only maps that already have a configured map-role entry. The optional `role` option uses Discord's normal role picker. Leave it blank to preserve the current role.
-
-After submitting `/editmaprole`, ServerWatcher opens a modal with the currently configured message (or the default `<map> is now live!` message) already filled in. Edit the text and submit the modal to save the change.
-
-The administrator `!help` current-configuration output shows each map role, role ID, and message on one line, for example:
-
-```text
-Operation Metro 2014 — @TFA (1529396067072868444) - "Operation Metro 2014 is now live!"
-```
+Keeper fallback is intentionally unnumbered because its returned order is not guaranteed to represent live scoreboard rank.
 
 ## Rich slash-status player stats
 
-The administrative `/status` command now has two subcommands:
-
-```text
-/status all
-/status server
-```
-
-`/status all` keeps the existing all-server status behavior and does not expose player/layout options.
-
-`/status server` lets a manager choose one configured server using autocomplete and optionally request player details:
+Managers can use:
 
 ```text
 /status server server:<selection> players:true layout:Mobile
 /status server server:<selection> players:true layout:Wide
 ```
 
-`players` defaults to `false`. `layout` defaults to **Mobile**.
-
-For PC servers where BFLIST enrichment succeeds, the slash player view includes:
+When BFLIST enrichment succeeds for PC, the rich scoreboard includes:
 
 ```text
 PL  NAME  SCORE  K  D  KDR
 ```
 
-The PC scoreboard is sorted by BFLIST score within each team. `PL` is the verified score-order position. KDR is calculated as kills divided by deaths; when deaths are zero, KDR is displayed as the kill count rather than dividing by zero.
+Mobile stacks team tables vertically. Wide displays two teams side by side and safely chunks large scoreboards with repeated headers.
 
-**Mobile** stacks Team 1 and Team 2 vertically for narrower displays. **Wide** renders the two complete scoreboards side by side for desktop/monitor use.
+Console/Keeper fallback remains the compact name-only roster.
 
-If BFLIST cannot be used for a PC server, or if the server is PS4/5 or XBox, `/status server ... players:true` deliberately falls back to the existing Keeper name-only side-by-side roster. Keeper fallback output is not changed by the Mobile/Wide selection.
+## Status role behavior
 
-The regular user command:
+`status_min_role_id` is per guild.
 
-```text
-!status <server-name> players
-```
+- `0` — anyone in an allowed listen channel may use normal `!status`.
+- Valid role ID — that role, higher roles, Administrators, and the guild owner may use it.
+- Invalid nonzero role ID — Administrators/guild owner retain access until corrected.
 
-remains unchanged from v1.3.5 and continues to use the compact two-team name list.
+## Version checking
 
-## v1.3.7 scoreboard chunking
+ServerWatcher checks the GitHub repository at startup and every 24 hours.
 
-Large `/status server ... players:true layout:Wide` scoreboards are pre-chunked below Discord's message limit using a conservative 1750-character ceiling.
+`!version` performs an immediate refresh before responding.
 
-Each continuation chunk repeats the team headings and `PL NAME SCORE K D KDR` column headings so every message remains readable on its own.
+## User commands
 
-Player-stat and Keeper-fallback chunks generated by `/status server` are posted as ordinary channel messages rather than interaction follow-ups. After posting, ServerWatcher removes the deferred interaction response. This avoids Discord rendering continuation chunks with a reply-style banner.
+- `!help`
+- `!list`
+- `!status`
+- `!status <server-name>`
+- `!status <server-name> players`
+- `!version`
+- `!announce` — management-only alias for `/announce`
 
-## Presence rotation interval
+## Management commands
 
-Administrators can change the rotating Discord presence timing with:
+- `/status all`
+- `/status server server:<selection> [players:true] [layout:Mobile|Wide]`
+- `/announce`
+- `/debug [server:<selection>]`
+- `/addserver server_urls:<Battlelog URLs> [make_default:true]`
+- `/delserver server:<selection>`
+- `/renameserver server:<selection> new_name:<name>`
+- `/defaultserver add server:<selection>`
+- `/defaultserver remove server:<selection>`
+- `/defaultserver list`
+- `/setannouncementchannel channel:<channel>`
+- `/addlistenchannel channels:<channel list>`
+- `/dellistenchannel channels:<channel list>`
+- `/setmanagementrole [role:<role>]`
+- `/setstatusrole [role:<role>]`
+- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]`
+- `/editmaprole map_name:<selection> [role:<role>]`
+- `/delmaprole map_search:<map>`
 
-```text
-/setpresenceupdate seconds:<number>
-```
-
-The supported effective range is **10 through 60 seconds**. Values outside that range are not rejected; they are clamped to the nearest limit and the command response explains which limit was applied.
-
-The default is **30 seconds** for existing configurations that do not yet contain `presence_update_seconds`.
-
-The setting is persisted to `config.json` and read by the presence loop every cycle, so a bot restart is not required. If `config.json` is edited manually, `/reload` applies the new value. Manual values outside 10-60 are also normalized to the nearest limit.
-
-`!help` shows the current presence update interval in the configuration section.
+`/reload`, `/setinterval`, and `/setpresenceupdate` were removed in v2.0.0 because global settings are environment-based and guild runtime state is database-backed.
 
 ## Manual announcement cleanup
 
-Manual announcements created by `/announce` or `!announce` are temporary. Each message is scheduled for deletion after **10 minutes (600 seconds)**.
+Manual announcements created by `/announce` or `!announce` automatically delete after 10 minutes.
 
-Automatic map-change announcements are not affected by this timer. They continue to use the normal per-server lifecycle: replacement on that server's next map change, or immediate removal when the server is removed from the default list.
+Automatic announcements use database-persisted message state and are not affected by the manual cleanup timer.
 
-## Rotating Discord presence
+## Global Discord presence
 
-The bot rotates its custom activity every 30 seconds across all currently cached default servers, followed by the bot version. For two defaults, the cycle can look like:
+The bot-wide presence rotates according to `PRESENCE_UPDATE_SECONDS` between aggregate values such as:
 
 ```text
-AAA • Dawnbreaker
-AAA currently has 63 players
-Flubber • Operation Locker
-Flubber currently has 48 players
-BF4 Server Watcher v1.3.8
+Tracking 42 BF4 servers
+1,287 players across tracked servers
 ```
 
-Presence uses cached watcher data and does not create extra Keeper polling requests.
+A BF4 server tracked by multiple guilds is counted only once.
 
-## Runtime/configuration files
+## Runtime/release files
 
-- `.env.example` — copy to `.env`; never commit the real token.
-- `config.example.json` — copy to `config.json`.
-- `servers.example.json` — AAA-default registry template; copied to live `servers.json` only when that file does not exist.
-- `maps.json` — BF4 map ID/display-name mapping.
-- `DISCORD.md` — Discord setup guide.
+- `.env.example` — global deployment settings template.
+- `DATABASE.md` — `DATABASE_URL` examples.
+- `MIGRATION.md` — v1.x -> v2.0.0 migration guide.
+- `DISCORD.md` — Discord setup and multi-guild behavior.
+- `THIRD_PARTY.md` — third-party dependencies/services and license information.
 - `CHANGELOG.md` — version history.
 - `LICENSE` — MIT License.
+- `alembic.ini` / `alembic/` — database migrations.
+- `serverwatcher.py`, `models.py`, `db.py` — application/database code.
 
-## Default server template
+There are no v2 runtime `config.json`, `servers.json`, or `maps.json` files.
 
-`servers.example.json` begins with:
+## Third-party software
 
-```json
-{
-  "default_servers": [
-    "aaa"
-  ],
-  "servers": {
-    "aaa": {
-      "name": "AAA",
-      "guid": "28773abe-e620-4d36-9512-c6f4b128f0ad",
-      "platform": "PC"
-    }
-  }
-}
-```
+BF4 Server Watcher itself is MIT licensed. Third-party libraries and services retain their own terms and licenses.
 
-Administrators may later remove every default server; the presence of AAA here only defines the fresh-install starting state.
+See **`THIRD_PARTY.md`**.
 
 ## Author and acknowledgments
 
@@ -452,6 +514,10 @@ Administrators may later remove every default server; the presence of AAA here o
 
 BF4 Server Watcher is released under the MIT License. See `LICENSE`.
 
-## Release files and GitHub safety
+## GitHub safety
 
-Release bundles intentionally contain **no `.env`, no `config.json`, and no live `servers.json`**. `.gitignore` excludes those live files, Python cache files, and release ZIPs.
+The live `.env` file is intentionally excluded from release bundles and Git.
+
+Never commit Discord tokens or database credentials.
+
+Legacy `config.json` / `servers.json` files may remain on upgraded installations for rollback/reference, but are ignored by normal v2 runtime after the migration is marked complete.
