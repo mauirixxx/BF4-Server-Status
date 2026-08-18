@@ -32,7 +32,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.0"
+BOT_VERSION = "v2.0.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -268,6 +268,7 @@ def build_status_message(title: str, status: dict) -> str:
 
 
 def build_map_announcement(server_name: str, status: dict) -> str:
+    """Build map-change content only; version/update notices are intentionally excluded."""
     return (
         "🎮 **BF4 Map Change**\n"
         f"🖥️ Server: **{server_name}**\n"
@@ -1278,6 +1279,7 @@ async def presence_loop():
 
 
 async def version_loop():
+    """Refresh version metadata for logs/!version only; never post Discord notices."""
     while not client.is_closed():
         await asyncio.to_thread(refresh_latest_version)
         await asyncio.sleep(VERSION_CHECK_INTERVAL_SECONDS)

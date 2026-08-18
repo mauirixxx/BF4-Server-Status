@@ -4,6 +4,19 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.0.1] - 2026-08-18
+
+### Changed
+- Formalized version checking as an operational/background function only: automatic checks continue to log installed/latest version information to stdout/Docker logs.
+- `!version` remains the explicit user-facing installed/latest version check.
+- Automatic map-change announcements intentionally contain no version/update suffix.
+- Automatic Discord update-available notifications are not posted.
+- Updated README/Discord documentation and Docker image/application version for v2.0.1.
+
+### Validation
+- Added release validation to ensure `build_map_announcement()` contains no version/update text and the background version loop does not send Discord messages.
+- No database schema migration is required for this patch.
+
 ## [v2.0.0] - 2026-08-17
 
 ### Major architecture

@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.0
+# BF4 Server Watcher v2.0.1
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -434,7 +434,9 @@ Console/Keeper fallback remains the compact name-only roster.
 
 ServerWatcher checks the GitHub repository at startup and every 24 hours.
 
-`!version` performs an immediate refresh before responding.
+Background version checks are operational only: results are written to the Docker/stdout log and are **not** posted automatically to Discord or appended to automatic map-change announcements.
+
+`!version` performs an immediate refresh before responding and remains the user-facing way to check the installed/latest version.
 
 ## User commands
 

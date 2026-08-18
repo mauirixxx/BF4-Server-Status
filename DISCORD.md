@@ -141,6 +141,8 @@ Normal users use:
 !status <server>
 !status <server> players
 !version
+
+Background version checks do not post update notices to Discord and do not append version text to automatic map announcements. Use `!version` for an explicit installed/latest version check.
 ```
 
 `!announce` is retained as a management-only chat alias.
