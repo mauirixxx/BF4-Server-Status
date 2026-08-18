@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +31,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.1"
+BOT_VERSION = "v2.0.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -62,6 +61,27 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 logging.Formatter.converter = time.gmtime
+
+
+class OptionalVoiceWarningFilter(logging.Filter):
+    """Suppress only discord.py warnings for unused optional voice dependencies."""
+
+    SUPPRESSED_PREFIXES = (
+        "PyNaCl is not installed, voice will NOT be supported",
+        "davey is not installed, voice will NOT be supported",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(
+            message.startswith(prefix)
+            for prefix in self.SUPPRESSED_PREFIXES
+        )
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(OptionalVoiceWarningFilter())
+
 log = logging.getLogger("serverwatcher")
 
 PLATFORM_URL_LABELS = {
@@ -79,6 +99,10 @@ FRESH_SERVER_CACHE: dict[str, dict] = {}
 LAST_SUCCESS_CACHE: dict[str, dict] = {}
 BFLIST_CACHE: dict[str, tuple[float, dict | None]] = {}
 BFLIST_CACHE_SECONDS = 15
+KEEPER_REQUEST_SPACING_SECONDS = 3.0
+KEEPER_SERVICE_FAILURE_THRESHOLD = 3
+KEEPER_SERVICE_BACKOFF_SECONDS = 60
+KEEPER_BACKOFF_UNTIL = 0.0
 watcher_started = False
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
 
@@ -174,6 +198,21 @@ def get_keeper_snapshot(guid: str) -> dict:
     if not isinstance(snapshot, dict):
         raise ValueError("Keeper response did not contain a snapshot object")
     return snapshot
+
+
+def keeper_service_failure_reason(exc: Exception) -> str | None:
+    """Classify failures that can indicate Keeper-wide throttling/outage."""
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in {403, 429} or (isinstance(status, int) and status >= 500):
+            return f"http_{status}"
+        return None
+    if isinstance(exc, requests.Timeout):
+        return "timeout"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection_error"
+    return None
 
 
 def as_int(value):
@@ -677,7 +716,13 @@ def has_role_or_higher(member: discord.Member, required_role_id: int, zero_allow
 
 
 def can_manage(member: discord.Member):
-    return has_role_or_higher(member, get_settings(member.guild.id).management_min_role_id)
+    # has_role_or_higher always permits the guild owner/Discord Administrators.
+    # With management_min_role_id=0, everyone else remains denied until a role
+    # is explicitly configured.
+    return has_role_or_higher(
+        member,
+        get_settings(member.guild.id).management_min_role_id,
+    )
 
 
 def management_channel_allowed(interaction_or_message):
@@ -757,37 +802,28 @@ def platform_server_list(guild_id: int, include_guid=False):
     return "\n".join(lines)
 
 
-def resolve_channel_arguments(guild: discord.Guild, raw: str):
-    resolved = []
-    seen = set()
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
-
-    for token in tokens:
-        match = re.search(r"\d{15,22}", token)
-        channel = guild.get_channel(int(match.group(0))) if match else None
-        if channel is None:
-            exact = [
-                item for item in guild.text_channels
-                if item.name.casefold() == token.lstrip("#").casefold()
-            ]
-            channel = exact[0] if len(exact) == 1 else None
-        if channel and channel.id not in seen:
-            seen.add(channel.id)
-            resolved.append(channel)
-    return resolved
-
-
-def map_matches(search: str):
-    needle = search.strip().casefold()
+def all_map_choices(current: str):
+    """Return up to 25 BF4 map choices, alphabetically, filtered across all maps."""
+    needle = (current or "").strip().casefold()
     with SessionLocal() as session:
-        rows = session.scalars(select(BF4Map)).all()
-        exact = [r for r in rows if r.map_name.casefold() == needle or r.map_key.casefold() == needle]
-        if exact:
-            return exact
-        return [r for r in rows if needle in r.map_name.casefold() or needle in r.map_key.casefold()]
+        rows = session.scalars(
+            select(BF4Map).order_by(BF4Map.map_name)
+        ).all()
+
+    choices = []
+    for row in rows:
+        haystack = f"{row.map_name} {row.map_key}".casefold()
+        if needle and needle not in haystack:
+            continue
+        choices.append(
+            app_commands.Choice(
+                name=row.map_name[:100],
+                value=row.map_key,
+            )
+        )
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 def configured_map_matches(guild_id: int, search: str):
@@ -1193,59 +1229,205 @@ async def maybe_send_map_role(guild_id, channel, map_key):
 
 
 async def monitor_cycle():
-    global FRESH_SERVER_CACHE
+    global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
+
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
         unique_guids = sorted({row.server_guid for row in relations})
-    references = len(relations)
-    duplicate_avoided = max(0, references - len(unique_guids))
-    log.info(
-        "Monitor cycle started references=%s unique_servers=%s duplicate_lookups_avoided=%s",
-        references, len(unique_guids), duplicate_avoided
-    )
-    fresh = {}
-    failures = 0
-    for index, guid in enumerate(unique_guids, 1):
-        try:
-            snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
-            fresh[guid] = snapshot
-            LAST_SUCCESS_CACHE[guid] = snapshot
-        except Exception as exc:
-            failures += 1
-            log.warning(
-                "Monitor server failed server=%s progress=%s/%s error=%s message=%r",
-                guid, index, len(unique_guids), type(exc).__name__, str(exc)
-            )
-    FRESH_SERVER_CACHE = fresh
 
+    references = len(relations)
+    unique_count = len(unique_guids)
+    duplicate_avoided = max(0, references - unique_count)
+
+    log.info(
+        "Monitor cycle started references=%s unique_servers=%s "
+        "duplicate_lookups_avoided=%s keeper_spacing_seconds=%s",
+        references,
+        unique_count,
+        duplicate_avoided,
+        KEEPER_REQUEST_SPACING_SECONDS,
+    )
+
+    fresh = {}
+    attempted = 0
+    skipped = 0
+    failures = 0
+    service_failures = 0
+    isolated_failures = 0
+    consecutive_service_failures = 0
+    circuit_opened = False
+
+    now_mono = time.monotonic()
+    if KEEPER_BACKOFF_UNTIL > now_mono:
+        skipped = unique_count
+        remaining = max(0, int(KEEPER_BACKOFF_UNTIL - now_mono))
+        FRESH_SERVER_CACHE = {}
+        log.warning(
+            "Keeper circuit backoff active skipped=%s retry_in_seconds=%s",
+            skipped,
+            remaining,
+        )
+    else:
+        last_request_started = None
+
+        for index, guid in enumerate(unique_guids, 1):
+            if circuit_opened:
+                skipped += 1
+                continue
+
+            if last_request_started is not None:
+                elapsed = time.monotonic() - last_request_started
+                wait_seconds = max(
+                    0.0,
+                    KEEPER_REQUEST_SPACING_SECONDS - elapsed,
+                )
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
+
+            last_request_started = time.monotonic()
+            attempted += 1
+
+            try:
+                snapshot = await asyncio.to_thread(
+                    get_keeper_snapshot,
+                    guid,
+                )
+                fresh[guid] = snapshot
+                LAST_SUCCESS_CACHE[guid] = snapshot
+                consecutive_service_failures = 0
+            except Exception as exc:
+                failures += 1
+                service_reason = keeper_service_failure_reason(exc)
+
+                if service_reason:
+                    service_failures += 1
+                    consecutive_service_failures += 1
+                    log.warning(
+                        "Monitor Keeper service failure server=%s "
+                        "progress=%s/%s streak=%s/%s reason=%s "
+                        "error=%s message=%r",
+                        guid,
+                        index,
+                        unique_count,
+                        consecutive_service_failures,
+                        KEEPER_SERVICE_FAILURE_THRESHOLD,
+                        service_reason,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+
+                    if (
+                        consecutive_service_failures
+                        >= KEEPER_SERVICE_FAILURE_THRESHOLD
+                    ):
+                        circuit_opened = True
+                        skipped = unique_count - attempted
+                        KEEPER_BACKOFF_UNTIL = (
+                            time.monotonic()
+                            + KEEPER_SERVICE_BACKOFF_SECONDS
+                        )
+                        log.error(
+                            "Keeper circuit opened attempted=%s skipped=%s "
+                            "service_failures=%s backoff_seconds=%s",
+                            attempted,
+                            skipped,
+                            service_failures,
+                            KEEPER_SERVICE_BACKOFF_SECONDS,
+                        )
+                        break
+                else:
+                    isolated_failures += 1
+                    log.warning(
+                        "Monitor server failed server=%s progress=%s/%s "
+                        "error=%s message=%r",
+                        guid,
+                        index,
+                        unique_count,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+
+        FRESH_SERVER_CACHE = fresh
+
+    # Only snapshots successfully fetched in THIS cycle are eligible to drive
+    # map-change transitions. LAST_SUCCESS_CACHE is diagnostic-only.
     with SessionLocal() as session:
-        default_rows = session.scalars(select(GuildServer).where(GuildServer.is_default.is_(True))).all()
-        detached = [(r.guild_id, r.server_guid, r.display_name) for r in default_rows]
+        default_rows = session.scalars(
+            select(GuildServer).where(GuildServer.is_default.is_(True))
+        ).all()
+        detached = [
+            (r.guild_id, r.server_guid, r.display_name)
+            for r in default_rows
+        ]
 
     for guild_id, guid, display_name in detached:
         snapshot = fresh.get(guid)
         if snapshot is None:
             continue
+
         status = get_server_status(snapshot)
         with SessionLocal() as session:
-            state = session.get(GuildServerState, (guild_id, guid))
+            state = session.get(
+                GuildServerState,
+                (guild_id, guid),
+            )
             previous = state.last_map_key if state else None
+
         if previous is None:
             with SessionLocal.begin() as session:
-                state = session.get(GuildServerState, (guild_id, guid))
+                state = session.get(
+                    GuildServerState,
+                    (guild_id, guid),
+                )
                 if state is None:
-                    state = GuildServerState(guild_id=guild_id, server_guid=guid)
+                    state = GuildServerState(
+                        guild_id=guild_id,
+                        server_guid=guid,
+                    )
                     session.add(state)
                 state.last_map_key = status["map_key"]
-            log.info("Monitor state seeded guild=%s server=%s map=%s", guild_id, guid, status["map_key"])
-        elif status["map_key"] != previous:
-            gs = GuildServer(guild_id=guild_id, server_guid=guid, display_name=display_name, is_default=True)
-            await post_automatic_announcement(guild_id, gs, status)
 
-    player_total = sum(get_server_status(snapshot)["players"] for snapshot in fresh.values())
+            log.info(
+                "Monitor state seeded guild=%s server=%s map=%s",
+                guild_id,
+                guid,
+                status["map_key"],
+            )
+        elif status["map_key"] != previous:
+            gs = GuildServer(
+                guild_id=guild_id,
+                server_guid=guid,
+                display_name=display_name,
+                is_default=True,
+            )
+            await post_automatic_announcement(
+                guild_id,
+                gs,
+                status,
+            )
+
+    # Presence/player totals also use fresh snapshots only.
+    player_total = sum(
+        get_server_status(snapshot)["players"]
+        for snapshot in fresh.values()
+    )
+
     log.info(
-        "Monitor cycle complete references=%s unique_servers=%s duplicate_lookups_avoided=%s succeeded=%s failed=%s players=%s",
-        references, len(unique_guids), duplicate_avoided, len(fresh), failures, player_total
+        "Monitor cycle complete references=%s unique_servers=%s "
+        "duplicate_lookups_avoided=%s attempted=%s skipped=%s "
+        "succeeded=%s failed=%s service_failures=%s "
+        "isolated_failures=%s circuit_opened=%s players=%s",
+        references,
+        unique_count,
+        duplicate_avoided,
+        attempted,
+        skipped,
+        len(fresh),
+        failures,
+        service_failures,
+        isolated_failures,
+        circuit_opened,
+        player_total,
     )
 
 
@@ -1692,39 +1874,103 @@ async def setannouncementchannel(interaction: discord.Interaction, channel: disc
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setannouncementchannel", command_type="slash", success=True, started=started, result_code="updated", target_type="channel", target_id=channel.id, target_name=channel.name)
 
 
-@tree.command(name="addlistenchannel", description="Add one or more listen channels")
-async def addlistenchannel(interaction: discord.Interaction, channels: str):
+@tree.command(name="addlistenchannel", description="Add one listen channel")
+@app_commands.describe(channel="Text channel to allow regular user commands in")
+async def addlistenchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
-    resolved = resolve_channel_arguments(interaction.guild, channels)
-    added = 0
+
+    added = False
     with SessionLocal.begin() as session:
-        for channel in resolved:
-            if session.get(GuildListenChannel, (interaction.guild.id, channel.id)) is None:
-                session.add(GuildListenChannel(guild_id=interaction.guild.id, channel_id=channel.id))
-                added += 1
-    await interaction.followup.send(f"✅ Added **{added}** listen channel(s).", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="addlistenchannel", command_type="slash", success=True, started=started, result_code="updated", metadata={"resolved": len(resolved), "added": added})
+        if session.get(
+            GuildListenChannel,
+            (interaction.guild.id, channel.id),
+        ) is None:
+            session.add(
+                GuildListenChannel(
+                    guild_id=interaction.guild.id,
+                    channel_id=channel.id,
+                )
+            )
+            added = True
+
+    if added:
+        await interaction.followup.send(
+            f"✅ Added **#{channel.name}** as a listen channel.",
+            ephemeral=True,
+        )
+        result_code = "added"
+    else:
+        await interaction.followup.send(
+            f"ℹ️ **#{channel.name}** is already a listen channel.",
+            ephemeral=True,
+        )
+        result_code = "already_configured"
+
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="addlistenchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code=result_code,
+        target_type="channel",
+        target_id=channel.id,
+        target_name=channel.name,
+    )
 
 
-@tree.command(name="dellistenchannel", description="Remove one or more listen channels")
-async def dellistenchannel(interaction: discord.Interaction, channels: str):
+@tree.command(name="dellistenchannel", description="Remove one listen channel")
+@app_commands.describe(channel="Configured text channel to remove from listen channels")
+async def dellistenchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
-    resolved = resolve_channel_arguments(interaction.guild, channels)
-    ids = [channel.id for channel in resolved]
-    removed = 0
-    if ids:
-        with SessionLocal.begin() as session:
-            result = session.execute(delete(GuildListenChannel).where(
+
+    with SessionLocal.begin() as session:
+        result = session.execute(
+            delete(GuildListenChannel).where(
                 GuildListenChannel.guild_id == interaction.guild.id,
-                GuildListenChannel.channel_id.in_(ids),
-            ))
-            removed = result.rowcount or 0
-    await interaction.followup.send(f"✅ Removed **{removed}** listen channel(s).", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="dellistenchannel", command_type="slash", success=True, started=started, result_code="updated", metadata={"resolved": len(resolved), "removed": removed})
+                GuildListenChannel.channel_id == channel.id,
+            )
+        )
+        removed = bool(result.rowcount)
+
+    if removed:
+        await interaction.followup.send(
+            f"✅ Removed **#{channel.name}** from listen channels.",
+            ephemeral=True,
+        )
+        result_code = "removed"
+    else:
+        await interaction.followup.send(
+            f"ℹ️ **#{channel.name}** is not currently a listen channel.",
+            ephemeral=True,
+        )
+        result_code = "not_configured"
+
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="dellistenchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code=result_code,
+        target_type="channel",
+        target_id=channel.id,
+        target_name=channel.name,
+    )
 
 
 @tree.command(name="setmanagementrole", description="Set this guild's management minimum role")
@@ -1752,26 +1998,89 @@ async def setstatusrole(interaction: discord.Interaction, role: discord.Role | N
 
 
 @tree.command(name="setmaprole", description="Create or replace a map-specific role ping")
-async def setmaprole(interaction: discord.Interaction, map_search: str, role: discord.Role | None = None, message: str | None = None, disable: bool = False):
+@app_commands.describe(
+    map_search="Choose a Battlefield 4 map",
+    role="Discord role to ping",
+    message="Optional custom map-live message",
+    disable="Disable the map ping by setting role ID to 0",
+)
+async def setmaprole(
+    interaction: discord.Interaction,
+    map_search: str,
+    role: discord.Role | None = None,
+    message: str | None = None,
+    disable: bool = False,
+):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
-    matches = map_matches(map_search)
-    if len(matches) != 1:
-        await interaction.followup.send("⚠️ Map search must resolve to exactly one BF4 map.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmaprole", command_type="slash", success=False, started=started, result_code="map_ambiguous")
+
+    with SessionLocal() as session:
+        map_row = session.get(BF4Map, map_search)
+        if map_row is not None:
+            session.expunge(map_row)
+
+    if map_row is None:
+        await interaction.followup.send(
+            "⚠️ Choose a BF4 map from the autocomplete list.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="setmaprole",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="map_not_found",
+            target_type="map",
+            target_id=map_search,
+        )
         return
-    map_row = matches[0]
+
     role_id = 0 if disable else (role.id if role else 0)
     text = message or f"{map_row.map_name} is now live!"
     with SessionLocal.begin() as session:
-        ping = session.get(GuildMapRolePing, (interaction.guild.id, map_row.map_key))
+        ping = session.get(
+            GuildMapRolePing,
+            (interaction.guild.id, map_row.map_key),
+        )
         if ping is None:
-            session.add(GuildMapRolePing(guild_id=interaction.guild.id, map_key=map_row.map_key, role_id=role_id, message=text))
+            session.add(
+                GuildMapRolePing(
+                    guild_id=interaction.guild.id,
+                    map_key=map_row.map_key,
+                    role_id=role_id,
+                    message=text,
+                )
+            )
         else:
-            ping.role_id, ping.message = role_id, text
-    await interaction.followup.send(f"✅ Map role updated for **{map_row.map_name}**.", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmaprole", command_type="slash", success=True, started=started, result_code="updated", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
+            ping.role_id = role_id
+            ping.message = text
+
+    await interaction.followup.send(
+        f"✅ Map role updated for **{map_row.map_name}**.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="setmaprole",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="updated",
+        target_type="map",
+        target_id=map_row.map_key,
+        target_name=map_row.map_name,
+    )
+
+
+@setmaprole.autocomplete("map_search")
+async def setmaprole_autocomplete(interaction, current):
+    return all_map_choices(current)
 
 
 class EditMapRoleModal(discord.ui.Modal):
@@ -1861,19 +2170,90 @@ async def editmaprole_autocomplete(interaction, current):
 
 
 @tree.command(name="delmaprole", description="Delete a configured map-role ping")
+@app_commands.describe(map_search="Choose a Battlefield 4 map")
 async def delmaprole(interaction: discord.Interaction, map_search: str):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
-    matches = configured_map_matches(interaction.guild.id, map_search)
-    if len(matches) != 1:
-        await interaction.followup.send("⚠️ Map search must resolve to one configured map.", ephemeral=True)
+
+    with SessionLocal() as session:
+        map_row = session.get(BF4Map, map_search)
+        ping = session.get(
+            GuildMapRolePing,
+            (interaction.guild.id, map_search),
+        )
+        if map_row is not None:
+            session.expunge(map_row)
+
+    if map_row is None:
+        await interaction.followup.send(
+            "⚠️ Choose a BF4 map from the autocomplete list.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="delmaprole",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="map_not_found",
+            target_type="map",
+            target_id=map_search,
+        )
         return
-    ping, map_row = matches[0]
+
+    if ping is None:
+        await interaction.followup.send(
+            f"ℹ️ **{map_row.map_name}** does not have a configured map-role ping for this guild.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="delmaprole",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="not_configured",
+            target_type="map",
+            target_id=map_row.map_key,
+            target_name=map_row.map_name,
+        )
+        return
+
     with SessionLocal.begin() as session:
-        session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == interaction.guild.id, GuildMapRolePing.map_key == map_row.map_key))
-    await interaction.followup.send(f"✅ Removed map role ping for **{map_row.map_name}**.", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delmaprole", command_type="slash", success=True, started=started, result_code="removed", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
+        session.execute(
+            delete(GuildMapRolePing).where(
+                GuildMapRolePing.guild_id == interaction.guild.id,
+                GuildMapRolePing.map_key == map_row.map_key,
+            )
+        )
+
+    await interaction.followup.send(
+        f"✅ Removed map role ping for **{map_row.map_name}**.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="delmaprole",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="removed",
+        target_type="map",
+        target_id=map_row.map_key,
+        target_name=map_row.map_name,
+    )
+
+
+@delmaprole.autocomplete("map_search")
+async def delmaprole_autocomplete(interaction, current):
+    return all_map_choices(current)
 
 
 @tree.command(name="debug", description="Show Keeper diagnostics for a configured server")

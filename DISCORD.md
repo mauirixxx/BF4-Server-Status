@@ -79,8 +79,8 @@ Automatic map-change announcement message IDs are persisted in the database. Ser
 Use:
 
 ```text
-/addlistenchannel
-/dellistenchannel
+/addlistenchannel channel:<text channel>
+/dellistenchannel channel:<text channel>
 ```
 
 to manage channels where normal users may use `!` commands.
@@ -156,3 +156,15 @@ If the bot rejoins during that window, ServerWatcher clears the leave timestamp 
 At 00:00 UTC each day, guilds absent for at least 30 days have their guild-scoped state transactionally removed.
 
 Permanent command-audit history is never removed by guild cleanup.
+
+
+## Map-role autocomplete
+
+`/setmaprole` and `/delmaprole` use autocomplete backed by the complete `bf4_maps` database table. With no text entered, Discord shows up to the first 25 maps alphabetically; typing filters across the complete BF4 map catalog.
+
+`/editmaprole` intentionally behaves differently and only offers map-role entries already configured for the current guild.
+
+
+## Keeper request pacing
+
+The background monitor performs one Keeper lookup per unique BF4 server GUID and spaces unique requests approximately three seconds apart. Repeated service-level failures trigger a per-cycle circuit breaker/backoff instead of continuing to hammer Keeper. Isolated server failures remain separate.

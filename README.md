@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.1
+# BF4 Server Watcher v2.0.2
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -304,6 +304,16 @@ See **`DISCORD.md`** for Discord application, invite, permission, guild bootstra
 
 Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` remains as a management chat alias.
 
+## Keeper polling resilience
+
+The global monitor deduplicates guild/server relationships by BF4 server GUID, then spaces unique Keeper snapshot request starts approximately **3 seconds apart**.
+
+Repeated service-level Keeper failures such as HTTP `403`, `429`, `5xx`, connection failures, or timeouts are tracked separately from isolated server failures such as a persistent `404`. After three consecutive service-level failures, ServerWatcher opens a circuit breaker for the remainder of the polling cycle and applies a short backoff before retrying Keeper.
+
+Cycle logs include attempted, skipped, successful, failed, service-failure, isolated-failure, and duplicate-lookups-avoided counts.
+
+Only snapshots fetched successfully during the current polling cycle can trigger map-change announcements or contribute to the global fresh-player presence total. Last-known snapshots remain diagnostic-only during Keeper failures.
+
 ## Announcement and listen channels
 
 Announcement/listen channel settings are per guild and stored in the database.
@@ -422,6 +432,12 @@ Mobile stacks team tables vertically. Wide displays two teams side by side and s
 
 Console/Keeper fallback remains the compact name-only roster.
 
+## Management bootstrap behavior
+
+When `management_min_role_id` is `0`, management commands are available only to the Discord guild owner and members with Discord's **Administrator** permission. This allows a newly added guild to configure `/setmanagementrole` immediately without trying to infer who invited the bot.
+
+After a management role is configured, the normal role-threshold behavior applies. The guild owner and Discord Administrators always retain the management bypass.
+
 ## Status role behavior
 
 `status_min_role_id` is per guild.
@@ -461,13 +477,13 @@ Background version checks are operational only: results are written to the Docke
 - `/defaultserver remove server:<selection>`
 - `/defaultserver list`
 - `/setannouncementchannel channel:<channel>`
-- `/addlistenchannel channels:<channel list>`
-- `/dellistenchannel channels:<channel list>`
+- `/addlistenchannel channel:<text channel>` — add one listen channel using Discord's native channel selector.
+- `/dellistenchannel channel:<text channel>` — remove one listen channel using Discord's native channel selector.
 - `/setmanagementrole [role:<role>]`
 - `/setstatusrole [role:<role>]`
-- `/setmaprole map_search:<map> [role:<role>] [message:<text>] [disable:true]`
+- `/setmaprole map_search:<map selection> [role:<role>] [message:<text>] [disable:true]` — map autocomplete is backed by the full `bf4_maps` table.
 - `/editmaprole map_name:<selection> [role:<role>]`
-- `/delmaprole map_search:<map>`
+- `/delmaprole map_search:<map selection>` — uses the same full-map autocomplete as `/setmaprole`; `/editmaprole` intentionally lists only maps configured for that guild.
 
 `/reload`, `/setinterval`, and `/setpresenceupdate` were removed in v2.0.0 because global settings are environment-based and guild runtime state is database-backed.
 

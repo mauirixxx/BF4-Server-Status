@@ -4,6 +4,29 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.0.2] - 2026-08-18
+
+### Added
+- Added approximately 3-second spacing between unique Keeper snapshot requests in the global monitor.
+- Added a Keeper service-level circuit breaker/backoff for repeated HTTP 403/429/5xx, connection, and timeout failures.
+- Added monitor-cycle attempted/skipped/service-failure/isolated-failure/circuit state logging.
+- Added full `bf4_maps` database autocomplete to `/setmaprole` and `/delmaprole`.
+
+### Changed
+- `/addlistenchannel` now uses Discord's native single text-channel selector and adds one channel per invocation.
+- `/dellistenchannel` now uses Discord's native single text-channel selector and removes one channel per invocation.
+- `/setmaprole` resolves the selected `bf4_maps.map_key` directly instead of relying on fuzzy manual map matching.
+- `/delmaprole` uses the full BF4 map catalog for autocomplete; `/editmaprole` remains configured-map-only.
+- Documented/validated that `management_min_role_id=0` permits the guild owner and Discord Administrators to bootstrap management configuration, while other members remain denied.
+- Suppressed only the irrelevant optional PyNaCl and davey Discord voice-support startup warnings.
+- Updated README/Discord documentation and Docker image/application version for v2.0.2.
+
+### Reliability
+- Stale Keeper snapshots remain diagnostic-only and cannot trigger fresh map-change announcements or contribute to fresh player totals during failed cycles.
+- The Keeper circuit breaker stops the remainder of a polling cycle after three consecutive service-level failures and applies a short backoff before retrying.
+- Isolated failures such as a per-server 404 do not count toward the service-level circuit-breaker threshold.
+- No database schema migration is required for this patch.
+
 ## [v2.0.1] - 2026-08-18
 
 ### Changed
