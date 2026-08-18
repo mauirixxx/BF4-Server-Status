@@ -4,6 +4,21 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.0.4] - 2026-08-18
+
+### Database readability
+- Added `guild_name`, `last_map_name`, and `announcement_channel_name` snapshots to `guild_server_state`.
+- Added `guild_name`, `map_name`, and `role_name` snapshots to `guild_map_role_pings`.
+- Added `guild_name` and `channel_name` snapshots to `guild_listen_channels`.
+- Rebuilt/copied `guild_settings`, `guild_server_state`, `guild_map_role_pings`, and `guild_listen_channels` in Alembic revision `0003_v2_0_4` so human-readable names are physically adjacent to their authoritative IDs/keys.
+- Preserved existing table data, primary keys, foreign keys, and constraints during the transactional migration.
+- Backfilled map names from `bf4_maps` during migration; Discord-resolved guild/channel/role names are refreshed during startup reconciliation.
+- Added ongoing snapshot synchronization for guild/channel/role rename and deletion events and relevant configuration changes.
+- IDs and keys remain authoritative; readable names are nullable informational snapshots intended to make direct database troubleshooting easier.
+
+### Changed
+- Updated application/Docker image version and documentation for v2.0.4.
+
 ## [v2.0.3] - 2026-08-18
 
 ### Added

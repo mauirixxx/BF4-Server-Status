@@ -41,7 +41,9 @@ class GuildListenChannel(Base):
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
         primary_key=True, autoincrement=False
     )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class BF4Server(Base):
@@ -79,11 +81,14 @@ class GuildMapRolePing(Base):
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
         primary_key=True, autoincrement=False
     )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     map_key: Mapped[str] = mapped_column(
         String(100), ForeignKey("bf4_maps.map_key"),
         primary_key=True
     )
+    map_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     message: Mapped[str] = mapped_column(Text, nullable=False)
 
 
@@ -93,12 +98,15 @@ class GuildServerState(Base):
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
         primary_key=True, autoincrement=False
     )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     server_guid: Mapped[str] = mapped_column(
         String(36), ForeignKey("bf4_servers.server_guid"),
         primary_key=True
     )
     last_map_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_map_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     announcement_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    announcement_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     announcement_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 

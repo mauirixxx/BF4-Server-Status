@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.3
+# BF4 Server Watcher v2.0.4
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -153,6 +153,22 @@ status_min_role_name
 ```
 
 The name snapshots are refreshed during guild reconciliation/startup and when the corresponding guild setting is changed. Guild, configured-channel, and configured-role rename events also refresh them when ServerWatcher can resolve the updated Discord object.
+
+For v2.0.4, the same readability model is extended to operational guild tables. IDs/keys remain authoritative, while nullable names are physically placed beside them for convenient direct database inspection:
+
+```text
+guild_server_state
+guild_id | guild_name | server_guid | last_map_key | last_map_name |
+announcement_channel_id | announcement_channel_name | announcement_message_id
+
+guild_map_role_pings
+guild_id | guild_name | map_key | map_name | role_id | role_name | message
+
+guild_listen_channels
+guild_id | guild_name | channel_id | channel_name
+```
+
+Alembic rebuilds/copies these tables, plus `guild_settings`, during the v2.0.4 migration so the readable columns are physically adjacent to their IDs/keys in PostgreSQL/MySQL/MariaDB rather than merely appended.
 
 Listen channels use `guild_listen_channels`, and map-role configuration uses `guild_map_role_pings`.
 

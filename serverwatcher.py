@@ -31,7 +31,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.3"
+BOT_VERSION = "v2.0.4"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -666,6 +666,61 @@ def refresh_guild_settings_names(discord_guild: discord.Guild):
         sync_guild_settings_names(discord_guild, settings)
 
 
+def refresh_guild_readable_snapshots(discord_guild: discord.Guild):
+    """Refresh all human-readable snapshots for one guild."""
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, discord_guild.id)
+        if settings is not None:
+            sync_guild_settings_names(discord_guild, settings)
+
+        map_names = {
+            row.map_key: row.map_name
+            for row in session.scalars(select(BF4Map)).all()
+        }
+
+        listen_rows = session.scalars(
+            select(GuildListenChannel).where(
+                GuildListenChannel.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in listen_rows:
+            row.guild_name = discord_guild.name
+            channel = discord_guild.get_channel(int(row.channel_id))
+            row.channel_name = channel.name if channel is not None else None
+
+        ping_rows = session.scalars(
+            select(GuildMapRolePing).where(
+                GuildMapRolePing.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in ping_rows:
+            row.guild_name = discord_guild.name
+            row.map_name = map_names.get(row.map_key)
+            role = (
+                discord_guild.get_role(int(row.role_id))
+                if row.role_id
+                else None
+            )
+            row.role_name = role.name if role is not None else None
+
+        state_rows = session.scalars(
+            select(GuildServerState).where(
+                GuildServerState.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in state_rows:
+            row.guild_name = discord_guild.name
+            row.last_map_name = map_names.get(row.last_map_key)
+            channel = (
+                discord_guild.get_channel(int(row.announcement_channel_id))
+                if row.announcement_channel_id
+                else None
+            )
+            row.announcement_channel_name = (
+                channel.name if channel is not None else None
+            )
+
+
 def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
     now = utcnow()
     created = False
@@ -726,11 +781,15 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
         if locker is None and created:
             session.add(GuildMapRolePing(
                 guild_id=discord_guild.id,
+                guild_name=discord_guild.name,
                 map_key=LOCKER_KEY,
+                map_name="Operation Locker",
                 role_id=0,
+                role_name=None,
                 message=LOCKER_MESSAGE,
             ))
 
+    refresh_guild_readable_snapshots(discord_guild)
     log.info(
         "Guild bootstrap guild=%s name=%r created=%s rejoined=%s aaa_default=%s",
         discord_guild.id, discord_guild.name, created, rejoined, created
@@ -1178,7 +1237,7 @@ def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
         # Legacy config may replace channel/role IDs after initial guild
         # reconciliation, so refresh their readable snapshots before marking
         # the import complete.
-        refresh_guild_settings_names(target)
+        refresh_guild_readable_snapshots(target)
 
         set_legacy_state("completed", target.id)
         log.info(
@@ -1276,10 +1335,17 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         with SessionLocal.begin() as session:
             state = session.get(GuildServerState, (guild_id, gs.server_guid))
             if state is None:
-                state = GuildServerState(guild_id=guild_id, server_guid=gs.server_guid)
+                state = GuildServerState(
+                    guild_id=guild_id,
+                    guild_name=(guild.name if guild else None),
+                    server_guid=gs.server_guid,
+                )
                 session.add(state)
+            state.guild_name = guild.name if guild else None
             state.last_map_key = status["map_key"]
+            state.last_map_name = status["map_name"]
             state.announcement_channel_id = channel.id
+            state.announcement_channel_name = channel.name
             state.announcement_message_id = sent.id
         log.info(
             "Announcement posted guild=%s channel=%s message=%s server=%s map=%s map_role=%s",
@@ -1451,12 +1517,19 @@ async def monitor_cycle():
                     (guild_id, guid),
                 )
                 if state is None:
+                    discord_guild = client.get_guild(guild_id)
                     state = GuildServerState(
                         guild_id=guild_id,
+                        guild_name=(
+                            discord_guild.name
+                            if discord_guild is not None
+                            else None
+                        ),
                         server_guid=guid,
                     )
                     session.add(state)
                 state.last_map_key = status["map_key"]
+                state.last_map_name = status["map_name"]
 
             log.info(
                 "Monitor state seeded guild=%s server=%s map=%s",
@@ -1621,7 +1694,7 @@ async def on_guild_remove(guild):
 async def on_guild_channel_update(before, after):
     if before.name != after.name:
         try:
-            refresh_guild_settings_names(after.guild)
+            refresh_guild_readable_snapshots(after.guild)
             log.info(
                 "Guild settings channel name refreshed guild=%s channel=%s old=%r new=%r",
                 after.guild.id,
@@ -1642,7 +1715,7 @@ async def on_guild_channel_update(before, after):
 @client.event
 async def on_guild_channel_delete(channel):
     try:
-        refresh_guild_settings_names(channel.guild)
+        refresh_guild_readable_snapshots(channel.guild)
         log.info(
             "Guild settings channel snapshots refreshed after delete guild=%s channel=%s",
             channel.guild.id,
@@ -1661,7 +1734,7 @@ async def on_guild_channel_delete(channel):
 @client.event
 async def on_guild_role_delete(role):
     try:
-        refresh_guild_settings_names(role.guild)
+        refresh_guild_readable_snapshots(role.guild)
         log.info(
             "Guild settings role snapshots refreshed after delete guild=%s role=%s",
             role.guild.id,
@@ -1681,7 +1754,7 @@ async def on_guild_role_delete(role):
 async def on_guild_role_update(before, after):
     if before.name != after.name:
         try:
-            refresh_guild_settings_names(after.guild)
+            refresh_guild_readable_snapshots(after.guild)
             log.info(
                 "Guild settings role name refreshed guild=%s role=%s old=%r new=%r",
                 after.guild.id,
@@ -2048,7 +2121,9 @@ async def addlistenchannel(
             session.add(
                 GuildListenChannel(
                     guild_id=interaction.guild.id,
+                    guild_name=interaction.guild.name,
                     channel_id=channel.id,
+                    channel_name=channel.name,
                 )
             )
             added = True
@@ -2211,13 +2286,19 @@ async def setmaprole(
             session.add(
                 GuildMapRolePing(
                     guild_id=interaction.guild.id,
+                    guild_name=interaction.guild.name,
                     map_key=map_row.map_key,
+                    map_name=map_row.map_name,
                     role_id=role_id,
+                    role_name=(role.name if role and role_id else None),
                     message=text,
                 )
             )
         else:
+            ping.guild_name = interaction.guild.name
+            ping.map_name = map_row.map_name
             ping.role_id = role_id
+            ping.role_name = role.name if role and role_id else None
             ping.message = text
 
     await interaction.followup.send(
@@ -2272,8 +2353,20 @@ class EditMapRoleModal(discord.ui.Modal):
                         target_name=self.map_name,
                     )
                     return
+                ping.guild_name = interaction.guild.name if interaction.guild else ping.guild_name
+                ping.map_name = self.map_name
                 if self.role_id is not None:
                     ping.role_id = self.role_id
+                    selected_role = (
+                        interaction.guild.get_role(self.role_id)
+                        if interaction.guild
+                        else None
+                    )
+                    ping.role_name = (
+                        selected_role.name
+                        if selected_role is not None
+                        else None
+                    )
                 ping.message = str(self.message_input.value).strip()
             await interaction.response.send_message(f"✅ Updated map role ping for **{self.map_name}**.", ephemeral=True)
             audit_command(

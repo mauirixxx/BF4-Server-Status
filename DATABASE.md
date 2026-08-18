@@ -27,3 +27,15 @@ DATABASE_URL=mariadb+pymysql://bf4_serverwatcher:PASSWORD@host.docker.internal:3
 `docker-compose.yml` maps `host.docker.internal` to the Docker host so a database running on the host can be reached from the container.
 
 Do not commit real database passwords or connection strings.
+
+
+## Human-readable operational snapshots (v2.0.4)
+
+Discord snowflake IDs, BF4 map keys, and server GUIDs remain authoritative. For easier administrator troubleshooting with direct SQL queries, selected guild-scoped operational tables also store nullable human-readable snapshots immediately beside their related identifiers.
+
+- `guild_settings`: guild, announcement-channel, management-role, and status-role names.
+- `guild_server_state`: guild name, resolved BF4 map name, and announcement-channel name.
+- `guild_map_role_pings`: guild name, resolved BF4 map name, and Discord role name.
+- `guild_listen_channels`: guild name and channel name.
+
+Alembic revision `0003_v2_0_4` rebuilds/copies these tables to establish the intended physical column order while preserving existing data and constraints. Map names are SQL-resolved from `bf4_maps`; Discord-resolved names are synchronized during guild reconciliation and relevant runtime configuration/rename/delete events. An unresolved Discord object leaves its readable snapshot `NULL` without invalidating the authoritative ID.
