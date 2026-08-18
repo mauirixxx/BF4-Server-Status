@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.4
+# BF4 Server Watcher v2.0.5
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -463,13 +463,16 @@ When `management_min_role_id` is `0`, management commands are available only to 
 
 After a management role is configured, the normal role-threshold behavior applies. The guild owner and Discord Administrators always retain the management bypass.
 
-## Status role behavior
+## User-command status role behavior
 
-`status_min_role_id` is per guild.
+`status_min_role_id` is per guild and gates all ordinary user-facing commands: `!help`, `!list`, `!status`, and `!version`.
 
-- `0` — anyone in an allowed listen channel may use normal `!status`.
-- Valid role ID — that role, higher roles, Administrators, and the guild owner may use it.
-- Invalid nonzero role ID — Administrators/guild owner retain access until corrected.
+- `0` — ordinary user commands remain open in their existing allowed channels.
+- Valid nonzero role ID — an ordinary user must **specifically possess that exact Discord role**. A different role that merely sits higher in Discord's hierarchy does not qualify.
+- Invalid nonzero role ID — ordinary users are denied until the setting is corrected.
+- Members authorized for ServerWatcher management bypass the status-role requirement. This includes the existing management-role authorization model plus the guild owner/Discord Administrator bypass.
+
+Management/configuration commands remain governed by `management_min_role_id`; they do not additionally require the status role.
 
 ## Version checking
 
@@ -488,6 +491,8 @@ Background version checks are operational only: results are written to the Docke
 - `!status <server-name> players`
 - `!version`
 - `!announce` — management-only alias for `/announce`
+
+All ordinary commands above inherit the common `status_min_role_id` gate described above.
 
 ## Management commands
 

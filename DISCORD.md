@@ -93,11 +93,11 @@ Managers may use management commands in the configured announcement channel or l
 
 When the configured management role is `0`, Discord Administrators and the guild owner may manage ServerWatcher.
 
-`/setstatusrole` controls normal `!status` access.
+`/setstatusrole` controls access to all ordinary user commands: `!help`, `!list`, `!status`, and `!version`.
 
-A status role of `0` allows everyone in configured listen channels to use `!status`.
+A status role of `0` leaves ordinary user commands open in their existing allowed channels. When a nonzero status role is configured, an ordinary user must actually possess that exact Discord role; having only a higher-positioned Discord role does not satisfy the check.
 
-Discord Administrators and the guild owner continue to bypass role thresholds.
+Members authorized for ServerWatcher management bypass the user-command status-role requirement. Guild owners and Discord Administrators continue to receive their existing management bypass.
 
 ## Servers and defaults
 

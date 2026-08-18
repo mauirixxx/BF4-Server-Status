@@ -4,6 +4,20 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.0.5] - 2026-08-18
+
+### Permissions
+- Extended `status_min_role_id` from `!status` only to all ordinary user-facing commands: `!help`, `!list`, `!status`, and `!version`.
+- Changed status-role authorization from Discord role-position threshold semantics to exact role membership. When `status_min_role_id` is nonzero, an ordinary user must actually possess that specific configured role; a different role higher in the hierarchy does not qualify.
+- Preserved `status_min_role_id=0` as open access for ordinary user commands subject to their existing channel restrictions.
+- Management-authorized members bypass the user-command status-role requirement using the existing management authorization model, including guild owner/Discord Administrator bypass.
+- Management/configuration commands continue to use `management_min_role_id` and are not additionally gated by `status_min_role_id`.
+- Added consistent operational logging and database command-audit metadata for user-command denials caused by the configured status role.
+
+### Changed
+- Updated application/Docker image version and permission documentation for v2.0.5.
+- No database schema migration is required for this patch.
+
 ## [v2.0.4] - 2026-08-18
 
 ### Database readability

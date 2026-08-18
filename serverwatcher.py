@@ -31,7 +31,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.4"
+BOT_VERSION = "v2.0.5"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -831,13 +831,33 @@ def has_role_or_higher(member: discord.Member, required_role_id: int, zero_allow
 
 
 def can_manage(member: discord.Member):
-    # has_role_or_higher always permits the guild owner/Discord Administrators.
-    # With management_min_role_id=0, everyone else remains denied until a role
-    # is explicitly configured.
+    # Management authorization intentionally retains the established role
+    # threshold behavior plus guild-owner/Administrator bypass.
     return has_role_or_higher(
         member,
         get_settings(member.guild.id).management_min_role_id,
     )
+
+
+def has_exact_role(member: discord.Member, role_id: int) -> bool:
+    """Return True only when the member actually possesses this role ID."""
+    target = int(role_id or 0)
+    return bool(target and any(role.id == target for role in member.roles))
+
+
+def can_use_user_commands(member: discord.Member) -> bool:
+    """Common v2.0.5 user-command role gate.
+
+    Management-authorized members bypass the status role. Otherwise a nonzero
+    status_min_role_id requires exact membership in that specific role; Discord
+    role hierarchy/position is intentionally ignored.
+    """
+    if can_manage(member):
+        return True
+    settings = get_settings(member.guild.id)
+    if int(settings.status_min_role_id or 0) == 0:
+        return True
+    return has_exact_role(member, settings.status_min_role_id)
 
 
 def management_channel_allowed(interaction_or_message):
@@ -855,13 +875,39 @@ def management_channel_allowed(interaction_or_message):
     return interaction_or_message.channel.id in allowed
 
 
-def can_use_status(message: discord.Message):
-    if message.guild is None or not isinstance(message.author, discord.Member):
-        return False
+async def deny_user_command_role(
+    message: discord.Message,
+    command_name: str,
+    started: float,
+):
     settings = get_settings(message.guild.id)
-    return (
-        message.channel.id in listen_channel_ids(message.guild.id)
-        and has_role_or_higher(message.author, settings.status_min_role_id, zero_allows=True)
+    role_id = int(settings.status_min_role_id or 0)
+    role = message.guild.get_role(role_id) if role_id else None
+    role_label = f"@{role.name}" if role is not None else f"role ID {role_id}"
+    log.info(
+        "User command denied guild=%s channel=%s user=%s command=%s "
+        "reason=status_role_required role=%s",
+        message.guild.id,
+        message.channel.id,
+        message.author.id,
+        command_name,
+        role_id,
+    )
+    audit_command(
+        guild=message.guild,
+        channel=message.channel,
+        user=message.author,
+        command_name=command_name,
+        command_type="prefix",
+        success=False,
+        started=started,
+        result_code="status_role_required",
+        target_type="role",
+        target_id=role_id,
+        target_name=role.name if role is not None else settings.status_min_role_name,
+    )
+    await message.channel.send(
+        f"⛔ You must have the configured status role ({role_label}) to use that command."
     )
 
 
@@ -2218,7 +2264,7 @@ async def setmanagementrole(interaction: discord.Interaction, role: discord.Role
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmanagementrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
 
-@tree.command(name="setstatusrole", description="Set minimum role for normal !status")
+@tree.command(name="setstatusrole", description="Set the exact role required for ordinary user commands")
 async def setstatusrole(interaction: discord.Interaction, role: discord.Role | None = None):
     started = time.perf_counter()
     if not await prepare_management(interaction):
@@ -2229,7 +2275,7 @@ async def setstatusrole(interaction: discord.Interaction, role: discord.Role | N
         settings.guild_name = interaction.guild.name
         settings.status_min_role_id = role_id
         settings.status_min_role_name = role.name if role else None
-    await interaction.followup.send(f"✅ Status role set to **{role.name if role else '0 (everyone in listen channels)'}**.", ephemeral=True)
+    await interaction.followup.send(f"✅ User-command status role set to **{role.name if role else '0 (open in allowed channels)'}**.", ephemeral=True)
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setstatusrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
 
@@ -2597,7 +2643,7 @@ def help_messages(member: discord.Member):
         f"**Announcement channel:** {settings.announcement_channel_id}",
         "**Listen channels:** " + (", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id))) or "None"),
         f"**Management minimum role:** {settings.management_min_role_id}",
-        f"**Status minimum role:** {settings.status_min_role_id}",
+        f"**User-command required role:** {settings.status_min_role_id}",
         f"**Map role pings:**\n{map_roles_text(member.guild)}",
     ])
     return [basic, mgmt, config]
@@ -2616,6 +2662,9 @@ async def on_message(message: discord.Message):
         if command == "!version":
             if message.channel.id not in listen_channel_ids(message.guild.id) and not (can_manage(message.author) and management_channel_allowed(message)):
                 return
+            if not can_use_user_commands(message.author):
+                await deny_user_command_role(message, "version", started)
+                return
             await asyncio.to_thread(refresh_latest_version)
             await message.channel.send(version_text())
             audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="version", command_type="prefix", success=True, started=started, result_code="ok")
@@ -2624,6 +2673,9 @@ async def on_message(message: discord.Message):
         if command == "!help":
             if message.channel.id not in listen_channel_ids(message.guild.id) and not (can_manage(message.author) and management_channel_allowed(message)):
                 return
+            if not can_use_user_commands(message.author):
+                await deny_user_command_role(message, "help", started)
+                return
             for chunk in help_messages(message.author):
                 await message.channel.send(chunk)
             audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="help", command_type="prefix", success=True, started=started, result_code="ok")
@@ -2631,6 +2683,9 @@ async def on_message(message: discord.Message):
 
         if command == "!list":
             if message.channel.id not in listen_channel_ids(message.guild.id):
+                return
+            if not can_use_user_commands(message.author):
+                await deny_user_command_role(message, "list", started)
                 return
             await message.channel.send(f"```text\n{platform_server_list(message.guild.id)}\n```")
             audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="list", command_type="prefix", success=True, started=started, result_code="ok")
@@ -2655,7 +2710,10 @@ async def on_message(message: discord.Message):
             return
 
         if command == "!status":
-            if not can_use_status(message):
+            if message.channel.id not in listen_channel_ids(message.guild.id):
+                return
+            if not can_use_user_commands(message.author):
+                await deny_user_command_role(message, "status", started)
                 return
             payload = raw[len("!status"):].strip()
             players = bool(re.search(r"\s+players$", payload, flags=re.I))
