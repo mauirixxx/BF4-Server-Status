@@ -130,6 +130,9 @@ The BF4 map catalog is stored in the database and is shared by all guilds.
 
 A role ID of `0` means the map ping is disabled.
 
+
+Map-role pings are integrated into automatic map-change announcements. When a configured map role is enabled, its role mention and message appear directly below `BF4 Map Change` in the same Discord message. A `role_id` of `0` omits the role line. ServerWatcher does not send a second standalone role-ping message.
+
 ## User commands
 
 Normal users use:

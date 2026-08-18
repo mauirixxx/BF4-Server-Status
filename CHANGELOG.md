@@ -4,6 +4,25 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.0.3] - 2026-08-18
+
+### Added
+- Added Alembic revision `0002_v2_0_3` with nullable `guild_name`, `announcement_channel_name`, `management_min_role_name`, and `status_min_role_name` columns on `guild_settings`.
+- Added startup/reconciliation and command-time synchronization of human-readable guild/channel/role names while keeping Discord IDs authoritative.
+- Added runtime refresh of guild-settings name snapshots when a guild, configured channel, or configured role is renamed.
+
+### Changed
+- Integrated enabled map-role mention/message content directly into the same automatic BF4 map-change announcement.
+- Removed the separate standalone automatic map-role message send path, reducing map-change Discord sends and cleanup state to one persisted announcement message.
+- Automatic announcement allowed-mentions remain restricted to roles only; user/everyone mentions are disabled.
+- Removed duplicate discord.py startup login/Gateway presentation by using ServerWatcher's existing Docker-friendly logging handler as the single output path.
+- Updated README/Discord documentation and Docker image/application version for v2.0.3.
+
+### Database
+- Existing `guild_name` values are backfilled into `guild_settings` by the new Alembic migration.
+- Discord channel/role names are populated during the first guild reconciliation after migration because those names must be resolved from Discord rather than SQL.
+- No existing command-audit or guild/server data is removed.
+
 ## [v2.0.2] - 2026-08-18
 
 ### Added

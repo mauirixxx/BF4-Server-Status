@@ -26,9 +26,13 @@ class GuildSettings(Base):
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
         primary_key=True, autoincrement=False
     )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     announcement_channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    announcement_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     management_min_role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    management_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status_min_role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class GuildListenChannel(Base):

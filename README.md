@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.2
+# BF4 Server Watcher v2.0.3
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -136,14 +136,23 @@ There is no enabled/disabled state. If a guild tracks a server, the relationship
 
 ### Guild settings
 
-Guild scalar settings are stored in `guild_settings`:
+Guild scalar settings are stored in `guild_settings`. Discord IDs remain authoritative, while nullable human-readable names are maintained alongside them for easier direct database inspection:
 
 ```text
 guild_id                  PRIMARY KEY
+guild_name
+
 announcement_channel_id
+announcement_channel_name
+
 management_min_role_id
+management_min_role_name
+
 status_min_role_id
+status_min_role_name
 ```
+
+The name snapshots are refreshed during guild reconciliation/startup and when the corresponding guild setting is changed. Guild, configured-channel, and configured-role rename events also refresh them when ServerWatcher can resolve the updated Discord object.
 
 Listen channels use `guild_listen_channels`, and map-role configuration uses `guild_map_role_pings`.
 
@@ -486,6 +495,20 @@ Background version checks are operational only: results are written to the Docke
 - `/delmaprole map_search:<map selection>` — uses the same full-map autocomplete as `/setmaprole`; `/editmaprole` intentionally lists only maps configured for that guild.
 
 `/reload`, `/setinterval`, and `/setpresenceupdate` were removed in v2.0.0 because global settings are environment-based and guild runtime state is database-backed.
+
+## Integrated map-role announcements
+
+When an automatic map change matches an enabled guild map-role configuration, the role mention and configured map message are included directly inside the same automatic announcement:
+
+```text
+🎮 BF4 Map Change
+@Role Configured map-role message
+🖥️ Server: Server Name
+🗺️ Now Playing: Map Name
+👥 Players: 64/64
+```
+
+If the configured `role_id` is `0`, the role line is omitted. ServerWatcher no longer sends a second standalone map-role message, so one automatic map change produces one persisted announcement message and requires only one replacement/deletion lifecycle.
 
 ## Manual announcement cleanup
 

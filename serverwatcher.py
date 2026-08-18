@@ -31,7 +31,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.2"
+BOT_VERSION = "v2.0.3"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -306,14 +306,21 @@ def build_status_message(title: str, status: dict) -> str:
     )
 
 
-def build_map_announcement(server_name: str, status: dict) -> str:
-    """Build map-change content only; version/update notices are intentionally excluded."""
-    return (
-        "🎮 **BF4 Map Change**\n"
-        f"🖥️ Server: **{server_name}**\n"
-        f"🗺️ Now Playing: **{status['map_name']}**\n"
-        f"👥 Players: **{status['players']}/{status['max_players']}**"
-    )
+def build_map_announcement(
+    server_name: str,
+    status: dict,
+    role_line: str | None = None,
+) -> str:
+    """Build one complete automatic map-change message."""
+    lines = ["🎮 **BF4 Map Change**"]
+    if role_line:
+        lines.append(role_line)
+    lines.extend([
+        f"🖥️ Server: **{server_name}**",
+        f"🗺️ Now Playing: **{status['map_name']}**",
+        f"👥 Players: **{status['players']}/{status['max_players']}**",
+    ])
+    return "\n".join(lines)
 
 
 def player_display_name(player):
@@ -616,6 +623,49 @@ def audit_command(
         )
 
 
+def sync_guild_settings_names(
+    discord_guild: discord.Guild,
+    settings: GuildSettings,
+):
+    """Refresh informational Discord names while keeping IDs authoritative."""
+    settings.guild_name = discord_guild.name
+
+    announcement = (
+        discord_guild.get_channel(int(settings.announcement_channel_id))
+        if settings.announcement_channel_id
+        else None
+    )
+    settings.announcement_channel_name = (
+        announcement.name if announcement is not None else None
+    )
+
+    management_role = (
+        discord_guild.get_role(int(settings.management_min_role_id))
+        if settings.management_min_role_id
+        else None
+    )
+    settings.management_min_role_name = (
+        management_role.name if management_role is not None else None
+    )
+
+    status_role = (
+        discord_guild.get_role(int(settings.status_min_role_id))
+        if settings.status_min_role_id
+        else None
+    )
+    settings.status_min_role_name = (
+        status_role.name if status_role is not None else None
+    )
+
+
+def refresh_guild_settings_names(discord_guild: discord.Guild):
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, discord_guild.id)
+        if settings is None:
+            return
+        sync_guild_settings_names(discord_guild, settings)
+
+
 def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
     now = utcnow()
     created = False
@@ -639,12 +689,18 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
 
         settings = session.get(GuildSettings, discord_guild.id)
         if settings is None:
-            session.add(GuildSettings(
+            settings = GuildSettings(
                 guild_id=discord_guild.id,
+                guild_name=discord_guild.name,
                 announcement_channel_id=0,
+                announcement_channel_name=None,
                 management_min_role_id=0,
+                management_min_role_name=None,
                 status_min_role_id=0,
-            ))
+                status_min_role_name=None,
+            )
+            session.add(settings)
+        sync_guild_settings_names(discord_guild, settings)
 
         aaa = session.get(BF4Server, AAA_GUID)
         if aaa is None:
@@ -1119,6 +1175,11 @@ def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
                     ping.message = message
                 map_count += 1
 
+        # Legacy config may replace channel/role IDs after initial guild
+        # reconciliation, so refresh their readable snapshots before marking
+        # the import complete.
+        refresh_guild_settings_names(target)
+
         set_legacy_state("completed", target.id)
         log.info(
             "Legacy import complete guild=%s imported_servers=%s listen_channels=%s map_roles=%s",
@@ -1167,6 +1228,17 @@ async def delete_discord_message(guild_id, channel_id, message_id):
         return False
 
 
+def active_map_role_line(guild_id: int, map_key: str | None):
+    """Return the configured role mention/message for this guild/map, if enabled."""
+    if not map_key:
+        return None, None
+    with SessionLocal() as session:
+        ping = session.get(GuildMapRolePing, (guild_id, map_key))
+        if not ping or not ping.role_id:
+            return None, None
+        return f"<@&{ping.role_id}> {ping.message}", int(ping.role_id)
+
+
 async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *, map_change=True):
     settings = get_settings(guild_id)
     if not settings.announcement_channel_id:
@@ -1185,7 +1257,22 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         await delete_discord_message(guild_id, old_channel, old_message)
 
     try:
-        sent = await channel.send(build_map_announcement(gs.display_name, status))
+        role_line, role_id = active_map_role_line(
+            guild_id,
+            status.get("map_key"),
+        )
+        sent = await channel.send(
+            build_map_announcement(
+                gs.display_name,
+                status,
+                role_line=role_line,
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
+        )
         with SessionLocal.begin() as session:
             state = session.get(GuildServerState, (guild_id, gs.server_guid))
             if state is None:
@@ -1195,10 +1282,14 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
             state.announcement_channel_id = channel.id
             state.announcement_message_id = sent.id
         log.info(
-            "Announcement posted guild=%s channel=%s message=%s server=%s map=%s",
-            guild_id, channel.id, sent.id, gs.server_guid, status["map_key"]
+            "Announcement posted guild=%s channel=%s message=%s server=%s map=%s map_role=%s",
+            guild_id,
+            channel.id,
+            sent.id,
+            gs.server_guid,
+            status["map_key"],
+            role_id or 0,
         )
-        await maybe_send_map_role(guild_id, channel, status["map_key"])
         return sent
     except Exception as exc:
         log.error(
@@ -1206,26 +1297,6 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
             guild_id, channel.id, gs.server_guid, type(exc).__name__, str(exc)
         )
         return None
-
-
-async def maybe_send_map_role(guild_id, channel, map_key):
-    if not map_key:
-        return
-    with SessionLocal() as session:
-        ping = session.get(GuildMapRolePing, (guild_id, map_key))
-    if not ping or not ping.role_id:
-        return
-    try:
-        await channel.send(
-            f"<@&{ping.role_id}> {ping.message}",
-            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-        )
-        log.info("Map role ping sent guild=%s channel=%s map=%s role=%s", guild_id, channel.id, map_key, ping.role_id)
-    except Exception as exc:
-        log.error(
-            "Map role ping failed guild=%s channel=%s map=%s role=%s error=%s message=%r",
-            guild_id, channel.id, map_key, ping.role_id, type(exc).__name__, str(exc)
-        )
 
 
 async def monitor_cycle():
@@ -1544,6 +1615,88 @@ async def on_guild_remove(guild):
         mark_guild_left(guild)
     except Exception as exc:
         log.error("Guild leave state failed guild=%s error=%s message=%r", guild.id, type(exc).__name__, str(exc))
+
+
+@client.event
+async def on_guild_channel_update(before, after):
+    if before.name != after.name:
+        try:
+            refresh_guild_settings_names(after.guild)
+            log.info(
+                "Guild settings channel name refreshed guild=%s channel=%s old=%r new=%r",
+                after.guild.id,
+                after.id,
+                before.name,
+                after.name,
+            )
+        except Exception as exc:
+            log.error(
+                "Guild settings channel name refresh failed guild=%s channel=%s error=%s message=%r",
+                after.guild.id,
+                after.id,
+                type(exc).__name__,
+                str(exc),
+            )
+
+
+@client.event
+async def on_guild_channel_delete(channel):
+    try:
+        refresh_guild_settings_names(channel.guild)
+        log.info(
+            "Guild settings channel snapshots refreshed after delete guild=%s channel=%s",
+            channel.guild.id,
+            channel.id,
+        )
+    except Exception as exc:
+        log.error(
+            "Guild settings channel delete refresh failed guild=%s channel=%s error=%s message=%r",
+            channel.guild.id,
+            channel.id,
+            type(exc).__name__,
+            str(exc),
+        )
+
+
+@client.event
+async def on_guild_role_delete(role):
+    try:
+        refresh_guild_settings_names(role.guild)
+        log.info(
+            "Guild settings role snapshots refreshed after delete guild=%s role=%s",
+            role.guild.id,
+            role.id,
+        )
+    except Exception as exc:
+        log.error(
+            "Guild settings role delete refresh failed guild=%s role=%s error=%s message=%r",
+            role.guild.id,
+            role.id,
+            type(exc).__name__,
+            str(exc),
+        )
+
+
+@client.event
+async def on_guild_role_update(before, after):
+    if before.name != after.name:
+        try:
+            refresh_guild_settings_names(after.guild)
+            log.info(
+                "Guild settings role name refreshed guild=%s role=%s old=%r new=%r",
+                after.guild.id,
+                after.id,
+                before.name,
+                after.name,
+            )
+        except Exception as exc:
+            log.error(
+                "Guild settings role name refresh failed guild=%s role=%s error=%s message=%r",
+                after.guild.id,
+                after.id,
+                type(exc).__name__,
+                str(exc),
+            )
 
 
 @client.event
@@ -1869,7 +2022,9 @@ async def setannouncementchannel(interaction: discord.Interaction, channel: disc
         return
     with SessionLocal.begin() as session:
         settings = session.get(GuildSettings, interaction.guild.id)
+        settings.guild_name = interaction.guild.name
         settings.announcement_channel_id = channel.id
+        settings.announcement_channel_name = channel.name
     await interaction.followup.send(f"✅ Announcement channel set to **#{channel.name}**.", ephemeral=True)
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setannouncementchannel", command_type="slash", success=True, started=started, result_code="updated", target_type="channel", target_id=channel.id, target_name=channel.name)
 
@@ -1980,7 +2135,10 @@ async def setmanagementrole(interaction: discord.Interaction, role: discord.Role
         return
     role_id = role.id if role else 0
     with SessionLocal.begin() as session:
-        session.get(GuildSettings, interaction.guild.id).management_min_role_id = role_id
+        settings = session.get(GuildSettings, interaction.guild.id)
+        settings.guild_name = interaction.guild.name
+        settings.management_min_role_id = role_id
+        settings.management_min_role_name = role.name if role else None
     await interaction.followup.send(f"✅ Management minimum role set to **{role.name if role else '0 (Administrators/server owner)'}**.", ephemeral=True)
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setmanagementrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
@@ -1992,7 +2150,10 @@ async def setstatusrole(interaction: discord.Interaction, role: discord.Role | N
         return
     role_id = role.id if role else 0
     with SessionLocal.begin() as session:
-        session.get(GuildSettings, interaction.guild.id).status_min_role_id = role_id
+        settings = session.get(GuildSettings, interaction.guild.id)
+        settings.guild_name = interaction.guild.name
+        settings.status_min_role_id = role_id
+        settings.status_min_role_name = role.name if role else None
     await interaction.followup.send(f"✅ Status role set to **{role.name if role else '0 (everyone in listen channels)'}**.", ephemeral=True)
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setstatusrole", command_type="slash", success=True, started=started, result_code="updated", target_type="role", target_id=role_id, target_name=role.name if role else None)
 
@@ -2559,7 +2720,7 @@ def main():
     log.info("Startup version=%s runtime_dir=%s", BOT_VERSION, RUNTIME_DIR)
     wait_for_database()
     log.info("Database startup check complete")
-    client.run(TOKEN)
+    client.run(TOKEN, log_handler=None)
 
 
 if __name__ == "__main__":
