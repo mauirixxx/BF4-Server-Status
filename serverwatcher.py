@@ -35,7 +35,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.3.0"
+BOT_VERSION = "v2.3.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -45,6 +45,7 @@ LOCKER_MESSAGE = "Operation Locker is now live!"
 LEGACY_IMPORT_KEY = "legacy_v1_import"
 MANUAL_ANNOUNCEMENT_TTL_SECONDS = 600
 ROLE_PANEL_BUTTONS_PER_MESSAGE = 15
+ROLE_PANEL_RECONCILE_DELAY_SECONDS = 3.0
 GUILD_RETENTION_DAYS = 30
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2508,47 +2509,27 @@ async def on_guild_channel_delete(channel):
 
 
 @client.event
+async def on_guild_role_create(role):
+    schedule_role_panel_reconcile(
+        role.guild,
+        reason=f"role_create:{role.id}",
+    )
+
+
+@client.event
 async def on_guild_role_delete(role):
-    try:
-        refresh_guild_readable_snapshots(role.guild)
-        await reconcile_role_panel(role.guild)
-        log.info(
-            "Guild settings role snapshots refreshed after delete guild=%s role=%s",
-            role.guild.id,
-            role.id,
-        )
-    except Exception as exc:
-        log.error(
-            "Guild settings role delete refresh failed guild=%s role=%s error=%s message=%r",
-            role.guild.id,
-            role.id,
-            type(exc).__name__,
-            str(exc),
-        )
+    schedule_role_panel_reconcile(
+        role.guild,
+        reason=f"role_delete:{role.id}",
+    )
 
 
 @client.event
 async def on_guild_role_update(before, after):
-    try:
-        refresh_guild_readable_snapshots(after.guild)
-        await reconcile_role_panel(after.guild)
-        log.info(
-            "Guild role update reconciled guild=%s role=%s old_name=%r new_name=%r old_position=%s new_position=%s",
-            after.guild.id,
-            after.id,
-            before.name,
-            after.name,
-            before.position,
-            after.position,
-        )
-    except Exception as exc:
-        log.error(
-            "Guild role update reconciliation failed guild=%s role=%s error=%s message=%r",
-            after.guild.id,
-            after.id,
-            type(exc).__name__,
-            str(exc),
-        )
+    schedule_role_panel_reconcile(
+        after.guild,
+        reason=f"role_update:{after.id}",
+    )
 
 
 @client.event
@@ -2900,6 +2881,135 @@ class MapRolePanelView(discord.ui.View):
             )
 
 
+def desired_role_panel_signature(
+    guild_id: int,
+    panel_index: int,
+    panel_count: int,
+    items: list[dict],
+):
+    content = role_panel_content(panel_index, panel_count, bool(items))
+    buttons = tuple(
+        (
+            str(item["map_name"])[:80],
+            f"bf4mr:{int(guild_id)}:{item['map_key']}",
+            int(discord.ButtonStyle.secondary.value),
+        )
+        for item in items
+    )
+    return content, buttons
+
+
+def live_role_panel_signature(message: discord.Message):
+    buttons = []
+    for action_row in getattr(message, "components", []) or []:
+        for component in getattr(action_row, "children", []) or []:
+            custom_id = getattr(component, "custom_id", None)
+            if custom_id is None:
+                continue
+            style = getattr(component, "style", None)
+            style_value = getattr(style, "value", style)
+            buttons.append(
+                (
+                    str(getattr(component, "label", "") or ""),
+                    str(custom_id),
+                    int(style_value) if style_value is not None else None,
+                )
+            )
+    return message.content or "", tuple(buttons)
+
+
+ROLE_PANEL_RECONCILE_LOCKS: dict[int, asyncio.Lock] = {}
+ROLE_PANEL_DEBOUNCE_TASKS: dict[int, asyncio.Task] = {}
+ROLE_PANEL_DEBOUNCE_DEADLINES: dict[int, float] = {}
+ROLE_PANEL_DEBOUNCE_REASONS: dict[int, str] = {}
+
+
+def role_panel_reconcile_lock(guild_id: int) -> asyncio.Lock:
+    lock = ROLE_PANEL_RECONCILE_LOCKS.get(int(guild_id))
+    if lock is None:
+        lock = asyncio.Lock()
+        ROLE_PANEL_RECONCILE_LOCKS[int(guild_id)] = lock
+    return lock
+
+
+def schedule_role_panel_reconcile(
+    guild: discord.Guild,
+    *,
+    reason: str,
+):
+    """Debounce bursts of Discord role events into one panel reconciliation."""
+    guild_id = int(guild.id)
+    ROLE_PANEL_DEBOUNCE_DEADLINES[guild_id] = (
+        time.monotonic() + ROLE_PANEL_RECONCILE_DELAY_SECONDS
+    )
+    ROLE_PANEL_DEBOUNCE_REASONS[guild_id] = reason
+
+    existing = ROLE_PANEL_DEBOUNCE_TASKS.get(guild_id)
+    if existing is not None and not existing.done():
+        log.info(
+            "Role panel reconciliation rescheduled guild=%s reason=%s "
+            "delay_seconds=%.1f",
+            guild.id,
+            reason,
+            ROLE_PANEL_RECONCILE_DELAY_SECONDS,
+        )
+        return
+
+    async def _runner():
+        try:
+            while True:
+                deadline = ROLE_PANEL_DEBOUNCE_DEADLINES.get(
+                    guild_id,
+                    time.monotonic(),
+                )
+                delay = max(0.0, deadline - time.monotonic())
+                if delay:
+                    await asyncio.sleep(delay)
+
+                latest_deadline = ROLE_PANEL_DEBOUNCE_DEADLINES.get(
+                    guild_id,
+                    deadline,
+                )
+                if latest_deadline > time.monotonic():
+                    continue
+                break
+
+            final_reason = ROLE_PANEL_DEBOUNCE_REASONS.get(
+                guild_id,
+                reason,
+            )
+            refresh_guild_readable_snapshots(guild)
+            await reconcile_role_panel(guild)
+            log.info(
+                "Role panel debounced reconciliation complete guild=%s "
+                "reason=%s delay_seconds=%.1f",
+                guild.id,
+                final_reason,
+                ROLE_PANEL_RECONCILE_DELAY_SECONDS,
+            )
+        except Exception as exc:
+            log.error(
+                "Role panel debounced reconciliation failed guild=%s "
+                "error=%s message=%r",
+                guild.id,
+                type(exc).__name__,
+                str(exc),
+            )
+        finally:
+            ROLE_PANEL_DEBOUNCE_TASKS.pop(guild_id, None)
+            ROLE_PANEL_DEBOUNCE_DEADLINES.pop(guild_id, None)
+            ROLE_PANEL_DEBOUNCE_REASONS.pop(guild_id, None)
+
+    ROLE_PANEL_DEBOUNCE_TASKS[guild_id] = asyncio.create_task(_runner())
+    log.info(
+        "Role panel reconciliation scheduled guild=%s reason=%s "
+        "delay_seconds=%.1f",
+        guild.id,
+        reason,
+        ROLE_PANEL_RECONCILE_DELAY_SECONDS,
+    )
+
+
 async def fetch_panel_message(channel, message_id):
     try:
         return await channel.fetch_message(int(message_id))
@@ -2993,7 +3103,7 @@ async def replace_persisted_role_panel(
             )
 
 
-async def reconcile_role_panel(guild: discord.Guild):
+async def _reconcile_role_panel_unlocked(guild: discord.Guild):
     """Validate/edit/recreate the configured persistent role panel."""
     settings = get_settings(guild.id)
     if not settings.roles_channel_id:
@@ -3063,24 +3173,40 @@ async def reconcile_role_panel(guild: discord.Guild):
                 len(items),
             )
         else:
-            await message.edit(
-                content=role_panel_content(
-                    panel_index,
-                    panel_count,
-                    bool(items),
-                ),
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            log.info(
-                "Role panel validated guild=%s channel=%s message=%s panel=%s/%s buttons=%s",
+            desired_signature = desired_role_panel_signature(
                 guild.id,
-                channel.id,
-                message.id,
-                panel_index + 1,
+                panel_index,
                 panel_count,
-                len(items),
+                items,
             )
+            live_signature = live_role_panel_signature(message)
+            if live_signature != desired_signature:
+                await message.edit(
+                    content=desired_signature[0],
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                log.info(
+                    "Role panel updated guild=%s channel=%s message=%s "
+                    "panel=%s/%s buttons=%s",
+                    guild.id,
+                    channel.id,
+                    message.id,
+                    panel_index + 1,
+                    panel_count,
+                    len(items),
+                )
+            else:
+                log.info(
+                    "Role panel unchanged guild=%s channel=%s message=%s "
+                    "panel=%s/%s buttons=%s edit_skipped=True",
+                    guild.id,
+                    channel.id,
+                    message.id,
+                    panel_index + 1,
+                    panel_count,
+                    len(items),
+                )
 
         final_rows.append((panel_index, message, items))
 
@@ -3115,6 +3241,13 @@ async def reconcile_role_panel(guild: discord.Guild):
         panel_count,
         sum(len(items) for items in chunks),
     )
+
+
+async def reconcile_role_panel(guild: discord.Guild):
+    """Serialize role-panel reconciliation per guild."""
+    lock = role_panel_reconcile_lock(guild.id)
+    async with lock:
+        await _reconcile_role_panel_unlocked(guild)
 
 
 def map_role_self_service_warning(guild: discord.Guild, role_id: int) -> str | None:

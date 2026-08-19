@@ -4,6 +4,15 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.3.1] - 2026-08-19
+
+### Fixed
+- Debounced bursts of Discord guild role create/update/delete events so rapid hierarchy changes produce one role-panel reconciliation after a short settling period.
+- Serialized role-panel reconciliation per guild so concurrent tasks cannot GET/PATCH the same persistent role-panel message at the same time.
+- Added desired-vs-live role-panel comparison and skip Discord message edits entirely when panel content/buttons are already unchanged.
+- Reduced unnecessary role-panel message edits that could trigger Discord HTTP 429 rate limits, including error code `30046` (`Maximum number of edits to messages older than 1 hour reached`).
+- Preserved automatic recovery for deleted roles, renamed roles, role hierarchy/manageability changes, and lost/restored `Manage Roles` permission.
+
 ## [v2.3.0] - 2026-08-19
 
 ### Announcement channels
