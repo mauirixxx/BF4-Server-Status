@@ -69,15 +69,22 @@ After an announcement channel or listen channel exists, the normal channel restr
 
 ## Announcement channel
 
-Use:
+Add one or more announcement channels with:
 
 ```text
-/setannouncementchannel
+/addannouncementchannel channel:<text channel>
+/delannouncementchannel channel:<configured channel>
 ```
 
-to choose the guild's automatic announcement destination.
+Each default BF4 server is assigned to one configured announcement channel. Its automatic map-change announcements and optional live player roster are routed to that channel.
 
-Automatic map-change announcement message IDs are persisted in the database. ServerWatcher can therefore delete/replace the previous automatic message after a restart.
+If only one announcement channel exists, `/defaultserver add` can use it automatically. If multiple channels exist, choose one with the `announcement_channel` option.
+
+Use `/defaultserver modify` to move an existing default server to another configured announcement channel.
+
+`/delannouncementchannel` refuses to remove a channel while a default server still uses it. Move those servers first.
+
+Automatic map-change announcement message IDs are persisted in the database so ServerWatcher can delete/replace previous messages after a restart.
 
 ## Listen channels
 
@@ -90,7 +97,7 @@ Use:
 
 to manage channels where normal users may use `!` commands.
 
-Managers may use management commands in the configured announcement channel or listen channels.
+Managers may use management commands in any configured announcement channel or listen channels.
 
 ## Self-service map-role channel
 
@@ -160,7 +167,8 @@ Each guild has its own server relationships and display names:
 /addserver
 /delserver
 /renameserver
-/defaultserver add server:<selection> include_users:<true|false>
+/defaultserver add server:<selection> announcement_channel:<configured channel> include_users:<true|false>
+/defaultserver modify server:<default selection> announcement_channel:<configured channel>
 /defaultserver remove server:<selection>
 /defaultserver list
 ```

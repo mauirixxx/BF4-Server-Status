@@ -33,7 +33,7 @@ Do not commit real database passwords or connection strings.
 
 Discord snowflake IDs, BF4 map keys, and server GUIDs remain authoritative. For easier administrator troubleshooting with direct SQL queries, selected guild-scoped operational tables also store nullable human-readable snapshots immediately beside their related identifiers.
 
-- `guild_settings`: guild, announcement-channel, management-role, and status-role names.
+- `guild_settings`: guild, legacy single-announcement-channel snapshot, management-role, and status-role names.
 - `guild_server_state`: guild name, resolved BF4 map name, and announcement-channel name.
 - `guild_map_role_pings`: guild name, resolved BF4 map name, and Discord role name.
 - `guild_listen_channels`: guild name and channel name.
@@ -95,3 +95,29 @@ content_hash
 The table stores Discord/configuration state only. Live player roster/stat data is intentionally not persisted. `content_hash` is a deterministic fingerprint of the complete rendered roster and is repeated across that roster's chunk rows so unchanged displays can avoid Discord post/delete churn.
 
 Fresh BFLIST/player-detail results are volatile per-monitor-cycle data and are deduplicated by unique BF4 server before being reused across guild displays.
+
+
+## Multi-announcement-channel routing (v2.3.0)
+
+Configured guild announcement channels are stored in:
+
+```text
+guild_announcement_channels
+guild_id
+guild_name
+channel_id
+channel_name
+```
+
+`(guild_id, channel_id)` is the primary key. IDs remain authoritative and names are human-readable snapshots.
+
+Each `guild_servers` row adds:
+
+```text
+announcement_channel_id
+announcement_channel_name
+```
+
+for the destination used while that relationship is a default server. Map-change announcements and optional persistent player rosters use this per-server assignment.
+
+Alembic revision `0006_v2_3_0` copies any existing nonzero legacy `guild_settings.announcement_channel_id/name` into `guild_announcement_channels` and assigns it to the guild's existing default servers. The legacy columns remain present for migration/backward-reading safety but are no longer used for normal v2.3.0 routing.

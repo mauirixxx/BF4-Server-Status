@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.2.0
+# BF4 Server Watcher v2.3.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -328,6 +328,8 @@ Recommended bot permissions:
 
 The bot itself does not require Administrator permission.
 
+Discord administrators adding an existing hosted bot can use **`QUICK-INSTALL.md`** for the shortest setup path.
+
 See **`DISCORD.md`** for Discord application, invite, permission, guild bootstrap, channel, and role setup.
 
 Management uses Discord slash commands (`/`). Regular-user commands remain `!` commands. `!announce` remains as a management chat alias.
@@ -346,11 +348,13 @@ Only snapshots fetched successfully during the current polling cycle can trigger
 
 Announcement/listen channel settings are per guild and stored in the database.
 
-The announcement channel is the protected destination for automatic map-change announcements and temporary manual announcements.
+A guild may configure multiple announcement channels with `/addannouncementchannel`. Each default BF4 server selects one configured announcement channel, and that server's map-change announcements and optional persistent player roster use that destination.
+
+`/delannouncementchannel` refuses to remove a channel while any default server is still assigned to it. Move those servers first with `/defaultserver modify`.
 
 Listen channels are where regular users may run normal commands.
 
-Managers may use management commands in the announcement channel or configured listen channels. During initial guild bootstrap, managers may configure the first channel even though none exists yet.
+Managers may use management commands in any configured announcement channel or listen channel. During initial guild bootstrap, managers may configure the first channel even though none exists yet.
 
 ## Tested Battlefield platforms
 
@@ -385,15 +389,16 @@ Use:
 
 ```text
 /defaultserver add
+/defaultserver modify
 /defaultserver remove
 /defaultserver list
 ```
 
 A map change on one guild's default server does not require any other server/guild to change.
 
-Adding a server to defaults performs an immediate current-status announcement when an announcement channel is configured. Removing a default deletes its persisted current automatic announcement state/message.
+Adding a server to defaults requires a configured announcement destination (or auto-selects the sole configured channel). Removing a default deletes its persisted current automatic announcement state/message.
 
-When the final default is removed, the guild announcement channel receives:
+When the final default is removed, the removed server's assigned announcement channel receives:
 
 ```text
 No default server(s) set
@@ -403,7 +408,7 @@ No default server(s) set
 
 Use `/addserver` with one or more Battlelog server URLs. Multiple URLs may be separated by spaces or new lines.
 
-`make_default:true` adds every successfully processed server to the current guild's default list.
+`make_default:true` is supported only when exactly one announcement channel is configured. With zero or multiple channels, add the server first and then use `/defaultserver add` to choose its destination.
 
 If a global `bf4_servers` row already exists for that GUID, ServerWatcher reuses it rather than creating a duplicate.
 
@@ -426,12 +431,12 @@ then alphabetically by guild display name.
 v2.2.0 adds an optional always-visible player roster for each guild default server. Enable it when adding/updating a default server:
 
 ```text
-/defaultserver add server:<selection> include_users:true
+/defaultserver add server:<selection> announcement_channel:<configured channel> include_users:true
 ```
 
 `include_users` defaults to `false`, so existing/default behavior stays uncluttered unless a Discord administrator explicitly opts in. Multiple default servers may independently enable the display.
 
-The display uses the guild announcement channel and the same global `CHECK_INTERVAL_SECONDS` monitor cadence. Normal on-demand `!status <server> players` remains available.
+The display uses that default server's assigned announcement channel and the same global `CHECK_INTERVAL_SECONDS` monitor cadence. Normal on-demand `!status <server> players` remains available.
 
 Fresh roster/enrichment data is **not stored in the database**. During a monitor cycle, ServerWatcher performs at most one roster/BFLIST lookup per unique BF4 server that needs a persistent display and reuses that volatile result across guilds.
 
@@ -524,10 +529,12 @@ All ordinary commands above inherit the common `status_min_role_id` gate describ
 - `/addserver server_urls:<Battlelog URLs> [make_default:true]`
 - `/delserver server:<selection>`
 - `/renameserver server:<selection> new_name:<name>`
-- `/defaultserver add server:<selection> [include_users:true|false]` — add a default server; `include_users` defaults to `false` and optionally maintains its player roster in the announcement channel.
+- `/defaultserver add server:<selection> [announcement_channel:<configured channel>] [include_users:true|false]` — add a default server; the channel may be omitted only when exactly one is configured.
+- `/defaultserver modify server:<default selection> announcement_channel:<configured channel>`
 - `/defaultserver remove server:<selection>`
 - `/defaultserver list`
-- `/setannouncementchannel channel:<channel>`
+- `/addannouncementchannel channel:<text channel>`
+- `/delannouncementchannel channel:<configured channel>`
 - `/setroleschannel channel:<text channel>` — create/move the persistent self-service map-role panel.
 - `/delroleschannel` — disable self-service map roles and remove the persisted panel.
 - `/addlistenchannel channel:<text channel>` — add one listen channel using Discord's native channel selector.

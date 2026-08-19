@@ -4,6 +4,32 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.3.0] - 2026-08-19
+
+### Announcement channels
+- Replaced the single guild-wide announcement destination with a configurable multi-channel model.
+- Retired `/setannouncementchannel`.
+- Added `/addannouncementchannel channel:<text channel>` and `/delannouncementchannel channel:<configured channel>`.
+- Added per-default-server announcement-channel assignments.
+- Extended `/defaultserver add` with an announcement-channel selector; when exactly one channel exists it can be selected automatically.
+- Added `/defaultserver modify server:<default> announcement_channel:<configured channel>` to move an existing default without changing `include_users`.
+- `/delannouncementchannel` refuses removal while any default server still uses the channel.
+- Map-change announcements, manual announcements, and optional persistent player rosters now route through each default server's assigned announcement channel.
+- Moving a default server creates its current persistent output in the new channel before cleaning up the previous destination.
+- Deleted/unresolvable configured announcement channels are logged clearly and are never silently redirected.
+- Added Alembic revision `0006_v2_3_0`, which copies each guild's existing nonzero legacy announcement channel into `guild_announcement_channels` and assigns it to existing default servers.
+
+### Fixed
+- Fixed `!help` failing with Discord HTTP error 50035 when large guild configuration output exceeded the 2,000-character message limit.
+- `!help` now safely splits large output below Discord's limit and logs/audits the failing chunk index/total if a send fails.
+
+### Changed
+- Changed rotating presence wording from `players across tracked servers` to `players across all tracked servers`.
+- Changed direct dependencies from exact pins to bounded compatible ranges using the v2.2.0-tested versions as release minimums and upper bounds that prevent unreviewed breaking-version upgrades.
+- Updated `THIRD_PARTY.md` to describe the shipped dependency ranges.
+- Added `QUICK-INSTALL.md` to the release bundle.
+- Retained the prominent Discord-admin handoff note at the top of `DISCORD.md`.
+
 ## [v2.2.0] - 2026-08-19
 
 ### Added

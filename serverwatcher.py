@@ -24,6 +24,7 @@ from models import (
     BF4Server,
     CommandAudit,
     Guild,
+    GuildAnnouncementChannel,
     GuildListenChannel,
     GuildMapRolePing,
     GuildRolePanelMessage,
@@ -34,7 +35,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.2.0"
+BOT_VERSION = "v2.3.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -691,6 +692,31 @@ def refresh_guild_readable_snapshots(discord_guild: discord.Guild):
             for row in session.scalars(select(BF4Map)).all()
         }
 
+        announcement_rows = session.scalars(
+            select(GuildAnnouncementChannel).where(
+                GuildAnnouncementChannel.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in announcement_rows:
+            row.guild_name = discord_guild.name
+            channel = discord_guild.get_channel(int(row.channel_id))
+            row.channel_name = channel.name if channel is not None else None
+
+        guild_server_rows = session.scalars(
+            select(GuildServer).where(
+                GuildServer.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in guild_server_rows:
+            channel = (
+                discord_guild.get_channel(int(row.announcement_channel_id))
+                if row.announcement_channel_id
+                else None
+            )
+            row.announcement_channel_name = (
+                channel.name if channel is not None else None
+            )
+
         listen_rows = session.scalars(
             select(GuildListenChannel).where(
                 GuildListenChannel.guild_id == discord_guild.id
@@ -819,6 +845,8 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
                 server_guid=AAA_GUID,
                 display_name=AAA_NAME,
                 is_default=True,
+                announcement_channel_id=None,
+                announcement_channel_name=None,
             ))
 
         locker = session.get(GuildMapRolePing, (discord_guild.id, LOCKER_KEY))
@@ -865,6 +893,75 @@ def listen_channel_ids(guild_id: int) -> set[int]:
         ).all())
 
 
+def announcement_channel_ids(guild_id: int) -> set[int]:
+    with SessionLocal() as session:
+        return set(session.scalars(
+            select(GuildAnnouncementChannel.channel_id).where(
+                GuildAnnouncementChannel.guild_id == guild_id
+            )
+        ).all())
+
+
+def configured_announcement_channels(guild_id: int):
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(GuildAnnouncementChannel)
+            .where(GuildAnnouncementChannel.guild_id == guild_id)
+            .order_by(GuildAnnouncementChannel.channel_name, GuildAnnouncementChannel.channel_id)
+        ).all()
+        return [
+            {
+                "channel_id": int(row.channel_id),
+                "channel_name": row.channel_name,
+            }
+            for row in rows
+        ]
+
+
+def announcement_channel_choices(interaction: discord.Interaction, current: str):
+    if interaction.guild is None:
+        return []
+    needle = (current or "").strip().casefold()
+    choices = []
+    for row in configured_announcement_channels(interaction.guild.id):
+        channel = interaction.guild.get_channel(row["channel_id"])
+        name = channel.name if channel is not None else (row["channel_name"] or str(row["channel_id"]))
+        if needle and needle not in name.casefold() and needle not in str(row["channel_id"]):
+            continue
+        choices.append(app_commands.Choice(name=f"#{name}"[:100], value=str(row["channel_id"])))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def resolve_configured_announcement_channel(
+    guild: discord.Guild,
+    selector: str | None,
+):
+    rows = configured_announcement_channels(guild.id)
+    if not rows:
+        return None, "none_configured"
+
+    if selector is None or not str(selector).strip():
+        if len(rows) == 1:
+            row = rows[0]
+            return guild.get_channel(row["channel_id"]), None
+        return None, "selection_required"
+
+    raw = str(selector).strip()
+    exact = [
+        row for row in rows
+        if str(row["channel_id"]) == raw
+        or (row["channel_name"] or "").casefold() == raw.casefold().lstrip("#")
+    ]
+    if len(exact) != 1:
+        return None, "not_configured"
+    channel = guild.get_channel(exact[0]["channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return None, "unresolved"
+    return channel, None
+
+
 def has_role_or_higher(member: discord.Member, required_role_id: int, zero_allows=False):
     if member.id == member.guild.owner_id or member.guild_permissions.administrator:
         return True
@@ -908,11 +1005,8 @@ def management_channel_allowed(interaction_or_message):
     guild = interaction_or_message.guild
     if guild is None:
         return False
-    settings = get_settings(guild.id)
-    listens = listen_channel_ids(guild.id)
-    allowed = set(listens)
-    if settings.announcement_channel_id:
-        allowed.add(settings.announcement_channel_id)
+    allowed = set(listen_channel_ids(guild.id))
+    allowed.update(announcement_channel_ids(guild.id))
     # Bootstrap exception: managers need somewhere to configure the first channel.
     if not allowed:
         return True
@@ -1260,15 +1354,27 @@ def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
             session.execute(delete(GuildServerState).where(GuildServerState.guild_id == target.id))
             session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == target.id))
             session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == target.id))
+            session.execute(delete(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == target.id))
             session.execute(delete(GuildServer).where(GuildServer.guild_id == target.id))
 
             settings = session.get(GuildSettings, target.id)
             if settings is None:
                 settings = GuildSettings(guild_id=target.id)
                 session.add(settings)
-            settings.announcement_channel_id = int(config.get("announcement_channel_id", 0) or 0)
+            legacy_announcement_channel_id = int(config.get("announcement_channel_id", 0) or 0)
+            settings.announcement_channel_id = legacy_announcement_channel_id
             settings.management_min_role_id = int(config.get("management_min_role_id", 0) or 0)
             settings.status_min_role_id = int(config.get("status_min_role_id", 0) or 0)
+
+            if legacy_announcement_channel_id:
+                session.add(
+                    GuildAnnouncementChannel(
+                        guild_id=target.id,
+                        guild_name=target.name,
+                        channel_id=legacy_announcement_channel_id,
+                        channel_name=None,
+                    )
+                )
 
             for channel_id in config.get("listen_channel_id", []):
                 channel_id = int(channel_id or 0)
@@ -1299,11 +1405,23 @@ def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
                         server_guid=guid,
                         display_name=str(record.get("name", key)),
                         is_default=key in default_keys,
+                        announcement_channel_id=(
+                            legacy_announcement_channel_id
+                            if key in default_keys and legacy_announcement_channel_id
+                            else None
+                        ),
+                        announcement_channel_name=None,
                     ))
                     imported_servers += 1
                 else:
                     relation.display_name = str(record.get("name", key))
                     relation.is_default = key in default_keys
+                    relation.announcement_channel_id = (
+                        legacy_announcement_channel_id
+                        if key in default_keys and legacy_announcement_channel_id
+                        else None
+                    )
+                    relation.announcement_channel_name = None
 
             for map_name, entry in config.get("map_role_pings", {}).items():
                 if not isinstance(entry, dict):
@@ -1389,13 +1507,16 @@ def active_map_role_line(guild_id: int, map_key: str | None):
 
 
 async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *, map_change=True):
-    settings = get_settings(guild_id)
-    if not settings.announcement_channel_id:
-        return None
     guild = client.get_guild(guild_id)
-    channel = guild.get_channel(settings.announcement_channel_id) if guild else None
-    if not channel:
-        log.warning("Announcement channel unresolved guild=%s channel=%s", guild_id, settings.announcement_channel_id)
+    channel_id = int(gs.announcement_channel_id or 0)
+    channel = guild.get_channel(channel_id) if guild and channel_id else None
+    if not isinstance(channel, discord.TextChannel):
+        log.warning(
+            "Announcement channel unresolved guild=%s server=%s channel=%s",
+            guild_id,
+            gs.server_guid,
+            channel_id,
+        )
         return None
 
     with SessionLocal() as session:
@@ -1642,10 +1763,9 @@ async def update_persistent_player_display(
     snapshot: dict,
     bflist_server: dict | None,
 ) -> dict:
-    settings = get_settings(guild.id)
     channel = (
-        guild.get_channel(int(settings.announcement_channel_id))
-        if settings.announcement_channel_id
+        guild.get_channel(int(gs.announcement_channel_id))
+        if gs.announcement_channel_id
         else None
     )
     if not isinstance(channel, discord.TextChannel):
@@ -1657,7 +1777,7 @@ async def update_persistent_player_display(
             "server=%s channel=%s",
             guild.id,
             gs.server_guid,
-            settings.announcement_channel_id,
+            gs.announcement_channel_id,
         )
         return {"result": "no_channel", "posted": 0, "deleted": 0}
 
@@ -1787,6 +1907,8 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
                 "guild_id": gs.guild_id,
                 "server_guid": gs.server_guid,
                 "display_name": gs.display_name,
+                "announcement_channel_id": gs.announcement_channel_id,
+                "announcement_channel_name": gs.announcement_channel_name,
                 "platform": bf.platform,
                 "server_name": bf.server_name,
             }
@@ -1885,6 +2007,8 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
             display_name=row["display_name"],
             is_default=True,
             include_users=True,
+            announcement_channel_id=row["announcement_channel_id"],
+            announcement_channel_name=row["announcement_channel_name"],
         )
         bf = BF4Server(
             server_guid=guid,
@@ -2074,11 +2198,17 @@ async def monitor_cycle():
             select(GuildServer).where(GuildServer.is_default.is_(True))
         ).all()
         detached = [
-            (r.guild_id, r.server_guid, r.display_name)
+            (
+                r.guild_id,
+                r.server_guid,
+                r.display_name,
+                r.announcement_channel_id,
+                r.announcement_channel_name,
+            )
             for r in default_rows
         ]
 
-    for guild_id, guid, display_name in detached:
+    for guild_id, guid, display_name, announcement_channel_id, announcement_channel_name in detached:
         snapshot = fresh.get(guid)
         if snapshot is None:
             continue
@@ -2124,6 +2254,8 @@ async def monitor_cycle():
                 server_guid=guid,
                 display_name=display_name,
                 is_default=True,
+                announcement_channel_id=announcement_channel_id,
+                announcement_channel_name=announcement_channel_name,
             )
             await post_automatic_announcement(
                 guild_id,
@@ -2201,7 +2333,7 @@ async def presence_loop():
             players = sum(get_server_status(s)["players"] for s in FRESH_SERVER_CACHE.values())
             activities = [
                 f"Tracking {unique_count} BF4 servers",
-                f"{players:,} players across tracked servers",
+                f"{players:,} players across all tracked servers",
             ]
             await client.change_presence(activity=discord.CustomActivity(name=activities[index % 2]))
             index += 1
@@ -2228,14 +2360,20 @@ async def guild_cleanup_once():
         try:
             with SessionLocal.begin() as session:
                 counts = {
+                    "announcement_channels": session.scalar(select(func.count()).select_from(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id)) or 0,
                     "listen_channels": session.scalar(select(func.count()).select_from(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id)) or 0,
                     "guild_servers": session.scalar(select(func.count()).select_from(GuildServer).where(GuildServer.guild_id == guild_id)) or 0,
                     "map_roles": session.scalar(select(func.count()).select_from(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id)) or 0,
                     "server_states": session.scalar(select(func.count()).select_from(GuildServerState).where(GuildServerState.guild_id == guild_id)) or 0,
+                    "player_messages": session.scalar(select(func.count()).select_from(GuildServerPlayerMessage).where(GuildServerPlayerMessage.guild_id == guild_id)) or 0,
+                    "role_panel_messages": session.scalar(select(func.count()).select_from(GuildRolePanelMessage).where(GuildRolePanelMessage.guild_id == guild_id)) or 0,
                 }
+                session.execute(delete(GuildServerPlayerMessage).where(GuildServerPlayerMessage.guild_id == guild_id))
+                session.execute(delete(GuildRolePanelMessage).where(GuildRolePanelMessage.guild_id == guild_id))
                 session.execute(delete(GuildServerState).where(GuildServerState.guild_id == guild_id))
                 session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id))
                 session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id))
+                session.execute(delete(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id))
                 session.execute(delete(GuildServer).where(GuildServer.guild_id == guild_id))
                 session.execute(delete(GuildSettings).where(GuildSettings.guild_id == guild_id))
                 session.execute(delete(Guild).where(Guild.guild_id == guild_id))
@@ -2325,9 +2463,35 @@ async def on_guild_channel_update(before, after):
 async def on_guild_channel_delete(channel):
     try:
         settings = get_settings(channel.guild.id)
+        with SessionLocal.begin() as session:
+            configured = session.get(
+                GuildAnnouncementChannel,
+                (channel.guild.id, channel.id),
+            )
+            if configured is not None:
+                session.delete(configured)
+            affected_defaults = session.scalar(
+                select(func.count())
+                .select_from(GuildServer)
+                .where(
+                    GuildServer.guild_id == channel.guild.id,
+                    GuildServer.is_default.is_(True),
+                    GuildServer.announcement_channel_id == channel.id,
+                )
+            ) or 0
+
         refresh_guild_readable_snapshots(channel.guild)
         if settings.roles_channel_id == channel.id:
             await reconcile_role_panel(channel.guild)
+
+        if affected_defaults:
+            log.warning(
+                "Configured announcement channel deleted guild=%s channel=%s "
+                "affected_default_servers=%s action=manual_reassignment_required",
+                channel.guild.id,
+                channel.id,
+                affected_defaults,
+            )
         log.info(
             "Guild settings channel snapshots refreshed after delete guild=%s channel=%s",
             channel.guild.id,
@@ -3057,11 +3221,28 @@ async def default_list(interaction):
     if not await prepare_management(interaction):
         return
     defaults = get_default_guild_servers(interaction.guild.id)
-    text = "\n".join(
-        f"({normalize_platform_label(bf.platform)}) - {gs.display_name} "
-        f"[Include Users: {'Yes' if gs.include_users else 'No'}]"
-        for gs, bf in defaults
-    ) or "No default server(s) set"
+    lines = []
+    for gs, bf in defaults:
+        channel = (
+            interaction.guild.get_channel(int(gs.announcement_channel_id))
+            if gs.announcement_channel_id
+            else None
+        )
+        channel_label = (
+            f"#{channel.name}"
+            if channel is not None
+            else (
+                f"unresolved:{gs.announcement_channel_id}"
+                if gs.announcement_channel_id
+                else "None"
+            )
+        )
+        lines.append(
+            f"({normalize_platform_label(bf.platform)}) - {gs.display_name} "
+            f"[Channel: {channel_label}] "
+            f"[Include Users: {'Yes' if gs.include_users else 'No'}]"
+        )
+    text = "\n".join(lines) or "No default server(s) set"
     await interaction.followup.send(f"```text\n{text}\n```", ephemeral=True)
     audit_command(
         guild=interaction.guild,
@@ -3082,25 +3263,87 @@ async def default_list(interaction):
 @default_group.command(name="add", description="Add a configured server to defaults")
 @app_commands.describe(
     server="Configured BF4 server",
-    include_users="Keep an automatically refreshed player list in the announcement channel",
+    announcement_channel="Configured announcement channel; optional only when exactly one exists",
+    include_users="Keep an automatically refreshed player list in this server's announcement channel",
 )
 async def default_add(
     interaction: discord.Interaction,
     server: str,
+    announcement_channel: str | None = None,
     include_users: bool = False,
 ):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
+
+    selected_channel, channel_error = resolve_configured_announcement_channel(
+        interaction.guild,
+        announcement_channel,
+    )
+    if channel_error:
+        messages = {
+            "none_configured": (
+                "⚠️ No announcement channels are configured. "
+                "Use `/addannouncementchannel` first."
+            ),
+            "selection_required": (
+                "⚠️ This guild has multiple announcement channels. "
+                "Choose one with the `announcement_channel` option."
+            ),
+            "not_configured": "⚠️ Choose an announcement channel from the configured list.",
+            "unresolved": "⚠️ That configured announcement channel can no longer be resolved.",
+        }
+        await interaction.followup.send(messages[channel_error], ephemeral=True)
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.add",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code=f"announcement_channel_{channel_error}",
+            target_type="server",
+            target_id=server,
+        )
+        return
+
     try:
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             bf = session.get(BF4Server, server)
             if not gs or not bf:
                 raise ValueError("server_not_found")
+            if (
+                gs.is_default
+                and gs.announcement_channel_id
+                and int(gs.announcement_channel_id) != selected_channel.id
+            ):
+                await interaction.followup.send(
+                    f"ℹ️ **{gs.display_name}** is already a default server. "
+                    "Use `/defaultserver modify` to move it to another "
+                    "announcement channel.",
+                    ephemeral=True,
+                )
+                audit_command(
+                    guild=interaction.guild,
+                    channel=interaction.channel,
+                    user=interaction.user,
+                    command_name="defaultserver.add",
+                    command_type="slash",
+                    success=False,
+                    started=started,
+                    result_code="use_modify_for_channel_change",
+                    target_type="server",
+                    target_id=server,
+                    target_name=gs.display_name,
+                )
+                return
             previous_include_users = bool(gs.include_users)
             gs.is_default = True
             gs.include_users = bool(include_users)
+            gs.announcement_channel_id = selected_channel.id
+            gs.announcement_channel_name = selected_channel.name
             name = gs.display_name
             platform = bf.platform
             server_name = bf.server_name
@@ -3112,15 +3355,18 @@ async def default_add(
             FRESH_SERVER_CACHE.get(server)
             or await asyncio.to_thread(get_keeper_snapshot, server)
         )
+        temp_gs = GuildServer(
+            guild_id=interaction.guild.id,
+            server_guid=server,
+            display_name=name,
+            is_default=True,
+            include_users=bool(include_users),
+            announcement_channel_id=selected_channel.id,
+            announcement_channel_name=selected_channel.name,
+        )
         await post_automatic_announcement(
             interaction.guild.id,
-            GuildServer(
-                guild_id=interaction.guild.id,
-                server_guid=server,
-                display_name=name,
-                is_default=True,
-                include_users=bool(include_users),
-            ),
+            temp_gs,
             get_server_status(snapshot),
             map_change=False,
         )
@@ -3137,13 +3383,7 @@ async def default_add(
                     )
                 result = await update_persistent_player_display(
                     interaction.guild,
-                    GuildServer(
-                        guild_id=interaction.guild.id,
-                        server_guid=server,
-                        display_name=name,
-                        is_default=True,
-                        include_users=True,
-                    ),
+                    temp_gs,
                     BF4Server(
                         server_guid=server,
                         server_name=server_name,
@@ -3152,9 +3392,7 @@ async def default_add(
                     snapshot,
                     bflist,
                 )
-                player_note = (
-                    f" Persistent player list: **{result['result']}**."
-                )
+                player_note = f" Persistent player list: **{result['result']}**."
             except Exception as exc:
                 log.warning(
                     "Immediate player display failed guild=%s server=%s "
@@ -3170,7 +3408,8 @@ async def default_add(
                 )
 
         await interaction.followup.send(
-            f"✅ **{name}** added to default servers. "
+            f"✅ **{name}** added to default servers in "
+            f"**#{selected_channel.name}**. "
             f"Include Users: **{'Yes' if include_users else 'No'}**."
             f"{player_note}",
             ephemeral=True,
@@ -3187,7 +3426,10 @@ async def default_add(
             target_type="server",
             target_id=server,
             target_name=name,
-            metadata={"include_users": bool(include_users)},
+            metadata={
+                "include_users": bool(include_users),
+                "announcement_channel_id": selected_channel.id,
+            },
         )
     except Exception as exc:
         await interaction.followup.send(
@@ -3214,41 +3456,339 @@ async def default_add_autocomplete(interaction, current):
     return command_choice_list(interaction.guild.id, current, defaults=False) if interaction.guild else []
 
 
+@default_add.autocomplete("announcement_channel")
+async def default_add_channel_autocomplete(interaction, current):
+    return announcement_channel_choices(interaction, current)
+
+
+@default_group.command(name="modify", description="Move a default server to another announcement channel")
+@app_commands.describe(
+    server="Current default server",
+    announcement_channel="Configured announcement channel",
+)
+async def default_modify(
+    interaction: discord.Interaction,
+    server: str,
+    announcement_channel: str,
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+
+    selected_channel, channel_error = resolve_configured_announcement_channel(
+        interaction.guild,
+        announcement_channel,
+    )
+    if channel_error:
+        await interaction.followup.send(
+            "⚠️ Choose a valid configured announcement channel.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        with SessionLocal() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            bf = session.get(BF4Server, server)
+            if not gs or not bf or not gs.is_default:
+                raise ValueError("default_server_not_found")
+            old_channel_id = gs.announcement_channel_id
+            old_channel_name = gs.announcement_channel_name
+            display_name = gs.display_name
+            include_users = bool(gs.include_users)
+            platform = bf.platform
+            server_name = bf.server_name
+
+        if int(old_channel_id or 0) == selected_channel.id:
+            await interaction.followup.send(
+                f"ℹ️ **{display_name}** already uses **#{selected_channel.name}**.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="defaultserver.modify",
+                command_type="slash",
+                success=True,
+                started=started,
+                result_code="unchanged",
+                target_type="server",
+                target_id=server,
+                target_name=display_name,
+                metadata={"announcement_channel_id": selected_channel.id},
+            )
+            return
+
+        snapshot = (
+            FRESH_SERVER_CACHE.get(server)
+            or await asyncio.to_thread(get_keeper_snapshot, server)
+        )
+        temp_gs = GuildServer(
+            guild_id=interaction.guild.id,
+            server_guid=server,
+            display_name=display_name,
+            is_default=True,
+            include_users=include_users,
+            announcement_channel_id=selected_channel.id,
+            announcement_channel_name=selected_channel.name,
+        )
+
+        # Establish the new destination before removing old persistent content.
+        new_announcement = await selected_channel.send(
+            build_map_announcement(
+                display_name,
+                get_server_status(snapshot),
+                role_line=active_map_role_line(
+                    interaction.guild.id,
+                    get_server_status(snapshot).get("map_key"),
+                )[0],
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
+        )
+
+        old_player_rows = player_message_rows(interaction.guild.id, server)
+        player_created = []
+        new_player_hash = None
+        if include_users:
+            bflist = None
+            if normalize_platform_label(platform) == "PC":
+                bflist = await asyncio.to_thread(
+                    get_bflist_server_cached,
+                    server,
+                    snapshot,
+                )
+            chunks = persistent_roster_chunks(
+                temp_gs,
+                BF4Server(
+                    server_guid=server,
+                    server_name=server_name,
+                    platform=platform,
+                ),
+                snapshot,
+                bflist,
+            )
+            new_player_hash = rendered_roster_hash(chunks)
+            try:
+                for chunk_index, content in enumerate(chunks):
+                    message = await selected_channel.send(
+                        content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    player_created.append((chunk_index, message))
+            except Exception:
+                for _, message in player_created:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                await new_announcement.delete()
+                raise
+
+        with SessionLocal.begin() as session:
+            live = session.get(GuildServer, (interaction.guild.id, server))
+            live.announcement_channel_id = selected_channel.id
+            live.announcement_channel_name = selected_channel.name
+
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            old_map_channel = state.announcement_channel_id if state else None
+            old_map_message = state.announcement_message_id if state else None
+            status = get_server_status(snapshot)
+            if state is None:
+                state = GuildServerState(
+                    guild_id=interaction.guild.id,
+                    guild_name=interaction.guild.name,
+                    server_guid=server,
+                )
+                session.add(state)
+            state.last_map_key = status["map_key"]
+            state.last_map_name = status["map_name"]
+            state.announcement_channel_id = selected_channel.id
+            state.announcement_channel_name = selected_channel.name
+            state.announcement_message_id = new_announcement.id
+
+            if include_users:
+                session.execute(
+                    delete(GuildServerPlayerMessage).where(
+                        GuildServerPlayerMessage.guild_id == interaction.guild.id,
+                        GuildServerPlayerMessage.server_guid == server,
+                    )
+                )
+                for chunk_index, message in player_created:
+                    session.add(
+                        GuildServerPlayerMessage(
+                            guild_id=interaction.guild.id,
+                            guild_name=interaction.guild.name,
+                            server_guid=server,
+                            server_name=display_name,
+                            chunk_index=chunk_index,
+                            channel_id=selected_channel.id,
+                            channel_name=selected_channel.name,
+                            message_id=message.id,
+                            content_hash=new_player_hash,
+                        )
+                    )
+
+        if old_map_channel and old_map_message and int(old_map_message) != new_announcement.id:
+            await delete_discord_message(
+                interaction.guild.id,
+                old_map_channel,
+                old_map_message,
+            )
+        if include_users and old_player_rows:
+            await delete_player_message_rows(interaction.guild, old_player_rows)
+        PLAYER_DISPLAY_VALIDATED.discard((interaction.guild.id, server))
+
+        log.info(
+            "Default server channel modified guild=%s server=%s old_channel=%s "
+            "new_channel=%s include_users=%s",
+            interaction.guild.id,
+            server,
+            old_channel_id or 0,
+            selected_channel.id,
+            include_users,
+        )
+        await interaction.followup.send(
+            f"✅ **{display_name}** moved from "
+            f"**#{old_channel_name or old_channel_id or 'unassigned'}** to "
+            f"**#{selected_channel.name}**.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.modify",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="channel_updated",
+            target_type="server",
+            target_id=server,
+            target_name=display_name,
+            metadata={
+                "old_channel_id": old_channel_id,
+                "new_channel_id": selected_channel.id,
+                "include_users": include_users,
+            },
+        )
+    except Exception as exc:
+        log.error(
+            "Default server modify failed guild=%s server=%s error=%s message=%r",
+            interaction.guild.id,
+            server,
+            type(exc).__name__,
+            str(exc),
+        )
+        await interaction.followup.send(
+            "⚠️ Could not move that default server.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.modify",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="failed",
+            error=exc,
+            target_type="server",
+            target_id=server,
+        )
+
+
+@default_modify.autocomplete("server")
+async def default_modify_server_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+
+
+@default_modify.autocomplete("announcement_channel")
+async def default_modify_channel_autocomplete(interaction, current):
+    return announcement_channel_choices(interaction, current)
+
+
 @default_group.command(name="remove", description="Remove a server from defaults")
 async def default_remove(interaction, server: str):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
     try:
-        old_channel = old_message = None
+        old_channel = old_message = assigned_channel_id = None
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
                 raise ValueError("server_not_found")
+            assigned_channel_id = gs.announcement_channel_id
             gs.is_default = False
             gs.include_users = False
+            gs.announcement_channel_id = None
+            gs.announcement_channel_name = None
             name = gs.display_name
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
-                old_channel, old_message = state.announcement_channel_id, state.announcement_message_id
+                old_channel = state.announcement_channel_id
+                old_message = state.announcement_message_id
                 session.delete(state)
+
         if old_channel and old_message:
-            await delete_discord_message(interaction.guild.id, old_channel, old_message)
+            await delete_discord_message(
+                interaction.guild.id,
+                old_channel,
+                old_message,
+            )
         await clear_persistent_player_display(interaction.guild, server)
-        if not get_default_guild_servers(interaction.guild.id):
-            settings = get_settings(interaction.guild.id)
-            channel = interaction.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
+
+        if not get_default_guild_servers(interaction.guild.id) and assigned_channel_id:
+            channel = interaction.guild.get_channel(int(assigned_channel_id))
             if channel:
                 await channel.send("⚠️ **No default server(s) set**")
                 log.info(
                     "No-default notice posted guild=%s channel=%s",
-                    interaction.guild.id, channel.id
+                    interaction.guild.id,
+                    channel.id,
                 )
-        await interaction.followup.send(f"✅ **{name}** removed from default servers.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.remove", command_type="slash", success=True, started=started, result_code="default_removed", target_type="server", target_id=server, target_name=name)
+
+        await interaction.followup.send(
+            f"✅ **{name}** removed from default servers.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.remove",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="default_removed",
+            target_type="server",
+            target_id=server,
+            target_name=name,
+        )
     except Exception as exc:
-        await interaction.followup.send("⚠️ Could not remove that default server.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.remove", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        await interaction.followup.send(
+            "⚠️ Could not remove that default server.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.remove",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="failed",
+            error=exc,
+            target_type="server",
+            target_id=server,
+        )
 
 
 @default_remove.autocomplete("server")
@@ -3267,6 +3807,22 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
     refs = [x for x in re.split(r"[\s,]+", server_urls.strip()) if x]
     added, updated, failed = [], [], []
     activated = []
+    configured_channels = configured_announcement_channels(interaction.guild.id)
+    default_channel = None
+    if make_default:
+        if len(configured_channels) == 1:
+            default_channel = interaction.guild.get_channel(
+                configured_channels[0]["channel_id"]
+            )
+        else:
+            make_default = False
+            await interaction.followup.send(
+                "ℹ️ The server(s) will be added as non-default because "
+                "`make_default` requires exactly one configured announcement "
+                "channel in v2.3.0. Use `/defaultserver add` afterward to choose "
+                "the destination.",
+                ephemeral=True,
+            )
     try:
         for ref in refs:
             parsed = parse_server_reference(ref)
@@ -3297,16 +3853,38 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         server_guid=guid,
                         display_name=parsed["name"],
                         is_default=make_default,
+                        announcement_channel_id=(
+                            default_channel.id if make_default and default_channel else None
+                        ),
+                        announcement_channel_name=(
+                            default_channel.name if make_default and default_channel else None
+                        ),
                     ))
                     added.append(parsed["name"])
                     if make_default:
-                        activated.append((guid, parsed["name"]))
+                        activated.append(
+                            (
+                                guid,
+                                parsed["name"],
+                                default_channel.id,
+                                default_channel.name,
+                            )
+                        )
                 else:
                     updated.append(gs.display_name)
                     if make_default and not gs.is_default:
                         gs.is_default = True
-                        activated.append((guid, gs.display_name))
-        for guid, display_name in activated:
+                        gs.announcement_channel_id = default_channel.id
+                        gs.announcement_channel_name = default_channel.name
+                        activated.append(
+                            (
+                                guid,
+                                gs.display_name,
+                                default_channel.id,
+                                default_channel.name,
+                            )
+                        )
+        for guid, display_name, channel_id, channel_name in activated:
             try:
                 snapshot = FRESH_SERVER_CACHE.get(guid) or await asyncio.to_thread(get_keeper_snapshot, guid)
                 await post_automatic_announcement(
@@ -3316,6 +3894,8 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         server_guid=guid,
                         display_name=display_name,
                         is_default=True,
+                        announcement_channel_id=channel_id,
+                        announcement_channel_name=channel_name,
                     ),
                     get_server_status(snapshot),
                     map_change=False,
@@ -3396,18 +3976,189 @@ async def renameserver_autocomplete(interaction, current):
     return command_choice_list(interaction.guild.id, current) if interaction.guild else []
 
 
-@tree.command(name="setannouncementchannel", description="Set this guild's announcement channel")
-async def setannouncementchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+@tree.command(name="addannouncementchannel", description="Add one announcement channel")
+@app_commands.describe(channel="Text channel available to default servers")
+async def addannouncementchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
+
+    added = False
+    auto_assigned = []
     with SessionLocal.begin() as session:
-        settings = session.get(GuildSettings, interaction.guild.id)
-        settings.guild_name = interaction.guild.name
-        settings.announcement_channel_id = channel.id
-        settings.announcement_channel_name = channel.name
-    await interaction.followup.send(f"✅ Announcement channel set to **#{channel.name}**.", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setannouncementchannel", command_type="slash", success=True, started=started, result_code="updated", target_type="channel", target_id=channel.id, target_name=channel.name)
+        existing = session.get(
+            GuildAnnouncementChannel,
+            (interaction.guild.id, channel.id),
+        )
+        if existing is None:
+            session.add(
+                GuildAnnouncementChannel(
+                    guild_id=interaction.guild.id,
+                    guild_name=interaction.guild.name,
+                    channel_id=channel.id,
+                    channel_name=channel.name,
+                )
+            )
+            added = True
+        else:
+            existing.guild_name = interaction.guild.name
+            existing.channel_name = channel.name
+
+        configured_count = session.scalar(
+            select(func.count())
+            .select_from(GuildAnnouncementChannel)
+            .where(GuildAnnouncementChannel.guild_id == interaction.guild.id)
+        ) or 0
+
+        # When the very first announcement channel is added, preserve the
+        # historical single-channel behavior for any already-default servers
+        # (including the bundled AAA default on a brand-new guild).
+        if configured_count == 1:
+            defaults = session.scalars(
+                select(GuildServer).where(
+                    GuildServer.guild_id == interaction.guild.id,
+                    GuildServer.is_default.is_(True),
+                    GuildServer.announcement_channel_id.is_(None),
+                )
+            ).all()
+            for gs in defaults:
+                gs.announcement_channel_id = channel.id
+                gs.announcement_channel_name = channel.name
+                auto_assigned.append(gs.display_name)
+
+    result_code = "added" if added else "already_configured"
+    response = (
+        f"✅ Added **#{channel.name}** as an announcement channel."
+        if added
+        else f"ℹ️ **#{channel.name}** is already a configured announcement channel."
+    )
+    if auto_assigned:
+        response += (
+            "\nAutomatically assigned existing default server(s): "
+            + ", ".join(f"**{name}**" for name in auto_assigned)
+        )
+
+    await interaction.followup.send(response, ephemeral=True)
+    log.info(
+        "Announcement channel configured guild=%s channel=%s added=%s "
+        "auto_assigned_defaults=%s",
+        interaction.guild.id,
+        channel.id,
+        added,
+        len(auto_assigned),
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="addannouncementchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code=result_code,
+        target_type="channel",
+        target_id=channel.id,
+        target_name=channel.name,
+        metadata={"auto_assigned_defaults": len(auto_assigned)},
+    )
+
+
+@tree.command(name="delannouncementchannel", description="Remove one configured announcement channel")
+@app_commands.describe(channel="Configured announcement channel")
+async def delannouncementchannel(
+    interaction: discord.Interaction,
+    channel: str,
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+
+    selected, channel_error = resolve_configured_announcement_channel(
+        interaction.guild,
+        channel,
+    )
+    if channel_error:
+        await interaction.followup.send(
+            "⚠️ Choose an announcement channel from the configured list.",
+            ephemeral=True,
+        )
+        return
+
+    with SessionLocal() as session:
+        in_use = session.scalars(
+            select(GuildServer).where(
+                GuildServer.guild_id == interaction.guild.id,
+                GuildServer.is_default.is_(True),
+                GuildServer.announcement_channel_id == selected.id,
+            )
+            .order_by(GuildServer.display_name)
+        ).all()
+        in_use_names = [row.display_name for row in in_use]
+
+    if in_use_names:
+        shown = ", ".join(in_use_names[:10])
+        if len(in_use_names) > 10:
+            shown += f", +{len(in_use_names) - 10} more"
+        await interaction.followup.send(
+            f"⛔ **#{selected.name}** is still assigned to default server(s): "
+            f"**{shown}**.\nMove them first with `/defaultserver modify`, "
+            "then remove the channel.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="delannouncementchannel",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="channel_in_use",
+            target_type="channel",
+            target_id=selected.id,
+            target_name=selected.name,
+            metadata={"default_servers": len(in_use_names)},
+        )
+        return
+
+    with SessionLocal.begin() as session:
+        session.execute(
+            delete(GuildAnnouncementChannel).where(
+                GuildAnnouncementChannel.guild_id == interaction.guild.id,
+                GuildAnnouncementChannel.channel_id == selected.id,
+            )
+        )
+
+    await interaction.followup.send(
+        f"✅ Removed **#{selected.name}** from configured announcement channels.",
+        ephemeral=True,
+    )
+    log.info(
+        "Announcement channel removed guild=%s channel=%s",
+        interaction.guild.id,
+        selected.id,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="delannouncementchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="removed",
+        target_type="channel",
+        target_id=selected.id,
+        target_name=selected.name,
+    )
+
+
+@delannouncementchannel.autocomplete("channel")
+async def delannouncementchannel_autocomplete(interaction, current):
+    return announcement_channel_choices(interaction, current)
 
 
 @tree.command(name="setroleschannel", description="Set the self-service BF4 map-role channel")
@@ -4103,22 +4854,56 @@ async def announce(interaction: discord.Interaction):
     if not await prepare_management(interaction):
         return
     defaults = get_default_guild_servers(interaction.guild.id)
-    settings = get_settings(interaction.guild.id)
-    channel = interaction.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
-    if not channel:
-        await interaction.followup.send("⚠️ Announcement channel is not configured.", ephemeral=True)
+    if not defaults:
+        await interaction.followup.send("⚠️ No default server(s) set.", ephemeral=True)
         return
     sent = 0
+    failed = 0
     for gs, bf in defaults:
+        channel = (
+            interaction.guild.get_channel(int(gs.announcement_channel_id))
+            if gs.announcement_channel_id
+            else None
+        )
+        if not isinstance(channel, discord.TextChannel):
+            failed += 1
+            log.warning(
+                "Manual announce skipped unresolved channel guild=%s server=%s channel=%s",
+                interaction.guild.id,
+                bf.server_guid,
+                gs.announcement_channel_id,
+            )
+            continue
         try:
             snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
             msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
             asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
             sent += 1
         except Exception as exc:
-            log.warning("Manual announce failed guild=%s server=%s error=%s", interaction.guild.id, bf.server_guid, type(exc).__name__)
-    await interaction.followup.send(f"✅ Posted **{sent}** temporary announcement(s).", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="announce", command_type="slash", success=True, started=started, result_code="posted", metadata={"sent": sent})
+            failed += 1
+            log.warning(
+                "Manual announce failed guild=%s server=%s channel=%s error=%s",
+                interaction.guild.id,
+                bf.server_guid,
+                channel.id,
+                type(exc).__name__,
+            )
+    await interaction.followup.send(
+        f"✅ Posted **{sent}** temporary announcement(s)."
+        + (f" ⚠️ Failed/skipped: **{failed}**." if failed else ""),
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="announce",
+        command_type="slash",
+        success=failed == 0,
+        started=started,
+        result_code="posted" if failed == 0 else "partial",
+        metadata={"sent": sent, "failed": failed},
+    )
 
 
 def help_messages(member: discord.Member):
@@ -4134,6 +4919,7 @@ def help_messages(member: discord.Member):
     ])
     if not can_manage(member):
         return [basic]
+
     settings = get_settings(member.guild.id)
     mgmt = "\n".join([
         "**Management slash commands**",
@@ -4142,8 +4928,9 @@ def help_messages(member: discord.Member):
         "`/announce` or `!announce` — temporary default-server announcements.",
         "`/debug` — Keeper diagnostics.",
         "`/addserver`, `/delserver`, `/renameserver` — manage this guild's servers.",
-        "`/defaultserver add|remove|list` — manage defaults; `add` can optionally keep a persistent player roster in the announcement channel.",
-        "`/setannouncementchannel` — set announcement channel.\n        `/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
+        "`/defaultserver add|modify|remove|list` — manage defaults, per-server announcement routing, and optional persistent player rosters.",
+        "`/addannouncementchannel`, `/delannouncementchannel` — manage announcement-channel choices.",
+        "`/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
         "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
         "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",
         "`/setmaprole`, `/editmaprole`, `/delmaprole` — manage map role pings.",
@@ -4151,17 +4938,45 @@ def help_messages(member: discord.Member):
         f"Global polling interval: **{CHECK_INTERVAL_SECONDS} seconds** (.env)",
         f"Global presence interval: **{PRESENCE_UPDATE_SECONDS} seconds** (.env)",
     ])
-    config = "\n\n".join([
-        "**Current guild configuration**",
-        f"**Servers:**\n```text\n{platform_server_list(member.guild.id, include_guid=True)}\n```",
-        f"**Announcement channel:** {settings.announcement_channel_id}",
-        "**Listen channels:** " + (", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id))) or "None"),
+
+    server_lines = platform_server_list(
+        member.guild.id,
+        include_guid=True,
+    ).splitlines()
+    server_chunks = chunk_table(
+        "**Current guild configuration**\n**Servers:**\n",
+        [],
+        server_lines,
+        1850,
+    )
+
+    configured_channels = configured_announcement_channels(member.guild.id)
+    if configured_channels:
+        channel_text = ", ".join(
+            f"#{(member.guild.get_channel(row['channel_id']).name if member.guild.get_channel(row['channel_id']) else row['channel_name'] or row['channel_id'])}"
+            for row in configured_channels
+        )
+    else:
+        channel_text = "None"
+
+    summary = "\n".join([
+        f"**Configured announcement channels:** {channel_text}",
+        "**Listen channels:** "
+        + (
+            ", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id)))
+            or "None"
+        ),
         f"**Management minimum role:** {settings.management_min_role_id}",
         f"**User-command required role:** {settings.status_min_role_id}",
         f"**Role-assignment channel:** {settings.roles_channel_id or 'None'}",
-        f"**Map role pings:**\n{map_roles_text(member.guild)}",
     ])
-    return [basic, mgmt, config]
+
+    map_text = map_roles_text(member.guild)
+    map_chunks = split_messages(
+        [f"**Map role pings:**\n{map_text}"],
+        1850,
+    )
+    return [basic, mgmt, *server_chunks, summary, *map_chunks]
 
 
 @client.event
@@ -4191,9 +5006,58 @@ async def on_message(message: discord.Message):
             if not can_use_user_commands(message.author):
                 await deny_user_command_role(message, "help", started)
                 return
-            for chunk in help_messages(message.author):
-                await message.channel.send(chunk)
-            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="help", command_type="prefix", success=True, started=started, result_code="ok")
+            help_chunks = help_messages(message.author)
+            for chunk_index, chunk in enumerate(help_chunks, 1):
+                try:
+                    await message.channel.send(chunk)
+                except Exception as exc:
+                    log.error(
+                        "Help chunk send failed guild=%s channel=%s user=%s "
+                        "chunk=%s/%s length=%s error=%s message=%r",
+                        message.guild.id,
+                        message.channel.id,
+                        message.author.id,
+                        chunk_index,
+                        len(help_chunks),
+                        len(chunk),
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                    audit_command(
+                        guild=message.guild,
+                        channel=message.channel,
+                        user=message.author,
+                        command_name="help",
+                        command_type="prefix",
+                        success=False,
+                        started=started,
+                        result_code="chunk_send_failed",
+                        error=exc,
+                        metadata={
+                            "chunk_index": chunk_index,
+                            "chunk_total": len(help_chunks),
+                            "chunk_length": len(chunk),
+                        },
+                    )
+                    try:
+                        await message.channel.send(
+                            f"⚠️ Help output failed while sending chunk "
+                            f"**{chunk_index}/{len(help_chunks)}**."
+                        )
+                    except Exception:
+                        pass
+                    return
+            audit_command(
+                guild=message.guild,
+                channel=message.channel,
+                user=message.author,
+                command_name="help",
+                command_type="prefix",
+                success=True,
+                started=started,
+                result_code="ok",
+                metadata={"chunks": len(help_chunks)},
+            )
             return
 
         if command == "!list":
@@ -4209,19 +5073,43 @@ async def on_message(message: discord.Message):
         if command == "!announce":
             if not can_manage(message.author) or not management_channel_allowed(message):
                 return
-            settings = get_settings(message.guild.id)
-            channel = message.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
-            if not channel:
-                await message.channel.send("⚠️ Announcement channel is not configured.")
+            defaults = get_default_guild_servers(message.guild.id)
+            if not defaults:
+                await message.channel.send("⚠️ No default server(s) set.")
                 return
             sent = 0
-            for gs, bf in get_default_guild_servers(message.guild.id):
-                snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
-                msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
-                asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
-                sent += 1
-            await message.channel.send(f"✅ Posted **{sent}** temporary announcement(s).")
-            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="announce", command_type="prefix", success=True, started=started, result_code="posted", metadata={"sent": sent})
+            failed = 0
+            for gs, bf in defaults:
+                channel = (
+                    message.guild.get_channel(int(gs.announcement_channel_id))
+                    if gs.announcement_channel_id
+                    else None
+                )
+                if not isinstance(channel, discord.TextChannel):
+                    failed += 1
+                    continue
+                try:
+                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                    msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
+                    asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
+                    sent += 1
+                except Exception:
+                    failed += 1
+            await message.channel.send(
+                f"✅ Posted **{sent}** temporary announcement(s)."
+                + (f" ⚠️ Failed/skipped: **{failed}**." if failed else "")
+            )
+            audit_command(
+                guild=message.guild,
+                channel=message.channel,
+                user=message.author,
+                command_name="announce",
+                command_type="prefix",
+                success=failed == 0,
+                started=started,
+                result_code="posted" if failed == 0 else "partial",
+                metadata={"sent": sent, "failed": failed},
+            )
             return
 
         if command == "!status":

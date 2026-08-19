@@ -3,57 +3,56 @@
 BF4 Server Watcher is licensed under the MIT License. Third-party software and
 services retain their own licenses and terms.
 
-The dependency versions below match the v2.0.0 `requirements.txt` release
-bundle.
+The dependency ranges below match the v2.3.0 `requirements.txt` release bundle. The listed lower bounds are the versions tested for this release; upper bounds prevent unreviewed breaking-version upgrades.
 
 ## Python dependencies
 
-### discord.py 2.7.1
+### discord.py >=2.7.1,<3
 - Purpose: Discord API client.
 - License: MIT.
 - Upstream: https://github.com/Rapptz/discord.py
 - PyPI: https://pypi.org/project/discord.py/
 
-### Requests 2.34.2
+### Requests >=2.34.2,<3
 - Purpose: HTTP client used for Keeper, BFLIST, and version-check requests.
 - License: Apache-2.0.
 - Upstream: https://github.com/psf/requests
 - PyPI: https://pypi.org/project/requests/
 
-### python-dotenv 1.2.3
+### python-dotenv >=1.2.3,<2
 - Purpose: `.env` loading for deployment-global settings.
 - License: BSD-3-Clause.
 - Upstream: https://github.com/theskumar/python-dotenv
 - PyPI: https://pypi.org/project/python-dotenv/
 
-### SQLAlchemy 2.0.52
+### SQLAlchemy >=2.0.52,<2.1
 - Purpose: Database ORM, SQL abstraction, connection pooling, and PostgreSQL/MySQL/MariaDB portability.
 - License: MIT.
 - Upstream: https://github.com/sqlalchemy/sqlalchemy
 - PyPI: https://pypi.org/project/SQLAlchemy/
 
-### Alembic 1.19.1
+### Alembic >=1.19.1,<2
 - Purpose: Database schema migrations.
 - License: MIT.
 - Upstream: https://github.com/sqlalchemy/alembic
 - PyPI: https://pypi.org/project/alembic/
 
-### Psycopg 3.3.4
+### Psycopg >=3.3.4,<4
 - Purpose: PostgreSQL database driver.
-- Installed as: `psycopg[binary]==3.3.4`.
+- Installed as: `psycopg[binary]>=3.3.4,<4`.
 - License expression reported by the Psycopg 3.3.4 PyPI metadata: LGPL-3.0-only.
 - Upstream: https://github.com/psycopg/psycopg
 - PyPI: https://pypi.org/project/psycopg/
 
-### psycopg-binary 3.3.4
+### psycopg-binary (via Psycopg `binary` extra)
 - Purpose: Precompiled Psycopg optimization/runtime component installed by the `binary` extra.
 - License expression reported by the psycopg-binary 3.3.4 PyPI metadata: LGPL-3.0-only.
 - Upstream: https://github.com/psycopg/psycopg
 - PyPI: https://pypi.org/project/psycopg-binary/
 
-### PyMySQL 1.2.0
+### PyMySQL >=1.2.0,<2
 - Purpose: MySQL/MariaDB database driver.
-- Installed as: `PyMySQL[rsa]==1.2.0`.
+- Installed as: `PyMySQL[rsa]>=1.2.0,<2`.
 - License: MIT.
 - Upstream: https://github.com/PyMySQL/PyMySQL
 - PyPI: https://pypi.org/project/PyMySQL/
@@ -66,7 +65,7 @@ bundle.
 
 ## Transitive dependencies
 
-Installing the pinned packages may install transitive dependencies under their
+Installing the bounded direct dependencies may install transitive dependencies under their
 own licenses. This source release does not distribute a prebuilt Docker image.
 
 Before publishing a prebuilt Docker image or binary distribution, generate and

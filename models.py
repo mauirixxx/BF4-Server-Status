@@ -37,6 +37,19 @@ class GuildSettings(Base):
     roles_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
+class GuildAnnouncementChannel(Base):
+    __tablename__ = "guild_announcement_channels"
+    guild_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
+        primary_key=True, autoincrement=False
+    )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    channel_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class GuildRolePanelMessage(Base):
     __tablename__ = "guild_role_panel_messages"
     guild_id: Mapped[int] = mapped_column(
@@ -83,6 +96,8 @@ class GuildServer(Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     include_users: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    announcement_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    announcement_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class GuildServerPlayerMessage(Base):

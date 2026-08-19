@@ -17,7 +17,7 @@ and imports guild-specific data into the v2 database.
 
 Imported data includes:
 
-- Announcement channel.
+- Configured announcement channel(s) and each default server's assigned destination.
 - Listen channels.
 - Management minimum role.
 - Status minimum role.
@@ -179,3 +179,16 @@ Rolling back application code to v1.x requires its old JSON configuration files;
 Any guild the bot newly joins in v2 receives its own database configuration, AAA as its initial default BF4 server, and the disabled Operation Locker map-role default.
 
 Multiple guilds can reference the same global BF4 server without creating duplicate Keeper polling requests.
+
+
+## v2.2.x to v2.3.0 announcement-channel migration
+
+Alembic revision `0006_v2_3_0` converts the existing single announcement-channel configuration into the multi-channel model automatically.
+
+For each guild with a nonzero legacy announcement channel:
+
+- The channel is inserted into `guild_announcement_channels`.
+- Existing default servers are assigned to that channel.
+- Existing automatic announcement/player-list message state remains associated with the same Discord destination.
+
+After upgrading, administrators may add more destinations with `/addannouncementchannel` and move individual defaults with `/defaultserver modify`.
