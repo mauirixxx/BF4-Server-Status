@@ -23,9 +23,12 @@ Never commit the real token.
 - Embed Links
 - Read Message History
 - Manage Messages
+- **Manage Roles** — required for v2.1.0 self-service map-role assignment/removal.
 - Mention @everyone, @here, and All Roles
 
 Administrator permission is not required.
+
+For self-service map roles, ServerWatcher's bot/integration role must also be positioned **above every BF4 map role it is expected to assign or remove**. `Manage Roles` alone cannot bypass Discord's role hierarchy.
 
 ## Slash commands
 
@@ -86,6 +89,54 @@ Use:
 to manage channels where normal users may use `!` commands.
 
 Managers may use management commands in the configured announcement channel or listen channels.
+
+## Self-service map-role channel
+
+Use:
+
+```text
+/setroleschannel channel:<text channel>
+/delroleschannel
+```
+
+to enable or disable the persistent map-role button panel for a guild.
+
+ServerWatcher sorts eligible map names alphabetically and places at most **15 buttons per message**. With all 33 maps configured, the layout is 15 + 15 + 3 across three persistent messages. Missing/deleted roles, `role_id=0` entries, and roles the bot cannot manage are not offered.
+
+When `/setroleschannel` moves the panel, ServerWatcher first creates and validates the complete new panel. Only after that succeeds does it remove the old panel and persist the new channel/message state.
+
+On startup, ServerWatcher validates stored panel messages, edits existing messages, recreates deleted ones, and removes stale extras so the panel reflects current map-role configuration.
+
+### Suggested `@everyone` permissions for the roles channel
+
+For a read-only role-selection channel:
+
+```text
+View Channel:                 Allow
+Read Message History:         Allow
+Send Messages:                Deny
+Create Public Threads:        Deny
+Create Private Threads:       Deny
+Send Messages in Threads:     Deny
+Add Reactions:                Deny
+Mention @everyone/@here:      Deny
+```
+
+Channel visibility remains a Discord administration choice. `status_min_role_id` does **not** hide the channel; it controls whether a member may successfully use the buttons.
+
+### ServerWatcher permissions in the roles channel
+
+ServerWatcher should have:
+
+```text
+View Channel:             Allow
+Send Messages:            Allow
+Read Message History:     Allow
+```
+
+The bot role also needs the server-level **Manage Roles** permission and must sit above each target map role.
+
+If users can see the buttons but assignment fails, verify: `Manage Roles`, bot role position, target role existence, `/setroleschannel`, and the user's exact `status_min_role_id` membership when configured.
 
 ## Role thresholds
 

@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.0.5
+# BF4 Server Watcher v2.1.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -150,6 +150,9 @@ management_min_role_name
 
 status_min_role_id
 status_min_role_name
+
+roles_channel_id
+roles_channel_name
 ```
 
 The name snapshots are refreshed during guild reconciliation/startup and when the corresponding guild setting is changed. Guild, configured-channel, and configured-role rename events also refresh them when ServerWatcher can resolve the updated Discord object.
@@ -507,6 +510,8 @@ All ordinary commands above inherit the common `status_min_role_id` gate describ
 - `/defaultserver remove server:<selection>`
 - `/defaultserver list`
 - `/setannouncementchannel channel:<channel>`
+- `/setroleschannel channel:<text channel>` — create/move the persistent self-service map-role panel.
+- `/delroleschannel` — disable self-service map roles and remove the persisted panel.
 - `/addlistenchannel channel:<text channel>` — add one listen channel using Discord's native channel selector.
 - `/dellistenchannel channel:<text channel>` — remove one listen channel using Discord's native channel selector.
 - `/setmanagementrole [role:<role>]`
@@ -516,6 +521,27 @@ All ordinary commands above inherit the common `status_min_role_id` gate describ
 - `/delmaprole map_search:<map selection>` — uses the same full-map autocomplete as `/setmaprole`; `/editmaprole` intentionally lists only maps configured for that guild.
 
 `/reload`, `/setinterval`, and `/setpresenceupdate` were removed in v2.0.0 because global settings are environment-based and guild runtime state is database-backed.
+
+## Self-service map notification roles
+
+v2.1.0 adds an optional persistent button panel for guild members to toggle configured BF4 map notification roles on themselves.
+
+Administrators configure the dedicated channel with:
+
+```text
+/setroleschannel channel:<text channel>
+/delroleschannel
+```
+
+Only enabled map-role entries already configured through `/setmaprole` are eligible. `role_id=0`, missing roles, and roles ServerWatcher cannot manage are omitted from the panel.
+
+The panel uses neutral Discord buttons and sends an ephemeral confirmation after each toggle. Buttons are sorted alphabetically and limited to **15 maps per persistent message**. If all 33 BF4 maps are configured and manageable, ServerWatcher creates three messages containing **15 + 15 + 3** buttons.
+
+`status_min_role_id` also gates button use. When nonzero, an ordinary user must possess that exact role; management-authorized members bypass the requirement. The roles channel itself may still be visible to other members depending on Discord channel permissions.
+
+ServerWatcher stores `roles_channel_id` / `roles_channel_name` plus persistent panel message state in the database. Startup and configuration changes validate, edit, recreate, or remove panel messages as needed without intentionally duplicating the panel.
+
+The bot requires Discord **Manage Roles**, and its highest role must be above each self-assignable map role.
 
 ## Integrated map-role announcements
 

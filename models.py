@@ -33,6 +33,21 @@ class GuildSettings(Base):
     management_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status_min_role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     status_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    roles_channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    roles_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class GuildRolePanelMessage(Base):
+    __tablename__ = "guild_role_panel_messages"
+    guild_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
+        primary_key=True, autoincrement=False
+    )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    panel_index: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class GuildListenChannel(Base):

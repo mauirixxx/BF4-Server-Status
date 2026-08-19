@@ -39,3 +39,29 @@ Discord snowflake IDs, BF4 map keys, and server GUIDs remain authoritative. For 
 - `guild_listen_channels`: guild name and channel name.
 
 Alembic revision `0003_v2_0_4` rebuilds/copies these tables to establish the intended physical column order while preserving existing data and constraints. Map names are SQL-resolved from `bf4_maps`; Discord-resolved names are synchronized during guild reconciliation and relevant runtime configuration/rename/delete events. An unresolved Discord object leaves its readable snapshot `NULL` without invalidating the authoritative ID.
+
+
+## Self-service role panel state (v2.1.0)
+
+`guild_settings` adds:
+
+```text
+roles_channel_id
+roles_channel_name
+```
+
+The ID remains authoritative and the name is a human-readable Discord snapshot.
+
+Persistent role-panel messages are tracked in:
+
+```text
+guild_role_panel_messages
+guild_id
+guild_name
+panel_index
+channel_id
+channel_name
+message_id
+```
+
+`panel_index` provides deterministic ordering for multiple messages. ServerWatcher intentionally limits role panels to 15 map buttons per message and reconciles stored message state during startup/configuration changes.

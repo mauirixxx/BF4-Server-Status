@@ -25,13 +25,14 @@ from models import (
     Guild,
     GuildListenChannel,
     GuildMapRolePing,
+    GuildRolePanelMessage,
     GuildServer,
     GuildServerState,
     GuildSettings,
     MigrationState,
 )
 
-BOT_VERSION = "v2.0.5"
+BOT_VERSION = "v2.1.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -40,6 +41,7 @@ LOCKER_KEY = "MP_Prison"
 LOCKER_MESSAGE = "Operation Locker is now live!"
 LEGACY_IMPORT_KEY = "legacy_v1_import"
 MANUAL_ANNOUNCEMENT_TTL_SECONDS = 600
+ROLE_PANEL_BUTTONS_PER_MESSAGE = 15
 GUILD_RETENTION_DAYS = 30
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -657,6 +659,15 @@ def sync_guild_settings_names(
         status_role.name if status_role is not None else None
     )
 
+    roles_channel = (
+        discord_guild.get_channel(int(settings.roles_channel_id))
+        if settings.roles_channel_id
+        else None
+    )
+    settings.roles_channel_name = (
+        roles_channel.name if roles_channel is not None else None
+    )
+
 
 def refresh_guild_settings_names(discord_guild: discord.Guild):
     with SessionLocal.begin() as session:
@@ -702,6 +713,16 @@ def refresh_guild_readable_snapshots(discord_guild: discord.Guild):
                 else None
             )
             row.role_name = role.name if role is not None else None
+
+        panel_rows = session.scalars(
+            select(GuildRolePanelMessage).where(
+                GuildRolePanelMessage.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in panel_rows:
+            row.guild_name = discord_guild.name
+            channel = discord_guild.get_channel(int(row.channel_id))
+            row.channel_name = channel.name if channel is not None else None
 
         state_rows = session.scalars(
             select(GuildServerState).where(
@@ -753,6 +774,8 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
                 management_min_role_name=None,
                 status_min_role_id=0,
                 status_min_role_name=None,
+                roles_channel_id=0,
+                roles_channel_name=None,
             )
             session.add(settings)
         sync_guild_settings_names(discord_guild, settings)
@@ -1738,9 +1761,12 @@ async def on_guild_remove(guild):
 
 @client.event
 async def on_guild_channel_update(before, after):
-    if before.name != after.name:
-        try:
-            refresh_guild_readable_snapshots(after.guild)
+    try:
+        refresh_guild_readable_snapshots(after.guild)
+        settings = get_settings(after.guild.id)
+        if settings.roles_channel_id == after.id:
+            await reconcile_role_panel(after.guild)
+        if before.name != after.name:
             log.info(
                 "Guild settings channel name refreshed guild=%s channel=%s old=%r new=%r",
                 after.guild.id,
@@ -1748,20 +1774,23 @@ async def on_guild_channel_update(before, after):
                 before.name,
                 after.name,
             )
-        except Exception as exc:
-            log.error(
-                "Guild settings channel name refresh failed guild=%s channel=%s error=%s message=%r",
-                after.guild.id,
-                after.id,
-                type(exc).__name__,
-                str(exc),
-            )
+    except Exception as exc:
+        log.error(
+            "Guild settings channel refresh failed guild=%s channel=%s error=%s message=%r",
+            after.guild.id,
+            after.id,
+            type(exc).__name__,
+            str(exc),
+        )
 
 
 @client.event
 async def on_guild_channel_delete(channel):
     try:
+        settings = get_settings(channel.guild.id)
         refresh_guild_readable_snapshots(channel.guild)
+        if settings.roles_channel_id == channel.id:
+            await reconcile_role_panel(channel.guild)
         log.info(
             "Guild settings channel snapshots refreshed after delete guild=%s channel=%s",
             channel.guild.id,
@@ -1781,6 +1810,7 @@ async def on_guild_channel_delete(channel):
 async def on_guild_role_delete(role):
     try:
         refresh_guild_readable_snapshots(role.guild)
+        await reconcile_role_panel(role.guild)
         log.info(
             "Guild settings role snapshots refreshed after delete guild=%s role=%s",
             role.guild.id,
@@ -1798,24 +1828,26 @@ async def on_guild_role_delete(role):
 
 @client.event
 async def on_guild_role_update(before, after):
-    if before.name != after.name:
-        try:
-            refresh_guild_readable_snapshots(after.guild)
-            log.info(
-                "Guild settings role name refreshed guild=%s role=%s old=%r new=%r",
-                after.guild.id,
-                after.id,
-                before.name,
-                after.name,
-            )
-        except Exception as exc:
-            log.error(
-                "Guild settings role name refresh failed guild=%s role=%s error=%s message=%r",
-                after.guild.id,
-                after.id,
-                type(exc).__name__,
-                str(exc),
-            )
+    try:
+        refresh_guild_readable_snapshots(after.guild)
+        await reconcile_role_panel(after.guild)
+        log.info(
+            "Guild role update reconciled guild=%s role=%s old_name=%r new_name=%r old_position=%s new_position=%s",
+            after.guild.id,
+            after.id,
+            before.name,
+            after.name,
+            before.position,
+            after.position,
+        )
+    except Exception as exc:
+        log.error(
+            "Guild role update reconciliation failed guild=%s role=%s error=%s message=%r",
+            after.guild.id,
+            after.id,
+            type(exc).__name__,
+            str(exc),
+        )
 
 
 @client.event
@@ -1826,6 +1858,571 @@ async def on_guild_update(before, after):
             log.info("Guild name updated guild=%s old=%r new=%r", after.id, before.name, after.name)
         except Exception as exc:
             log.error("Guild name update failed guild=%s error=%s", after.id, type(exc).__name__)
+
+
+def role_self_service_problem(guild: discord.Guild, role: discord.Role) -> str | None:
+    """Return a human-readable reason this role cannot be self-assigned."""
+    bot_member = guild.me
+    if bot_member is None:
+        return "ServerWatcher member could not be resolved"
+    if not bot_member.guild_permissions.manage_roles:
+        return "ServerWatcher is missing the Manage Roles permission"
+    if role.is_default() or role.managed:
+        return "that Discord role is not manually assignable"
+    if bot_member.top_role <= role:
+        return "ServerWatcher's highest role must be above the target role"
+    return None
+
+
+def role_panel_items(guild: discord.Guild):
+    """Return alphabetically sorted, enabled, resolvable, manageable map roles."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildMapRolePing, BF4Map)
+            .join(BF4Map, GuildMapRolePing.map_key == BF4Map.map_key)
+            .where(
+                GuildMapRolePing.guild_id == guild.id,
+                GuildMapRolePing.role_id != 0,
+            )
+            .order_by(BF4Map.map_name)
+        ).all()
+
+    items = []
+    for ping, map_row in rows:
+        role = guild.get_role(int(ping.role_id))
+        if role is None:
+            log.warning(
+                "Role panel skipping unresolved role guild=%s map=%s role=%s",
+                guild.id,
+                map_row.map_key,
+                ping.role_id,
+            )
+            continue
+        problem = role_self_service_problem(guild, role)
+        if problem:
+            log.warning(
+                "Role panel skipping unmanageable role guild=%s map=%s role=%s reason=%r",
+                guild.id,
+                map_row.map_key,
+                role.id,
+                problem,
+            )
+            continue
+        items.append(
+            {
+                "map_key": map_row.map_key,
+                "map_name": map_row.map_name,
+                "role_id": role.id,
+                "role_name": role.name,
+            }
+        )
+    return items
+
+
+def role_panel_chunks(guild: discord.Guild):
+    items = role_panel_items(guild)
+    if not items:
+        return [[]]
+    return [
+        items[i:i + ROLE_PANEL_BUTTONS_PER_MESSAGE]
+        for i in range(0, len(items), ROLE_PANEL_BUTTONS_PER_MESSAGE)
+    ]
+
+
+def role_panel_content(panel_index: int, panel_count: int, has_buttons: bool) -> str:
+    title = "🎮 **BF4 Map Notifications**"
+    if panel_count > 1:
+        title += f" — {panel_index + 1} of {panel_count}"
+    if has_buttons:
+        return (
+            f"{title}\n"
+            "Click a map below to toggle notifications for that map. "
+            "Your confirmation is visible only to you."
+        )
+    return (
+        f"{title}\n"
+        "No self-service map notification roles are currently available. "
+        "A server administrator may need to configure or fix the map roles."
+    )
+
+
+class MapRoleButton(discord.ui.Button):
+    def __init__(self, guild_id: int, item: dict, row: int):
+        self.guild_id = int(guild_id)
+        self.map_key = str(item["map_key"])
+        super().__init__(
+            label=str(item["map_name"])[:80],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"bf4mr:{self.guild_id}:{self.map_key}",
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        started = time.perf_counter()
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "⛔ This role button can only be used inside its Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        settings = get_settings(guild.id)
+        if (
+            not settings.roles_channel_id
+            or interaction.channel_id != settings.roles_channel_id
+        ):
+            await interaction.response.send_message(
+                "⛔ This role panel is no longer active.",
+                ephemeral=True,
+            )
+            return
+
+        if not can_use_user_commands(member):
+            role_id = int(settings.status_min_role_id or 0)
+            required = guild.get_role(role_id) if role_id else None
+            role_label = f"@{required.name}" if required else f"role ID {role_id}"
+            log.info(
+                "Map role toggle denied guild=%s channel=%s user=%s map=%s "
+                "reason=status_role_required role=%s",
+                guild.id,
+                interaction.channel_id,
+                member.id,
+                self.map_key,
+                role_id,
+            )
+            audit_command(
+                guild=guild,
+                channel=interaction.channel,
+                user=member,
+                command_name="maprole.toggle",
+                command_type="button",
+                success=False,
+                started=started,
+                result_code="status_role_required",
+                target_type="map",
+                target_id=self.map_key,
+            )
+            await interaction.response.send_message(
+                f"⛔ You must have the configured status role ({role_label}) "
+                "to use map-role buttons.",
+                ephemeral=True,
+            )
+            return
+
+        with SessionLocal() as session:
+            ping = session.get(GuildMapRolePing, (guild.id, self.map_key))
+            map_row = session.get(BF4Map, self.map_key)
+            if ping is not None:
+                role_id = int(ping.role_id or 0)
+            else:
+                role_id = 0
+
+        if ping is None or map_row is None or role_id == 0:
+            await interaction.response.send_message(
+                "⚠️ That map notification role is no longer configured.",
+                ephemeral=True,
+            )
+            await reconcile_role_panel(guild)
+            return
+
+        role = guild.get_role(role_id)
+        if role is None:
+            log.warning(
+                "Map role toggle failed guild=%s user=%s map=%s role=%s "
+                "reason=role_unresolved",
+                guild.id,
+                member.id,
+                self.map_key,
+                role_id,
+            )
+            await interaction.response.send_message(
+                "⚠️ That Discord role no longer exists. Please contact a server administrator.",
+                ephemeral=True,
+            )
+            await reconcile_role_panel(guild)
+            return
+
+        problem = role_self_service_problem(guild, role)
+        if problem:
+            log.warning(
+                "Map role toggle failed guild=%s user=%s map=%s role=%s reason=%r",
+                guild.id,
+                member.id,
+                self.map_key,
+                role.id,
+                problem,
+            )
+            audit_command(
+                guild=guild,
+                channel=interaction.channel,
+                user=member,
+                command_name="maprole.toggle",
+                command_type="button",
+                success=False,
+                started=started,
+                result_code="role_unmanageable",
+                target_type="role",
+                target_id=role.id,
+                target_name=role.name,
+                metadata={"map_key": self.map_key, "reason": problem},
+            )
+            await interaction.response.send_message(
+                f"⚠️ ServerWatcher cannot manage **@{role.name}**: {problem}. "
+                "Please contact a server administrator.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            if role in member.roles:
+                await member.remove_roles(
+                    role,
+                    reason=f"BF4 ServerWatcher self-service map role: {self.map_key}",
+                )
+                enabled = False
+                result_code = "removed"
+                response = (
+                    f"➖ **{map_row.map_name}** notifications disabled. "
+                    f"Removed **@{role.name}**."
+                )
+            else:
+                await member.add_roles(
+                    role,
+                    reason=f"BF4 ServerWatcher self-service map role: {self.map_key}",
+                )
+                enabled = True
+                result_code = "added"
+                response = (
+                    f"✅ **{map_row.map_name}** notifications enabled. "
+                    f"Added **@{role.name}**."
+                )
+
+            log.info(
+                "Map role toggled guild=%s channel=%s user=%s map=%s role=%s "
+                "enabled=%s",
+                guild.id,
+                interaction.channel_id,
+                member.id,
+                self.map_key,
+                role.id,
+                enabled,
+            )
+            audit_command(
+                guild=guild,
+                channel=interaction.channel,
+                user=member,
+                command_name="maprole.toggle",
+                command_type="button",
+                success=True,
+                started=started,
+                result_code=result_code,
+                target_type="role",
+                target_id=role.id,
+                target_name=role.name,
+                metadata={"map_key": self.map_key, "map_name": map_row.map_name},
+            )
+            await interaction.response.send_message(response, ephemeral=True)
+        except discord.Forbidden as exc:
+            log.warning(
+                "Forbidden toggling map role guild=%s user=%s map=%s role=%s "
+                "error=%s",
+                guild.id,
+                member.id,
+                self.map_key,
+                role.id,
+                type(exc).__name__,
+            )
+            audit_command(
+                guild=guild,
+                channel=interaction.channel,
+                user=member,
+                command_name="maprole.toggle",
+                command_type="button",
+                success=False,
+                started=started,
+                result_code="forbidden",
+                error=exc,
+                target_type="role",
+                target_id=role.id,
+                target_name=role.name,
+                metadata={"map_key": self.map_key},
+            )
+            await interaction.response.send_message(
+                "⚠️ Discord refused the role change. Ask an administrator to "
+                "check ServerWatcher's **Manage Roles** permission and role position.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            log.error(
+                "Map role toggle failed guild=%s user=%s map=%s role=%s "
+                "error=%s message=%r",
+                guild.id,
+                member.id,
+                self.map_key,
+                role.id,
+                type(exc).__name__,
+                str(exc),
+            )
+            audit_command(
+                guild=guild,
+                channel=interaction.channel,
+                user=member,
+                command_name="maprole.toggle",
+                command_type="button",
+                success=False,
+                started=started,
+                result_code="failed",
+                error=exc,
+                target_type="role",
+                target_id=role.id,
+                target_name=role.name,
+                metadata={"map_key": self.map_key},
+            )
+            await interaction.response.send_message(
+                "⚠️ The role could not be changed. Please contact a server administrator.",
+                ephemeral=True,
+            )
+
+
+class MapRolePanelView(discord.ui.View):
+    def __init__(self, guild_id: int, items: list[dict]):
+        super().__init__(timeout=None)
+        for index, item in enumerate(items):
+            self.add_item(
+                MapRoleButton(
+                    guild_id,
+                    item,
+                    row=index // 5,
+                )
+            )
+
+
+async def fetch_panel_message(channel, message_id):
+    try:
+        return await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden):
+        return None
+
+
+async def delete_role_panel_messages(guild: discord.Guild, rows):
+    deleted = 0
+    for row in rows:
+        channel = guild.get_channel(int(row.channel_id))
+        if channel is None:
+            continue
+        message = await fetch_panel_message(channel, row.message_id)
+        if message is None:
+            continue
+        try:
+            await message.delete()
+            deleted += 1
+            log.info(
+                "Deleted role panel message guild=%s channel=%s message=%s panel=%s",
+                guild.id,
+                channel.id,
+                row.message_id,
+                row.panel_index,
+            )
+        except discord.Forbidden:
+            log.warning(
+                "Forbidden deleting role panel message guild=%s channel=%s message=%s",
+                guild.id,
+                channel.id,
+                row.message_id,
+            )
+    return deleted
+
+
+async def create_role_panel_set(guild: discord.Guild, channel: discord.TextChannel):
+    chunks = role_panel_chunks(guild)
+    panel_count = len(chunks)
+    created = []
+    try:
+        for panel_index, items in enumerate(chunks):
+            view = MapRolePanelView(guild.id, items) if items else None
+            message = await channel.send(
+                role_panel_content(panel_index, panel_count, bool(items)),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            created.append((panel_index, message, items))
+            log.info(
+                "Role panel message created guild=%s channel=%s message=%s "
+                "panel=%s/%s buttons=%s",
+                guild.id,
+                channel.id,
+                message.id,
+                panel_index + 1,
+                panel_count,
+                len(items),
+            )
+        return created
+    except Exception:
+        for _, message, _ in created:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        raise
+
+
+async def replace_persisted_role_panel(
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    created,
+):
+    with SessionLocal.begin() as session:
+        session.execute(
+            delete(GuildRolePanelMessage).where(
+                GuildRolePanelMessage.guild_id == guild.id
+            )
+        )
+        for panel_index, message, _ in created:
+            session.add(
+                GuildRolePanelMessage(
+                    guild_id=guild.id,
+                    guild_name=guild.name,
+                    panel_index=panel_index,
+                    channel_id=channel.id,
+                    channel_name=channel.name,
+                    message_id=message.id,
+                )
+            )
+
+
+async def reconcile_role_panel(guild: discord.Guild):
+    """Validate/edit/recreate the configured persistent role panel."""
+    settings = get_settings(guild.id)
+    if not settings.roles_channel_id:
+        return
+
+    channel = guild.get_channel(int(settings.roles_channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        log.warning(
+            "Roles channel unresolved; disabling self-service guild=%s channel=%s",
+            guild.id,
+            settings.roles_channel_id,
+        )
+        with SessionLocal.begin() as session:
+            live = session.get(GuildSettings, guild.id)
+            if live:
+                live.roles_channel_id = 0
+                live.roles_channel_name = None
+            session.execute(
+                delete(GuildRolePanelMessage).where(
+                    GuildRolePanelMessage.guild_id == guild.id
+                )
+            )
+        return
+
+    chunks = role_panel_chunks(guild)
+    panel_count = len(chunks)
+
+    with SessionLocal() as session:
+        stored = session.scalars(
+            select(GuildRolePanelMessage)
+            .where(GuildRolePanelMessage.guild_id == guild.id)
+            .order_by(GuildRolePanelMessage.panel_index)
+        ).all()
+        stored_data = [
+            {
+                "guild_id": r.guild_id,
+                "panel_index": r.panel_index,
+                "channel_id": r.channel_id,
+                "message_id": r.message_id,
+            }
+            for r in stored
+        ]
+
+    by_index = {r["panel_index"]: r for r in stored_data}
+    final_rows = []
+
+    for panel_index, items in enumerate(chunks):
+        view = MapRolePanelView(guild.id, items) if items else None
+        current = by_index.get(panel_index)
+        message = None
+        if current and current["channel_id"] == channel.id:
+            message = await fetch_panel_message(channel, current["message_id"])
+
+        if message is None:
+            message = await channel.send(
+                role_panel_content(panel_index, panel_count, bool(items)),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log.info(
+                "Role panel recreated guild=%s channel=%s message=%s panel=%s/%s buttons=%s",
+                guild.id,
+                channel.id,
+                message.id,
+                panel_index + 1,
+                panel_count,
+                len(items),
+            )
+        else:
+            await message.edit(
+                content=role_panel_content(
+                    panel_index,
+                    panel_count,
+                    bool(items),
+                ),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log.info(
+                "Role panel validated guild=%s channel=%s message=%s panel=%s/%s buttons=%s",
+                guild.id,
+                channel.id,
+                message.id,
+                panel_index + 1,
+                panel_count,
+                len(items),
+            )
+
+        final_rows.append((panel_index, message, items))
+
+    extras = [
+        row for row in stored_data
+        if row["panel_index"] >= panel_count
+        or row["channel_id"] != channel.id
+    ]
+    # Convert simple snapshots into delete-compatible objects.
+    class _Row:
+        pass
+    extra_objs = []
+    for data in extras:
+        obj = _Row()
+        for key, value in data.items():
+            setattr(obj, key, value)
+        extra_objs.append(obj)
+    if extra_objs:
+        await delete_role_panel_messages(guild, extra_objs)
+
+    await replace_persisted_role_panel(guild, channel, final_rows)
+    with SessionLocal.begin() as session:
+        live = session.get(GuildSettings, guild.id)
+        if live:
+            live.roles_channel_id = channel.id
+            live.roles_channel_name = channel.name
+
+    log.info(
+        "Role panel reconciliation complete guild=%s channel=%s panels=%s buttons=%s",
+        guild.id,
+        channel.id,
+        panel_count,
+        sum(len(items) for items in chunks),
+    )
+
+
+def map_role_self_service_warning(guild: discord.Guild, role_id: int) -> str | None:
+    if not role_id:
+        return None
+    role = guild.get_role(int(role_id))
+    if role is None:
+        return "the selected Discord role could not be resolved"
+    return role_self_service_problem(guild, role)
 
 
 async def send_clean_chunks(interaction, chunks):
@@ -2148,6 +2745,232 @@ async def setannouncementchannel(interaction: discord.Interaction, channel: disc
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="setannouncementchannel", command_type="slash", success=True, started=started, result_code="updated", target_type="channel", target_id=channel.id, target_name=channel.name)
 
 
+@tree.command(name="setroleschannel", description="Set the self-service BF4 map-role channel")
+@app_commands.describe(channel="Read-only text channel where ServerWatcher will post map-role buttons")
+async def setroleschannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+
+    guild = interaction.guild
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.followup.send(
+            "⚠️ ServerWatcher could not resolve its guild member record.",
+            ephemeral=True,
+        )
+        return
+
+    perms = channel.permissions_for(bot_member)
+    missing_channel_perms = []
+    if not perms.view_channel:
+        missing_channel_perms.append("View Channel")
+    if not perms.send_messages:
+        missing_channel_perms.append("Send Messages")
+    if not perms.read_message_history:
+        missing_channel_perms.append("Read Message History")
+
+    if missing_channel_perms:
+        text = ", ".join(missing_channel_perms)
+        log.warning(
+            "Set roles channel denied guild=%s channel=%s missing_permissions=%r",
+            guild.id,
+            channel.id,
+            text,
+        )
+        audit_command(
+            guild=guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="setroleschannel",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="missing_channel_permissions",
+            target_type="channel",
+            target_id=channel.id,
+            target_name=channel.name,
+            metadata={"missing_permissions": missing_channel_perms},
+        )
+        await interaction.followup.send(
+            f"⚠️ ServerWatcher needs **{text}** in #{channel.name} before it can create the role panel.",
+            ephemeral=True,
+        )
+        return
+
+    current_settings = get_settings(guild.id)
+    if current_settings.roles_channel_id == channel.id:
+        with SessionLocal.begin() as session:
+            live = session.get(GuildSettings, guild.id)
+            if live:
+                live.roles_channel_name = channel.name
+        await reconcile_role_panel(guild)
+        with SessionLocal() as session:
+            panel_count = session.scalar(
+                select(func.count())
+                .select_from(GuildRolePanelMessage)
+                .where(GuildRolePanelMessage.guild_id == guild.id)
+            ) or 0
+        await interaction.followup.send(
+            f"✅ Role-assignment channel remains **#{channel.name}**. "
+            f"Validated **{panel_count}** persistent panel message(s).",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="setroleschannel",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="validated",
+            target_type="channel",
+            target_id=channel.id,
+            target_name=channel.name,
+            metadata={"panel_messages": panel_count},
+        )
+        return
+
+    with SessionLocal() as session:
+        old_rows = session.scalars(
+            select(GuildRolePanelMessage)
+            .where(GuildRolePanelMessage.guild_id == guild.id)
+            .order_by(GuildRolePanelMessage.panel_index)
+        ).all()
+        old_rows = list(old_rows)
+
+    try:
+        # Safety rule: create the complete new panel first. Existing panel state
+        # is untouched unless every new message succeeds.
+        created = await create_role_panel_set(guild, channel)
+    except Exception as exc:
+        log.error(
+            "Set roles channel panel creation failed guild=%s channel=%s error=%s message=%r",
+            guild.id,
+            channel.id,
+            type(exc).__name__,
+            str(exc),
+        )
+        audit_command(
+            guild=guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="setroleschannel",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="panel_create_failed",
+            error=exc,
+            target_type="channel",
+            target_id=channel.id,
+            target_name=channel.name,
+        )
+        await interaction.followup.send(
+            f"⚠️ Could not create the role panel in **#{channel.name}**. "
+            "The previous roles channel/panel was left unchanged.",
+            ephemeral=True,
+        )
+        return
+
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, guild.id)
+        settings.guild_name = guild.name
+        settings.roles_channel_id = channel.id
+        settings.roles_channel_name = channel.name
+
+    await replace_persisted_role_panel(guild, channel, created)
+
+    # Only after the new panel is fully persisted do we remove old messages.
+    old_to_delete = [
+        row for row in old_rows
+        if row.channel_id != channel.id
+        or row.message_id not in {message.id for _, message, _ in created}
+    ]
+    if old_to_delete:
+        await delete_role_panel_messages(guild, old_to_delete)
+
+    warning = ""
+    if not bot_member.guild_permissions.manage_roles:
+        warning = (
+            "\n⚠️ **Self-service role assignment is currently unavailable:** "
+            "ServerWatcher is missing the **Manage Roles** permission."
+        )
+
+    await interaction.followup.send(
+        f"✅ Role-assignment channel set to **#{channel.name}**. "
+        f"Created **{len(created)}** persistent panel message(s).{warning}",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="setroleschannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="updated",
+        target_type="channel",
+        target_id=channel.id,
+        target_name=channel.name,
+        metadata={"panel_messages": len(created)},
+    )
+
+
+@tree.command(name="delroleschannel", description="Disable the self-service BF4 map-role channel")
+async def delroleschannel(interaction: discord.Interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+
+    guild = interaction.guild
+    settings = get_settings(guild.id)
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(GuildRolePanelMessage)
+            .where(GuildRolePanelMessage.guild_id == guild.id)
+            .order_by(GuildRolePanelMessage.panel_index)
+        ).all()
+        rows = list(rows)
+
+    deleted = await delete_role_panel_messages(guild, rows)
+
+    with SessionLocal.begin() as session:
+        live = session.get(GuildSettings, guild.id)
+        if live:
+            live.roles_channel_id = 0
+            live.roles_channel_name = None
+        session.execute(
+            delete(GuildRolePanelMessage).where(
+                GuildRolePanelMessage.guild_id == guild.id
+            )
+        )
+
+    await interaction.followup.send(
+        f"✅ Self-service map roles disabled. Removed **{deleted}** role-panel message(s). "
+        "Map roles remain configured for announcements and can still be assigned manually by Discord administrators.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="delroleschannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="removed",
+        target_type="channel",
+        target_id=settings.roles_channel_id or None,
+        target_name=settings.roles_channel_name,
+        metadata={"panel_messages_deleted": deleted},
+    )
+
+
 @tree.command(name="addlistenchannel", description="Add one listen channel")
 @app_commands.describe(channel="Text channel to allow regular user commands in")
 async def addlistenchannel(
@@ -2347,10 +3170,17 @@ async def setmaprole(
             ping.role_name = role.name if role and role_id else None
             ping.message = text
 
-    await interaction.followup.send(
-        f"✅ Map role updated for **{map_row.map_name}**.",
-        ephemeral=True,
-    )
+    warning = map_role_self_service_warning(interaction.guild, role_id)
+    if get_settings(interaction.guild.id).roles_channel_id:
+        await reconcile_role_panel(interaction.guild)
+
+    response = f"✅ Map role updated for **{map_row.map_name}**."
+    if warning:
+        response += (
+            f"\n⚠️ **Self-service warning:** {warning}. "
+            "Announcements can still use this map role, but users cannot self-assign it until corrected."
+        )
+    await interaction.followup.send(response, ephemeral=True)
     audit_command(
         guild=interaction.guild,
         channel=interaction.channel,
@@ -2414,7 +3244,23 @@ class EditMapRoleModal(discord.ui.Modal):
                         else None
                     )
                 ping.message = str(self.message_input.value).strip()
-            await interaction.response.send_message(f"✅ Updated map role ping for **{self.map_name}**.", ephemeral=True)
+                final_role_id = int(ping.role_id or 0)
+
+            warning = (
+                map_role_self_service_warning(interaction.guild, final_role_id)
+                if interaction.guild
+                else None
+            )
+            if interaction.guild and get_settings(interaction.guild.id).roles_channel_id:
+                await reconcile_role_panel(interaction.guild)
+
+            response = f"✅ Updated map role ping for **{self.map_name}**."
+            if warning:
+                response += (
+                    f"\n⚠️ **Self-service warning:** {warning}. "
+                    "Announcements can still use this map role, but users cannot self-assign it until corrected."
+                )
+            await interaction.response.send_message(response, ephemeral=True)
             audit_command(
                 guild=interaction.guild,
                 channel=interaction.channel,
@@ -2532,6 +3378,9 @@ async def delmaprole(interaction: discord.Interaction, map_search: str):
             )
         )
 
+    if get_settings(interaction.guild.id).roles_channel_id:
+        await reconcile_role_panel(interaction.guild)
+
     await interaction.followup.send(
         f"✅ Removed map role ping for **{map_row.map_name}**.",
         ephemeral=True,
@@ -2629,7 +3478,7 @@ def help_messages(member: discord.Member):
         "`/debug` — Keeper diagnostics.",
         "`/addserver`, `/delserver`, `/renameserver` — manage this guild's servers.",
         "`/defaultserver add|remove|list` — manage this guild's defaults.",
-        "`/setannouncementchannel` — set announcement channel.",
+        "`/setannouncementchannel` — set announcement channel.\n        `/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
         "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
         "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",
         "`/setmaprole`, `/editmaprole`, `/delmaprole` — manage map role pings.",
@@ -2644,6 +3493,7 @@ def help_messages(member: discord.Member):
         "**Listen channels:** " + (", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id))) or "None"),
         f"**Management minimum role:** {settings.management_min_role_id}",
         f"**User-command required role:** {settings.status_min_role_id}",
+        f"**Role-assignment channel:** {settings.roles_channel_id or 'None'}",
         f"**Map role pings:**\n{map_roles_text(member.guild)}",
     ])
     return [basic, mgmt, config]
@@ -2850,6 +3700,18 @@ async def on_ready():
     if not run_legacy_import(list(client.guilds)):
         log.critical("Legacy import blocked/failed; background watcher not started")
         return
+
+    try:
+        for guild in client.guilds:
+            if get_settings(guild.id).roles_channel_id:
+                await reconcile_role_panel(guild)
+        log.info("Role panel startup reconciliation complete guilds=%s", len(client.guilds))
+    except Exception as exc:
+        log.error(
+            "Role panel startup reconciliation failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
+        )
 
     try:
         synced = await tree.sync()

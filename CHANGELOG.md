@@ -4,6 +4,29 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.1.0] - 2026-08-18
+
+### Added
+- Added persistent self-service BF4 map notification role panels using neutral Discord buttons.
+- Added `/setroleschannel channel:<text channel>` and `/delroleschannel`.
+- Added exact `status_min_role_id` authorization to role-panel button interactions, with existing management authorization bypass.
+- Added ephemeral role-added/role-removed confirmations for button interactions.
+- Added a project-level maximum of 15 map buttons per persistent panel message; 33 configured maps produce 15 + 15 + 3 messages.
+- Added startup/configuration reconciliation that validates, edits, recreates missing panel messages, and removes stale extras.
+- Added immediate self-service manageability warnings to `/setmaprole` and `/editmaprole`.
+- Added operational logging and command auditing for role-button successes, denials, permission failures, and hierarchy failures.
+- Added Discord `Manage Roles` and bot-role hierarchy documentation plus recommended read-only `@everyone` roles-channel permissions.
+
+### Database
+- Added `roles_channel_id` and `roles_channel_name` to `guild_settings`.
+- Added `guild_role_panel_messages` to persist guild/channel/message identifiers and deterministic panel ordering.
+- Added Alembic revision `0004_v2_1_0`.
+
+### Behavior
+- Only existing enabled map-role configurations are offered; `role_id=0`, deleted/unresolved roles, and unmanageable roles are excluded.
+- `/setroleschannel` creates and validates the complete new panel before removing the old panel.
+- If no roles channel is configured, map-role assignment remains a manual Discord-admin task while map announcements continue normally.
+
 ## [v2.0.5] - 2026-08-18
 
 ### Permissions
