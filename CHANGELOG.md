@@ -4,6 +4,29 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.2.0] - 2026-08-19
+
+### Added
+- Added optional persistent default-server player rosters in each guild's announcement channel.
+- Added `include_users` to `/defaultserver add`; it defaults to `false` and is stored per guild/server relationship.
+- Added multi-message persistent roster state with deterministic chunk indexes and rendered-content hashes.
+- Added per-monitor-cycle roster/BFLIST deduplication so multiple guilds requesting the same BF4 server reuse one volatile fresh roster result.
+- Added operational player-display cycle logging for requested displays, unique roster lookups, duplicate lookups avoided, unchanged/replaced displays, failures, and posted/deleted chunks.
+- Added a prominent Discord-admin handoff note at the top of `DISCORD.md` directing admins of an existing hosted bot to begin at the “Announcement channel” section.
+
+### Behavior
+- Persistent player rosters refresh on the existing global `CHECK_INTERVAL_SECONDS` cadence; no additional polling timer is introduced.
+- Existing Discord roster messages are left untouched when the newly rendered roster is identical.
+- Changed rosters use new-first replacement: post the complete new chunk set, persist its IDs, then remove the previous chunk set.
+- Live roster/player-stat data remains volatile and is not stored in the database.
+- Normal on-demand `!status <server> players` remains available unchanged.
+- Disabling Include Users or removing a server from defaults removes its persisted player-list display.
+
+### Database
+- Added `guild_servers.include_users` with a default of `false`.
+- Added `guild_server_player_messages` for guild/server/channel/message/chunk metadata and rendered-content fingerprints.
+- Added Alembic revision `0005_v2_2_0`.
+
 ## [v2.1.0] - 2026-08-18
 
 ### Added

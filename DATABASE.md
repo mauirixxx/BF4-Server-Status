@@ -65,3 +65,33 @@ message_id
 ```
 
 `panel_index` provides deterministic ordering for multiple messages. ServerWatcher intentionally limits role panels to 15 map buttons per message and reconciles stored message state during startup/configuration changes.
+
+
+## Persistent default-server player displays (v2.2.0)
+
+`guild_servers` adds:
+
+```text
+include_users
+```
+
+The boolean defaults to `false` and is configured per guild/server relationship.
+
+Persistent multi-message roster state is stored in:
+
+```text
+guild_server_player_messages
+guild_id
+guild_name
+server_guid
+server_name
+chunk_index
+channel_id
+channel_name
+message_id
+content_hash
+```
+
+The table stores Discord/configuration state only. Live player roster/stat data is intentionally not persisted. `content_hash` is a deterministic fingerprint of the complete rendered roster and is repeated across that roster's chunk rows so unchanged displays can avoid Discord post/delete churn.
+
+Fresh BFLIST/player-detail results are volatile per-monitor-cycle data and are deduplicated by unique BF4 server before being reused across guild displays.

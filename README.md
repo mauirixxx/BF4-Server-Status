@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.1.0
+# BF4 Server Watcher v2.2.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -421,6 +421,24 @@ PC -> PS4/5 -> XBox -> Unknown
 
 then alphabetically by guild display name.
 
+## Persistent default-server player lists
+
+v2.2.0 adds an optional always-visible player roster for each guild default server. Enable it when adding/updating a default server:
+
+```text
+/defaultserver add server:<selection> include_users:true
+```
+
+`include_users` defaults to `false`, so existing/default behavior stays uncluttered unless a Discord administrator explicitly opts in. Multiple default servers may independently enable the display.
+
+The display uses the guild announcement channel and the same global `CHECK_INTERVAL_SECONDS` monitor cadence. Normal on-demand `!status <server> players` remains available.
+
+Fresh roster/enrichment data is **not stored in the database**. During a monitor cycle, ServerWatcher performs at most one roster/BFLIST lookup per unique BF4 server that needs a persistent display and reuses that volatile result across guilds.
+
+ServerWatcher renders the complete roster, calculates a deterministic content fingerprint, and leaves the existing Discord messages untouched when the rendered output is unchanged. When it changes, ServerWatcher posts the complete new chunk set first, persists the new message IDs, and only then removes the previous chunk set. This avoids unnecessary Discord message churn and avoids intentionally leaving the channel without a roster if posting fails.
+
+Persistent message metadata is database-backed so multi-message rosters survive restarts. Disabling Include Users or removing the server from defaults cleans up the saved display.
+
 ## Team player roster
 
 Regular users can request:
@@ -506,7 +524,7 @@ All ordinary commands above inherit the common `status_min_role_id` gate describ
 - `/addserver server_urls:<Battlelog URLs> [make_default:true]`
 - `/delserver server:<selection>`
 - `/renameserver server:<selection> new_name:<name>`
-- `/defaultserver add server:<selection>`
+- `/defaultserver add server:<selection> [include_users:true|false]` — add a default server; `include_users` defaults to `false` and optionally maintains its player roster in the announcement channel.
 - `/defaultserver remove server:<selection>`
 - `/defaultserver list`
 - `/setannouncementchannel channel:<channel>`

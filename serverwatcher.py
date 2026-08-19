@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -27,12 +28,13 @@ from models import (
     GuildMapRolePing,
     GuildRolePanelMessage,
     GuildServer,
+    GuildServerPlayerMessage,
     GuildServerState,
     GuildSettings,
     MigrationState,
 )
 
-BOT_VERSION = "v2.1.0"
+BOT_VERSION = "v2.2.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -721,6 +723,25 @@ def refresh_guild_readable_snapshots(discord_guild: discord.Guild):
         ).all()
         for row in panel_rows:
             row.guild_name = discord_guild.name
+            channel = discord_guild.get_channel(int(row.channel_id))
+            row.channel_name = channel.name if channel is not None else None
+
+        player_message_rows_db = session.scalars(
+            select(GuildServerPlayerMessage).where(
+                GuildServerPlayerMessage.guild_id == discord_guild.id
+            )
+        ).all()
+        guild_server_names = {
+            row.server_guid: row.display_name
+            for row in session.scalars(
+                select(GuildServer).where(
+                    GuildServer.guild_id == discord_guild.id
+                )
+            ).all()
+        }
+        for row in player_message_rows_db:
+            row.guild_name = discord_guild.name
+            row.server_name = guild_server_names.get(row.server_guid)
             channel = discord_guild.get_channel(int(row.channel_id))
             row.channel_name = channel.name if channel is not None else None
 
@@ -1434,6 +1455,497 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         return None
 
 
+def rendered_roster_hash(chunks: list[str]) -> str:
+    payload = "\x1e".join(chunks).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def persistent_roster_chunks(
+    gs: GuildServer,
+    bf: BF4Server,
+    snapshot: dict,
+    bflist_server: dict | None,
+) -> list[str]:
+    """Render the same compact roster style as `!status <server> players`."""
+    teams = None
+    if normalize_platform_label(bf.platform) == "PC" and bflist_server:
+        rich = bflist_team_rosters(bflist_server, snapshot)
+        teams = [
+            {
+                "team_id": team["team_id"],
+                "faction": team["faction"],
+                "names": [row["name"] for row in team["rows"]],
+                "numbered": True,
+            }
+            for team in rich
+        ]
+    if not teams:
+        teams = keeper_team_rosters(snapshot)
+    return compact_roster_messages(teams, gs.display_name)
+
+
+def player_message_rows(guild_id: int, server_guid: str | None = None):
+    with SessionLocal() as session:
+        stmt = (
+            select(GuildServerPlayerMessage)
+            .where(GuildServerPlayerMessage.guild_id == guild_id)
+            .order_by(
+                GuildServerPlayerMessage.server_guid,
+                GuildServerPlayerMessage.chunk_index,
+            )
+        )
+        if server_guid is not None:
+            stmt = stmt.where(
+                GuildServerPlayerMessage.server_guid == server_guid
+            )
+        rows = session.scalars(stmt).all()
+        return [
+            {
+                "guild_id": row.guild_id,
+                "guild_name": row.guild_name,
+                "server_guid": row.server_guid,
+                "server_name": row.server_name,
+                "chunk_index": row.chunk_index,
+                "channel_id": row.channel_id,
+                "channel_name": row.channel_name,
+                "message_id": row.message_id,
+                "content_hash": row.content_hash,
+            }
+            for row in rows
+        ]
+
+
+async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, int]:
+    deleted = 0
+    failed = 0
+    for row in rows:
+        channel = guild.get_channel(int(row["channel_id"]))
+        if channel is None:
+            log.warning(
+                "Player display delete unresolved guild=%s server=%s channel=%s message=%s",
+                guild.id,
+                row["server_guid"],
+                row["channel_id"],
+                row["message_id"],
+            )
+            failed += 1
+            continue
+        try:
+            message = await channel.fetch_message(int(row["message_id"]))
+            await message.delete()
+            deleted += 1
+            log.info(
+                "Deleted player display message guild=%s server=%s channel=%s "
+                "message=%s chunk=%s",
+                guild.id,
+                row["server_guid"],
+                channel.id,
+                row["message_id"],
+                row["chunk_index"],
+            )
+        except discord.NotFound:
+            deleted += 1
+            log.info(
+                "Player display message already absent guild=%s server=%s "
+                "channel=%s message=%s chunk=%s",
+                guild.id,
+                row["server_guid"],
+                channel.id,
+                row["message_id"],
+                row["chunk_index"],
+            )
+        except discord.Forbidden:
+            failed += 1
+            log.warning(
+                "Forbidden deleting player display message guild=%s server=%s "
+                "channel=%s message=%s",
+                guild.id,
+                row["server_guid"],
+                channel.id,
+                row["message_id"],
+            )
+        except Exception as exc:
+            failed += 1
+            log.error(
+                "Player display message delete failed guild=%s server=%s "
+                "channel=%s message=%s error=%s message_text=%r",
+                guild.id,
+                row["server_guid"],
+                channel.id,
+                row["message_id"],
+                type(exc).__name__,
+                str(exc),
+            )
+    return deleted, failed
+
+
+async def clear_persistent_player_display(
+    guild: discord.Guild,
+    server_guid: str | None = None,
+) -> tuple[int, int]:
+    rows = player_message_rows(guild.id, server_guid)
+    deleted, failed = await delete_player_message_rows(guild, rows)
+    with SessionLocal.begin() as session:
+        stmt = delete(GuildServerPlayerMessage).where(
+            GuildServerPlayerMessage.guild_id == guild.id
+        )
+        if server_guid is not None:
+            stmt = stmt.where(
+                GuildServerPlayerMessage.server_guid == server_guid
+            )
+        session.execute(stmt)
+    if rows:
+        log.info(
+            "Player display cleared guild=%s server=%s rows=%s deleted=%s failed=%s",
+            guild.id,
+            server_guid or "all",
+            len(rows),
+            deleted,
+            failed,
+        )
+    return deleted, failed
+
+
+async def player_display_messages_exist(
+    guild: discord.Guild,
+    rows,
+) -> bool:
+    for row in rows:
+        channel = guild.get_channel(int(row["channel_id"]))
+        if channel is None:
+            return False
+        try:
+            await channel.fetch_message(int(row["message_id"]))
+        except (discord.NotFound, discord.Forbidden):
+            return False
+        except Exception as exc:
+            log.warning(
+                "Player display validation failed guild=%s server=%s "
+                "channel=%s message=%s error=%s",
+                guild.id,
+                row["server_guid"],
+                row["channel_id"],
+                row["message_id"],
+                type(exc).__name__,
+            )
+            return False
+    return True
+
+
+PLAYER_DISPLAY_VALIDATED: set[tuple[int, str]] = set()
+
+
+async def update_persistent_player_display(
+    guild: discord.Guild,
+    gs: GuildServer,
+    bf: BF4Server,
+    snapshot: dict,
+    bflist_server: dict | None,
+) -> dict:
+    settings = get_settings(guild.id)
+    channel = (
+        guild.get_channel(int(settings.announcement_channel_id))
+        if settings.announcement_channel_id
+        else None
+    )
+    if not isinstance(channel, discord.TextChannel):
+        old_rows = player_message_rows(guild.id, gs.server_guid)
+        if old_rows:
+            await clear_persistent_player_display(guild, gs.server_guid)
+        log.warning(
+            "Player display skipped unresolved announcement channel guild=%s "
+            "server=%s channel=%s",
+            guild.id,
+            gs.server_guid,
+            settings.announcement_channel_id,
+        )
+        return {"result": "no_channel", "posted": 0, "deleted": 0}
+
+    chunks = persistent_roster_chunks(gs, bf, snapshot, bflist_server)
+    content_hash = rendered_roster_hash(chunks)
+    old_rows = player_message_rows(guild.id, gs.server_guid)
+    key = (guild.id, gs.server_guid)
+
+    same_hash = bool(
+        old_rows
+        and len(old_rows) == len(chunks)
+        and all(row["content_hash"] == content_hash for row in old_rows)
+        and all(row["channel_id"] == channel.id for row in old_rows)
+    )
+
+    if same_hash:
+        if key not in PLAYER_DISPLAY_VALIDATED:
+            exists = await player_display_messages_exist(guild, old_rows)
+            if not exists:
+                same_hash = False
+            else:
+                PLAYER_DISPLAY_VALIDATED.add(key)
+        if same_hash:
+            return {
+                "result": "unchanged",
+                "posted": 0,
+                "deleted": 0,
+                "chunks": len(chunks),
+            }
+
+    created = []
+    try:
+        for chunk_index, content in enumerate(chunks):
+            message = await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            created.append((chunk_index, message))
+            log.info(
+                "Player display message posted guild=%s server=%s channel=%s "
+                "message=%s chunk=%s/%s",
+                guild.id,
+                gs.server_guid,
+                channel.id,
+                message.id,
+                chunk_index + 1,
+                len(chunks),
+            )
+    except Exception as exc:
+        log.error(
+            "Player display post failed guild=%s server=%s channel=%s "
+            "posted=%s/%s error=%s message=%r",
+            guild.id,
+            gs.server_guid,
+            channel.id,
+            len(created),
+            len(chunks),
+            type(exc).__name__,
+            str(exc),
+        )
+        for _, message in created:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        return {"result": "post_failed", "posted": 0, "deleted": 0}
+
+    # Persist the new authoritative set before removing the old set. A crash
+    # after this point can leave an orphaned old message, but never loses the
+    # newly displayed roster or its persisted IDs.
+    with SessionLocal.begin() as session:
+        session.execute(
+            delete(GuildServerPlayerMessage).where(
+                GuildServerPlayerMessage.guild_id == guild.id,
+                GuildServerPlayerMessage.server_guid == gs.server_guid,
+            )
+        )
+        for chunk_index, message in created:
+            session.add(
+                GuildServerPlayerMessage(
+                    guild_id=guild.id,
+                    guild_name=guild.name,
+                    server_guid=gs.server_guid,
+                    server_name=gs.display_name,
+                    chunk_index=chunk_index,
+                    channel_id=channel.id,
+                    channel_name=channel.name,
+                    message_id=message.id,
+                    content_hash=content_hash,
+                )
+            )
+
+    deleted, delete_failed = await delete_player_message_rows(guild, old_rows)
+    PLAYER_DISPLAY_VALIDATED.add(key)
+    log.info(
+        "Player display replaced guild=%s server=%s chunks=%s old_rows=%s "
+        "old_deleted=%s old_delete_failed=%s hash=%s",
+        guild.id,
+        gs.server_guid,
+        len(chunks),
+        len(old_rows),
+        deleted,
+        delete_failed,
+        content_hash[:12],
+    )
+    return {
+        "result": "replaced",
+        "posted": len(created),
+        "deleted": deleted,
+        "chunks": len(chunks),
+    }
+
+
+async def refresh_persistent_player_displays(fresh: dict[str, dict]):
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildServer, BF4Server)
+            .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+            .where(
+                GuildServer.is_default.is_(True),
+                GuildServer.include_users.is_(True),
+            )
+            .order_by(GuildServer.server_guid, GuildServer.guild_id)
+        ).all()
+        requested = [
+            {
+                "guild_id": gs.guild_id,
+                "server_guid": gs.server_guid,
+                "display_name": gs.display_name,
+                "platform": bf.platform,
+                "server_name": bf.server_name,
+            }
+            for gs, bf in rows
+        ]
+
+    if not requested:
+        return {
+            "requested": 0,
+            "unique": 0,
+            "duplicates": 0,
+            "lookups": 0,
+            "unchanged": 0,
+            "replaced": 0,
+            "failed": 0,
+            "posted": 0,
+            "deleted": 0,
+        }
+
+    unique_guids = sorted({row["server_guid"] for row in requested})
+    duplicate_avoided = len(requested) - len(unique_guids)
+    log.info(
+        "Player display cycle started requested=%s unique_servers=%s "
+        "duplicate_roster_lookups_avoided=%s",
+        len(requested),
+        len(unique_guids),
+        duplicate_avoided,
+    )
+
+    # One volatile BFLIST/player-detail result per unique server for this cycle.
+    bflist_by_guid: dict[str, dict | None] = {}
+    lookup_count = 0
+    for index, guid in enumerate(unique_guids, 1):
+        snapshot = fresh.get(guid)
+        if snapshot is None:
+            continue
+        platform = next(
+            row["platform"]
+            for row in requested
+            if row["server_guid"] == guid
+        )
+        if normalize_platform_label(platform) != "PC":
+            bflist_by_guid[guid] = None
+            continue
+        lookup_count += 1
+        try:
+            bflist_by_guid[guid] = await asyncio.to_thread(
+                get_bflist_server_cached,
+                guid,
+                snapshot,
+            )
+            log.info(
+                "Player roster lookup complete server=%s progress=%s/%s "
+                "source=%s",
+                guid,
+                index,
+                len(unique_guids),
+                "BFLIST" if bflist_by_guid[guid] else "Keeper fallback",
+            )
+        except Exception as exc:
+            bflist_by_guid[guid] = None
+            log.warning(
+                "Player roster lookup failed server=%s progress=%s/%s "
+                "error=%s message=%r fallback=Keeper",
+                guid,
+                index,
+                len(unique_guids),
+                type(exc).__name__,
+                str(exc),
+            )
+
+    unchanged = replaced = failed = posted = deleted = 0
+    for row in requested:
+        guid = row["server_guid"]
+        snapshot = fresh.get(guid)
+        if snapshot is None:
+            failed += 1
+            log.warning(
+                "Player display skipped stale/missing snapshot guild=%s server=%s",
+                row["guild_id"],
+                guid,
+            )
+            continue
+        guild = client.get_guild(int(row["guild_id"]))
+        if guild is None:
+            failed += 1
+            log.warning(
+                "Player display skipped unresolved guild=%s server=%s",
+                row["guild_id"],
+                guid,
+            )
+            continue
+        gs = GuildServer(
+            guild_id=guild.id,
+            server_guid=guid,
+            display_name=row["display_name"],
+            is_default=True,
+            include_users=True,
+        )
+        bf = BF4Server(
+            server_guid=guid,
+            server_name=row["server_name"],
+            platform=row["platform"],
+        )
+        try:
+            result = await update_persistent_player_display(
+                guild,
+                gs,
+                bf,
+                snapshot,
+                bflist_by_guid.get(guid),
+            )
+            posted += int(result.get("posted", 0))
+            deleted += int(result.get("deleted", 0))
+            if result["result"] == "unchanged":
+                unchanged += 1
+            elif result["result"] == "replaced":
+                replaced += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            failed += 1
+            log.error(
+                "Player display update failed guild=%s server=%s "
+                "error=%s message=%r",
+                guild.id,
+                guid,
+                type(exc).__name__,
+                str(exc),
+            )
+
+    log.info(
+        "Player display cycle complete requested=%s unique_servers=%s "
+        "duplicate_roster_lookups_avoided=%s roster_lookups=%s "
+        "unchanged=%s replaced=%s failed=%s chunks_posted=%s "
+        "old_chunks_deleted=%s",
+        len(requested),
+        len(unique_guids),
+        duplicate_avoided,
+        lookup_count,
+        unchanged,
+        replaced,
+        failed,
+        posted,
+        deleted,
+    )
+    return {
+        "requested": len(requested),
+        "unique": len(unique_guids),
+        "duplicates": duplicate_avoided,
+        "lookups": lookup_count,
+        "unchanged": unchanged,
+        "replaced": replaced,
+        "failed": failed,
+        "posted": posted,
+        "deleted": deleted,
+    }
+
+
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
 
@@ -1619,6 +2131,26 @@ async def monitor_cycle():
                 status,
             )
 
+    player_display_summary = {
+        "requested": 0,
+        "unique": 0,
+        "duplicates": 0,
+        "lookups": 0,
+        "unchanged": 0,
+        "replaced": 0,
+        "failed": 0,
+        "posted": 0,
+        "deleted": 0,
+    }
+    try:
+        player_display_summary = await refresh_persistent_player_displays(fresh)
+    except Exception as exc:
+        log.error(
+            "Player display cycle failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
+        )
+
     # Presence/player totals also use fresh snapshots only.
     player_total = sum(
         get_server_status(snapshot)["players"]
@@ -1629,7 +2161,9 @@ async def monitor_cycle():
         "Monitor cycle complete references=%s unique_servers=%s "
         "duplicate_lookups_avoided=%s attempted=%s skipped=%s "
         "succeeded=%s failed=%s service_failures=%s "
-        "isolated_failures=%s circuit_opened=%s players=%s",
+        "isolated_failures=%s circuit_opened=%s players=%s "
+        "player_displays=%s player_displays_replaced=%s "
+        "player_displays_unchanged=%s",
         references,
         unique_count,
         duplicate_avoided,
@@ -1641,6 +2175,9 @@ async def monitor_cycle():
         isolated_failures,
         circuit_opened,
         player_total,
+        player_display_summary["requested"],
+        player_display_summary["replaced"],
+        player_display_summary["unchanged"],
     )
 
 
@@ -2520,30 +3057,156 @@ async def default_list(interaction):
     if not await prepare_management(interaction):
         return
     defaults = get_default_guild_servers(interaction.guild.id)
-    text = "\n".join(f"({normalize_platform_label(bf.platform)}) - {gs.display_name}" for gs, bf in defaults) or "No default server(s) set"
+    text = "\n".join(
+        f"({normalize_platform_label(bf.platform)}) - {gs.display_name} "
+        f"[Include Users: {'Yes' if gs.include_users else 'No'}]"
+        for gs, bf in defaults
+    ) or "No default server(s) set"
     await interaction.followup.send(f"```text\n{text}\n```", ephemeral=True)
-    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.list", command_type="slash", success=True, started=started, result_code="ok", metadata={"count": len(defaults)})
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="defaultserver.list",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="ok",
+        metadata={
+            "count": len(defaults),
+            "include_users": sum(1 for gs, _ in defaults if gs.include_users),
+        },
+    )
 
 
 @default_group.command(name="add", description="Add a configured server to defaults")
-async def default_add(interaction, server: str):
+@app_commands.describe(
+    server="Configured BF4 server",
+    include_users="Keep an automatically refreshed player list in the announcement channel",
+)
+async def default_add(
+    interaction: discord.Interaction,
+    server: str,
+    include_users: bool = False,
+):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
     try:
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
-            if not gs:
+            bf = session.get(BF4Server, server)
+            if not gs or not bf:
                 raise ValueError("server_not_found")
+            previous_include_users = bool(gs.include_users)
             gs.is_default = True
+            gs.include_users = bool(include_users)
             name = gs.display_name
-        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
-        await post_automatic_announcement(interaction.guild.id, GuildServer(guild_id=interaction.guild.id, server_guid=server, display_name=name, is_default=True), get_server_status(snapshot), map_change=False)
-        await interaction.followup.send(f"✅ **{name}** added to default servers.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.add", command_type="slash", success=True, started=started, result_code="default_added", target_type="server", target_id=server, target_name=name)
+            platform = bf.platform
+            server_name = bf.server_name
+
+        if previous_include_users and not include_users:
+            await clear_persistent_player_display(interaction.guild, server)
+
+        snapshot = (
+            FRESH_SERVER_CACHE.get(server)
+            or await asyncio.to_thread(get_keeper_snapshot, server)
+        )
+        await post_automatic_announcement(
+            interaction.guild.id,
+            GuildServer(
+                guild_id=interaction.guild.id,
+                server_guid=server,
+                display_name=name,
+                is_default=True,
+                include_users=bool(include_users),
+            ),
+            get_server_status(snapshot),
+            map_change=False,
+        )
+
+        player_note = ""
+        if include_users:
+            try:
+                bflist = None
+                if normalize_platform_label(platform) == "PC":
+                    bflist = await asyncio.to_thread(
+                        get_bflist_server_cached,
+                        server,
+                        snapshot,
+                    )
+                result = await update_persistent_player_display(
+                    interaction.guild,
+                    GuildServer(
+                        guild_id=interaction.guild.id,
+                        server_guid=server,
+                        display_name=name,
+                        is_default=True,
+                        include_users=True,
+                    ),
+                    BF4Server(
+                        server_guid=server,
+                        server_name=server_name,
+                        platform=platform,
+                    ),
+                    snapshot,
+                    bflist,
+                )
+                player_note = (
+                    f" Persistent player list: **{result['result']}**."
+                )
+            except Exception as exc:
+                log.warning(
+                    "Immediate player display failed guild=%s server=%s "
+                    "error=%s message=%r",
+                    interaction.guild.id,
+                    server,
+                    type(exc).__name__,
+                    str(exc),
+                )
+                player_note = (
+                    " ⚠️ The persistent player list could not be refreshed "
+                    "immediately and will retry on the next monitor cycle."
+                )
+
+        await interaction.followup.send(
+            f"✅ **{name}** added to default servers. "
+            f"Include Users: **{'Yes' if include_users else 'No'}**."
+            f"{player_note}",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.add",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="default_added",
+            target_type="server",
+            target_id=server,
+            target_name=name,
+            metadata={"include_users": bool(include_users)},
+        )
     except Exception as exc:
-        await interaction.followup.send("⚠️ Could not add that default server.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="defaultserver.add", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        await interaction.followup.send(
+            "⚠️ Could not add that default server.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="defaultserver.add",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="failed",
+            error=exc,
+            target_type="server",
+            target_id=server,
+        )
 
 
 @default_add.autocomplete("server")
@@ -2563,6 +3226,7 @@ async def default_remove(interaction, server: str):
             if not gs:
                 raise ValueError("server_not_found")
             gs.is_default = False
+            gs.include_users = False
             name = gs.display_name
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
@@ -2570,6 +3234,7 @@ async def default_remove(interaction, server: str):
                 session.delete(state)
         if old_channel and old_message:
             await delete_discord_message(interaction.guild.id, old_channel, old_message)
+        await clear_persistent_player_display(interaction.guild, server)
         if not get_default_guild_servers(interaction.guild.id):
             settings = get_settings(interaction.guild.id)
             channel = interaction.guild.get_channel(settings.announcement_channel_id) if settings.announcement_channel_id else None
@@ -3477,7 +4142,7 @@ def help_messages(member: discord.Member):
         "`/announce` or `!announce` — temporary default-server announcements.",
         "`/debug` — Keeper diagnostics.",
         "`/addserver`, `/delserver`, `/renameserver` — manage this guild's servers.",
-        "`/defaultserver add|remove|list` — manage this guild's defaults.",
+        "`/defaultserver add|remove|list` — manage defaults; `add` can optionally keep a persistent player roster in the announcement channel.",
         "`/setannouncementchannel` — set announcement channel.\n        `/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
         "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
         "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",

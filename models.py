@@ -82,6 +82,26 @@ class GuildServer(Base):
     )
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    include_users: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class GuildServerPlayerMessage(Base):
+    __tablename__ = "guild_server_player_messages"
+    guild_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
+        primary_key=True, autoincrement=False
+    )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    server_guid: Mapped[str] = mapped_column(
+        String(36), ForeignKey("bf4_servers.server_guid"),
+        primary_key=True
+    )
+    server_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class BF4Map(Base):

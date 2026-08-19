@@ -1,3 +1,5 @@
+> **Discord Administrators:** If you're adding an existing ServerWatcher bot to your server, you can skip the bot creation and hosting setup below. Start at the **“Announcement channel”** section, which begins the Discord server configuration instructions.
+
 # Discord Setup
 
 BF4 Server Watcher v2 can serve multiple Discord guilds from one bot instance.
@@ -23,7 +25,7 @@ Never commit the real token.
 - Embed Links
 - Read Message History
 - Manage Messages
-- **Manage Roles** — required for v2.1.0 self-service map-role assignment/removal.
+- **Manage Roles** — required for v2.1.0+ self-service map-role assignment/removal.
 - Mention @everyone, @here, and All Roles
 
 Administrator permission is not required.
@@ -158,8 +160,8 @@ Each guild has its own server relationships and display names:
 /addserver
 /delserver
 /renameserver
-/defaultserver add
-/defaultserver remove
+/defaultserver add server:<selection> include_users:<true|false>
+/defaultserver remove server:<selection>
 /defaultserver list
 ```
 
