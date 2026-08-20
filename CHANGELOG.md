@@ -4,6 +4,17 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.5.1] - 2026-08-19
+
+### Fixed
+- Fixed Battlelog persona-ID/name enrichment on current PC, PS4/5, and Xbox One server pages by parsing the embedded renderer `players` JSON payload instead of relying only on legacy rendered scoreboard `<tr data-personaid>` rows.
+- Embedded player arrays are parsed with balanced JSON scanning, and repeated Battlelog roster payloads are deduplicated by persona ID + normalized player name. The older scoreboard-row parser remains as a fallback.
+- The configured watched-player alert channel is now also accepted as a management-command channel, so administrators can run management/player-watch commands directly from their private watched-player operations channel without separately adding it as a listen channel.
+
+### Behavior
+- Persona enrichment continues to use the existing maximum of 3 Battlelog server-page requests per monitor cycle, FIFO queue, and retry/backoff behavior; no additional polling traffic was introduced.
+- No Alembic migration is required for v2.5.1.
+
 ## [v2.5.0] - 2026-08-19
 
 ### Added

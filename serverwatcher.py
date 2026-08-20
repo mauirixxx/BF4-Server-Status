@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.5.0"
+BOT_VERSION = "v2.5.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -302,19 +302,108 @@ def battlelog_server_url_for(server: BF4Server) -> str | None:
     )
 
 
+def _iter_embedded_json_arrays(text: str, key: str):
+    """Yield JSON arrays assigned to a quoted object key inside Battlelog JS payloads."""
+    marker = f'"{key}"'
+    start = 0
+    while True:
+        key_pos = text.find(marker, start)
+        if key_pos < 0:
+            return
+        colon_pos = text.find(":", key_pos + len(marker))
+        if colon_pos < 0:
+            return
+        array_pos = colon_pos + 1
+        while array_pos < len(text) and text[array_pos].isspace():
+            array_pos += 1
+        if array_pos >= len(text) or text[array_pos] != "[":
+            start = key_pos + len(marker)
+            continue
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(array_pos, len(text)):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    raw = text[array_pos : pos + 1]
+                    try:
+                        value = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    else:
+                        if isinstance(value, list):
+                            yield value
+                    start = pos + 1
+                    break
+        else:
+            return
+
+
 def extract_battlelog_player_identities(page_html: str) -> list[dict]:
-    """Extract live scoreboard persona IDs and current names from Battlelog HTML."""
+    """Extract live Battlelog persona IDs/current names from embedded JSON, with HTML fallback."""
     text = str(page_html or "")
     result = []
     seen: set[tuple[int, str]] = set()
+
+    def add_identity(persona_id_value, name_value):
+        persona_id = as_int(persona_id_value)
+        name = re.sub(r"\s+", " ", html_lib.unescape(str(name_value or ""))).strip()
+        normalized = normalize_player_name(name)
+        if persona_id is None or not name or not normalized:
+            return
+        key = (persona_id, normalized)
+        if key in seen:
+            return
+        seen.add(key)
+        result.append(
+            {
+                "persona_id": persona_id,
+                "player_name": name,
+                "normalized_name": normalized,
+            }
+        )
+
+    # Current Battlelog server pages embed one or more renderer payloads whose
+    # `players` arrays contain authoritative persona identity information. The
+    # arrays are nested JSON, so scan balanced brackets instead of using one
+    # broad regex. Battlelog commonly repeats the same roster; `seen` dedupes it.
+    for players in _iter_embedded_json_arrays(text, "players"):
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            persona = player.get("persona")
+            if not isinstance(persona, dict):
+                persona = {}
+            add_identity(
+                player.get("personaId") or persona.get("personaId"),
+                persona.get("personaName") or player.get("personaName") or player.get("name"),
+            )
+
+    if result:
+        return result
+
+    # Fallback for older Battlelog variants that render persona IDs directly on
+    # scoreboard table rows.
     for row_match in re.finditer(
         r'<tr\b[^>]*\bdata-personaid="(\d+)"[^>]*>(.*?)</tr>',
         text,
         flags=re.IGNORECASE | re.DOTALL,
     ):
-        persona_id = as_int(row_match.group(1))
-        if persona_id is None:
-            continue
         row_html = row_match.group(2)
         name_match = re.search(
             r'<(?:span|a)\b[^>]*class="[^"]*common-playername-personaname-nolink[^"]*"[^>]*>(.*?)</(?:span|a)>',
@@ -322,8 +411,6 @@ def extract_battlelog_player_identities(page_html: str) -> list[dict]:
             flags=re.IGNORECASE | re.DOTALL,
         )
         if not name_match:
-            # Some Battlelog variants render the persona-name container with a
-            # nested link instead of the nolink span.
             container_match = re.search(
                 r'<div\b[^>]*class="[^"]*common-playername-personaname[^"]*"[^>]*>(.*?)</div>',
                 row_html,
@@ -334,21 +421,7 @@ def extract_battlelog_player_identities(page_html: str) -> list[dict]:
             raw_name = re.sub(r"<[^>]+>", " ", container_match.group(1))
         else:
             raw_name = re.sub(r"<[^>]+>", " ", name_match.group(1))
-        name = re.sub(r"\s+", " ", html_lib.unescape(raw_name)).strip()
-        normalized = normalize_player_name(name)
-        if not name or not normalized:
-            continue
-        key = (persona_id, normalized)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(
-            {
-                "persona_id": persona_id,
-                "player_name": name,
-                "normalized_name": normalized,
-            }
-        )
+        add_identity(row_match.group(1), raw_name)
     return result
 
 
@@ -1213,6 +1286,10 @@ def management_channel_allowed(interaction_or_message):
         return False
     allowed = set(listen_channel_ids(guild.id))
     allowed.update(announcement_channel_ids(guild.id))
+    settings = get_settings(guild.id)
+    watched_channel_id = int(settings.watched_player_channel_id or 0)
+    if watched_channel_id:
+        allowed.add(watched_channel_id)
     # Bootstrap exception: managers need somewhere to configure the first channel.
     if not allowed:
         return True
@@ -1395,7 +1472,7 @@ async def prepare_management(interaction: discord.Interaction):
         return False
     if not management_channel_allowed(interaction):
         await interaction.response.send_message(
-            "⛔ Management commands may only be used in the configured announcement/listen channels.",
+            "⛔ Management commands may only be used in the configured announcement/listen/watched-player channels.",
             ephemeral=True,
         )
         audit_command(

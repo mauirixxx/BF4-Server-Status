@@ -103,6 +103,7 @@ Managers may use management commands in any configured announcement channel or l
 ## Watched-player admin channel
 
 v2.5.0 can alert administrators when a configured player joins a specific default BF4 server. These notifications should use a dedicated channel visible only to the guild's admin/moderator team and ServerWatcher.
+In v2.5.1 and later, that configured watched-player channel is also an authorized management-command channel, so administrators do not need to add it separately as a listen channel.
 
 Configure or disable it with:
 
