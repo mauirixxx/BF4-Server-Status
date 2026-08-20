@@ -4,6 +4,19 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.4.1] - 2026-08-19
+
+### Added
+- Added management notifications for actual stored BF4 server tick-rate changes, including `NULL` -> numeric Hz transitions.
+- Tick-rate change alerts fan out only to guilds where the affected server GUID is currently configured as a default server.
+- Each qualifying guild receives the alert in the announcement channel assigned to that specific default server.
+- Alerts ping the configured management role; when no management role is configured, they ping the Discord guild owner.
+
+### Behavior
+- Re-reading or refreshing the same tick-rate value does not send an alert.
+- Guilds that reference the same global BF4 server but do not have it configured as a default do not receive the alert.
+- The v2.4.1 patch requires no new Alembic migration.
+
 ## [v2.4.0] - 2026-08-19
 
 ### Added

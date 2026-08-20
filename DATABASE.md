@@ -134,3 +134,5 @@ tick_rate_hz INTEGER NULL
 The value is global per BF4 server GUID and stores only the numeric rate reported by Battlelog, for example `30`, `45`, `60`, `90`, or `120`. `/addserver` populates it with a one-time Battlelog page fetch when the server does not already have a stored value. `/refreshserverhz` performs an explicit management-only refresh. There is no scheduled tick-rate scraping.
 
 A failed Battlelog request or parse leaves the field `NULL` (or preserves an existing value). Automatic announcements omit the Tick Rate line when the field is `NULL`. Alembic revision `0007_v2_4_0` adds the column without backfilling existing servers over the network. Existing configured servers can be populated later with `/refreshserverhz`.
+
+v2.4.1 adds no schema change. When `tick_rate_hz` actually changes, ServerWatcher fans out a Discord alert only to guilds where the affected GUID is currently a default server, using each default server row's assigned `announcement_channel_id`. No database row is added for the alert itself.

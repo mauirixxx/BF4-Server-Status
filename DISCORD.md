@@ -180,6 +180,8 @@ When a full Battlelog URL is first added and the global server does not already 
 
 If an administrator notices that the BF4 server's configured tick rate changed, use `/refreshserverhz server:<configured server>` to re-fetch it intentionally. The command is management-only and requires a stored Battlelog URL.
 
+When the stored tick rate actually changes, including from no recorded value to a numeric Hz value, ServerWatcher sends an alert only to guilds where that server is currently a default. The alert goes to the announcement channel assigned to that default server and pings the configured management role; if no management role is configured, it pings the Discord server owner. Refreshing to the same Hz value does not send an alert.
+
 The global polling layer still performs one Keeper lookup per unique BF4 server GUID per cycle.
 
 ## Map-role pings

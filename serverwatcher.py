@@ -35,7 +35,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.4.0"
+BOT_VERSION = "v2.4.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -1596,6 +1596,123 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+
+def _tick_rate_label(value: int | None) -> str:
+    return "Not recorded" if value is None else f"{int(value)} Hz"
+
+
+async def notify_default_guilds_tick_rate_change(
+    server_guid: str,
+    old_tick_rate: int | None,
+    new_tick_rate: int | None,
+):
+    """Notify every guild where this server is a default and has an assigned announcement channel."""
+    if old_tick_rate == new_tick_rate:
+        return 0
+
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildServer, GuildSettings)
+            .join(
+                GuildSettings,
+                GuildSettings.guild_id == GuildServer.guild_id,
+            )
+            .where(
+                GuildServer.server_guid == server_guid,
+                GuildServer.is_default.is_(True),
+            )
+        ).all()
+
+    sent_count = 0
+    seen_guilds: set[int] = set()
+    for gs, settings in rows:
+        guild_id = int(gs.guild_id)
+        if guild_id in seen_guilds:
+            continue
+        seen_guilds.add(guild_id)
+
+        if not gs.announcement_channel_id:
+            log.warning(
+                "Tick rate change alert skipped guild=%s server=%s reason=no_default_announcement_channel",
+                guild_id,
+                server_guid,
+            )
+            continue
+
+        guild = client.get_guild(guild_id)
+        channel = (
+            guild.get_channel(int(gs.announcement_channel_id))
+            if guild is not None
+            else None
+        )
+        if guild is None or channel is None:
+            log.warning(
+                "Tick rate change alert skipped guild=%s server=%s channel=%s reason=unresolved_destination",
+                guild_id,
+                server_guid,
+                gs.announcement_channel_id,
+            )
+            continue
+
+        management_role_id = int(settings.management_min_role_id or 0)
+        if management_role_id:
+            mention = f"<@&{management_role_id}>"
+        else:
+            mention = f"<@{guild.owner_id}>"
+
+        content = (
+            f"{mention}\n"
+            "⚡ **BF4 Server Tick Rate Changed**\n"
+            f"🖥️ Server: **{gs.display_name}**\n"
+            f"🆔 GUID: `{server_guid}`\n"
+            f"Previous: **{_tick_rate_label(old_tick_rate)}**\n"
+            f"New: **{_tick_rate_label(new_tick_rate)}**"
+        )
+
+        try:
+            message = await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                    users=True,
+                    everyone=False,
+                ),
+            )
+            sent_count += 1
+            log.info(
+                "Tick rate change alert posted guild=%s channel=%s message=%s server=%s old=%s new=%s target=%s",
+                guild_id,
+                channel.id,
+                message.id,
+                server_guid,
+                old_tick_rate,
+                new_tick_rate,
+                "management_role" if management_role_id else "guild_owner",
+            )
+        except Exception as exc:
+            log.error(
+                "Tick rate change alert failed guild=%s channel=%s server=%s old=%s new=%s "
+                "error=%s message=%r",
+                guild_id,
+                gs.announcement_channel_id,
+                server_guid,
+                old_tick_rate,
+                new_tick_rate,
+                type(exc).__name__,
+                str(exc),
+            )
+
+    log.info(
+        "Tick rate change alert fanout complete server=%s old=%s new=%s "
+        "eligible_guilds=%s alerts_sent=%s",
+        server_guid,
+        old_tick_rate,
+        new_tick_rate,
+        len(seen_guilds),
+        sent_count,
+    )
+    return sent_count
 
 
 async def delete_discord_message(guild_id, channel_id, message_id):
@@ -4073,6 +4190,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
     refs = [x for x in re.split(r"[\s,]+", server_urls.strip()) if x]
     added, updated, failed = [], [], []
     activated = []
+    tick_rate_changes: dict[str, tuple[int | None, int | None]] = {}
     configured_channels = configured_announcement_channels(interaction.guild.id)
     default_channel = None
     if make_default:
@@ -4097,10 +4215,14 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                 continue
             guid = parsed["guid"]
             tick_rate_hz = None
+            existing_global_present = False
+            old_tick_rate_hz = None
             with SessionLocal() as session:
                 existing_global = session.get(BF4Server, guid)
                 if existing_global is not None:
-                    tick_rate_hz = existing_global.tick_rate_hz
+                    existing_global_present = True
+                    old_tick_rate_hz = existing_global.tick_rate_hz
+                    tick_rate_hz = old_tick_rate_hz
 
             if tick_rate_hz is None and parsed.get("battlelog_url"):
                 try:
@@ -4180,6 +4302,23 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                                 default_channel.name,
                             )
                         )
+
+            if (
+                existing_global_present
+                and old_tick_rate_hz != tick_rate_hz
+            ):
+                tick_rate_changes[guid] = (
+                    old_tick_rate_hz,
+                    tick_rate_hz,
+                )
+
+        for changed_guid, (old_hz, new_hz) in tick_rate_changes.items():
+            await notify_default_guilds_tick_rate_change(
+                changed_guid,
+                old_hz,
+                new_hz,
+            )
+
         for guid, display_name, channel_id, channel_name in activated:
             try:
                 snapshot = FRESH_SERVER_CACHE.get(guid) or await asyncio.to_thread(get_keeper_snapshot, guid)
@@ -4303,6 +4442,18 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
             old_tick_rate,
             new_tick_rate,
         )
+        if old_tick_rate != new_tick_rate:
+            await notify_default_guilds_tick_rate_change(
+                server,
+                old_tick_rate,
+                new_tick_rate,
+            )
+        else:
+            log.info(
+                "Tick rate unchanged server=%s value=%s alert_skipped=True",
+                server,
+                new_tick_rate,
+            )
         audit_command(
             guild=interaction.guild,
             channel=interaction.channel,
