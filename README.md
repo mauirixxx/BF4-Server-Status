@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.3.1
+# BF4 Server Watcher v2.4.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -381,6 +381,21 @@ Battlelog platform segments map to:
 
 A full Battlelog URL remains the documented way to add console servers because a raw GUID does not reliably identify console platform.
 
+
+## Battlelog tick-rate metadata (v2.4.0)
+
+When a server is added with a full Battlelog URL, ServerWatcher performs a one-time Battlelog page fetch and stores the server's reported tick rate in the global `bf4_servers.tick_rate_hz` field. It prefers Battlelog's embedded numeric `tickRate` value and falls back to the rendered `XX Hz` server-info value.
+
+Tick rate is treated as server metadata, not live polling data. There is **no scheduled Battlelog tick-rate refresh**. If the stored value is already present for a global server GUID, another guild adding the same server reuses it without another scrape. A failed scrape never blocks `/addserver`; the field remains `NULL` and map announcements simply omit the Tick Rate line.
+
+Use the management-only command below if an administrator later notices that a server's tick rate changed:
+
+```text
+/refreshserverhz server:<configured server>
+```
+
+The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
+
 ## Multiple default servers
 
 Every guild independently supports zero, one, or multiple default BF4 servers.
@@ -527,6 +542,7 @@ All ordinary commands above inherit the common `status_min_role_id` gate describ
 - `/announce`
 - `/debug [server:<selection>]`
 - `/addserver server_urls:<Battlelog URLs> [make_default:true]`
+- `/refreshserverhz server:<selection>` — manually re-scrape the stored Battlelog tick rate for a configured server.
 - `/delserver server:<selection>`
 - `/renameserver server:<selection> new_name:<name>`
 - `/defaultserver add server:<selection> [announcement_channel:<configured channel>] [include_users:true|false]` — add a default server; the channel may be omitted only when exactly one is configured.

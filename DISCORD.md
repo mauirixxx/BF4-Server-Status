@@ -167,6 +167,7 @@ Each guild has its own server relationships and display names:
 /addserver
 /delserver
 /renameserver
+/refreshserverhz server:<configured server>
 /defaultserver add server:<selection> announcement_channel:<configured channel> include_users:<true|false>
 /defaultserver modify server:<default selection> announcement_channel:<configured channel>
 /defaultserver remove server:<selection>
@@ -174,6 +175,10 @@ Each guild has its own server relationships and display names:
 ```
 
 Two guilds may track the same BF4 server under different display names.
+
+When a full Battlelog URL is first added and the global server does not already have a stored tick rate, ServerWatcher fetches that Battlelog page once and stores its reported `tickRate`. Map announcements show the stored value directly below Players. If the value is unavailable, that line is omitted. Tick rate is not refreshed on the normal monitor interval.
+
+If an administrator notices that the BF4 server's configured tick rate changed, use `/refreshserverhz server:<configured server>` to re-fetch it intentionally. The command is management-only and requires a stored Battlelog URL.
 
 The global polling layer still performs one Keeper lookup per unique BF4 server GUID per cycle.
 

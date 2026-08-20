@@ -81,6 +81,7 @@ class BF4Server(Base):
     platform: Mapped[str] = mapped_column(String(32), nullable=False, default="Unknown")
     battlelog_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     platform_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tick_rate_hz: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class GuildServer(Base):

@@ -4,6 +4,25 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.4.0] - 2026-08-19
+
+### Added
+- Added nullable global `bf4_servers.tick_rate_hz` metadata with Alembic revision `0007_v2_4_0`.
+- `/addserver` now performs a one-time Battlelog page fetch when a server has no stored tick rate, preferring the embedded numeric `tickRate` field and falling back to the rendered `XX Hz` value.
+- Added management-only `/refreshserverhz server:<configured server>` for intentional tick-rate refreshes when an administrator notices a server-side change.
+- Automatic map-change and temporary announcement messages now show `⚡ Tick Rate: **XX Hz**` directly below Players when a stored value exists; the line is omitted when the value is `NULL`.
+
+### Behavior
+- Tick rate is stored globally per BF4 server GUID and reused across guilds.
+- No scheduled or monitor-cycle Battlelog tick-rate scraping is introduced.
+- A failed Battlelog scrape never blocks `/addserver` and never clears a previously stored tick rate.
+- Existing pre-v2.4.0 servers are not network-backfilled during migration; administrators may populate them with `/refreshserverhz`.
+
+### Fixed
+- Rolled the planned v2.3.2 version-comparison fix into v2.4.0. Installed/latest versions are now compared semantically instead of by simple string inequality.
+- `!version` shows **Update available** only when the published release is newer than the installed build. If the installed build is newer than GitHub's latest published release, it reports that state instead of incorrectly claiming an update is available.
+- Docker/stdout version-check logging now records the semantic installed/latest relationship.
+
 ## [v2.3.1] - 2026-08-19
 
 ### Fixed

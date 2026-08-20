@@ -192,3 +192,10 @@ For each guild with a nonzero legacy announcement channel:
 - Existing automatic announcement/player-list message state remains associated with the same Discord destination.
 
 After upgrading, administrators may add more destinations with `/addannouncementchannel` and move individual defaults with `/defaultserver modify`.
+
+
+## v2.3.x to v2.4.0 tick-rate metadata migration
+
+Alembic revision `0007_v2_4_0` adds nullable `bf4_servers.tick_rate_hz`. The migration performs no external HTTP requests and does not backfill existing rows. Existing configured servers continue working with `tick_rate_hz = NULL`; their map announcements omit the Tick Rate line until the value is populated.
+
+After upgrade, an administrator may run `/refreshserverhz server:<configured server>` for any existing server with a stored Battlelog URL. Newly added Battlelog servers attempt the one-time tick-rate discovery automatically.

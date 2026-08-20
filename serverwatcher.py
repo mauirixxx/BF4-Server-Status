@@ -35,7 +35,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.3.1"
+BOT_VERSION = "v2.4.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -196,6 +196,76 @@ def parse_server_reference(value):
     return None
 
 
+def extract_battlelog_tick_rate(html: str, guid: str | None = None) -> int | None:
+    """Extract a BF4 server tick rate from Battlelog HTML.
+
+    Prefer the embedded server object's numeric ``tickRate`` field when the
+    requested GUID can be tied to that object. Fall back to the rendered
+    ``Tick rate`` / ``XX Hz`` server-info column for resilience.
+    """
+    text = str(html or "")
+    normalized_guid = str(guid or "").strip().lower()
+
+    if normalized_guid:
+        guid_match = re.search(
+            rf'"guid"\s*:\s*"{re.escape(normalized_guid)}"',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if guid_match:
+            # On Battlelog server objects, tickRate is close to the GUID. Use
+            # the nearest tickRate field in a bounded window so server-browser
+            # pages containing many server objects still resolve the requested
+            # GUID rather than simply taking the first tickRate on the page.
+            start = max(0, guid_match.start() - 4000)
+            end = min(len(text), guid_match.end() + 4000)
+            candidates = []
+            for match in re.finditer(
+                r'"tickRate"\s*:\s*(\d+)',
+                text[start:end],
+                flags=re.IGNORECASE,
+            ):
+                absolute = start + match.start()
+                candidates.append((abs(absolute - guid_match.start()), int(match.group(1))))
+            if candidates:
+                _, value = min(candidates, key=lambda item: item[0])
+                if 1 <= value <= 1000:
+                    return value
+
+    # Server-show pages also render the same value directly in the info table.
+    visible = re.search(
+        r'<h1>\s*Tick\s+rate\s*</h1>.*?<h5>\s*(\d+)\s*Hz\s*</h5>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if visible:
+        value = int(visible.group(1))
+        if 1 <= value <= 1000:
+            return value
+
+    # Last-resort embedded-field fallback for ordinary single-server pages.
+    embedded = re.search(r'"tickRate"\s*:\s*(\d+)', text, flags=re.IGNORECASE)
+    if embedded:
+        value = int(embedded.group(1))
+        if 1 <= value <= 1000:
+            return value
+    return None
+
+
+def get_battlelog_tick_rate(battlelog_url: str, guid: str | None = None) -> int:
+    """Fetch one Battlelog server page and return its numeric tick rate."""
+    response = requests.get(
+        battlelog_url,
+        headers={"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    tick_rate = extract_battlelog_tick_rate(response.text, guid)
+    if tick_rate is None:
+        raise ValueError("Battlelog page did not contain a tick rate")
+    return tick_rate
+
+
 def get_keeper_snapshot(guid: str) -> dict:
     response = requests.get(f"https://keeper.battlelog.com/snapshot/{guid}", timeout=10)
     response.raise_for_status()
@@ -316,6 +386,7 @@ def build_map_announcement(
     server_name: str,
     status: dict,
     role_line: str | None = None,
+    tick_rate_hz: int | None = None,
 ) -> str:
     """Build one complete automatic map-change message."""
     lines = ["🎮 **BF4 Map Change**"]
@@ -326,6 +397,8 @@ def build_map_announcement(
         f"🗺️ Now Playing: **{status['map_name']}**",
         f"👥 Players: **{status['players']}/{status['max_players']}**",
     ])
+    if tick_rate_hz is not None:
+        lines.append(f"⚡ Tick Rate: **{tick_rate_hz} Hz**")
     return "\n".join(lines)
 
 
@@ -1251,6 +1324,35 @@ def build_debug_report(snapshot: dict):
     return f"```json\n{text[:1800]}\n```"
 
 
+def semantic_version_key(value: str | None):
+    """Return a comparable semantic-version key for simple release tags."""
+    match = re.fullmatch(
+        r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?",
+        str(value or "").strip(),
+    )
+    if not match:
+        return None
+    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+    prerelease = match.group(4)
+    if prerelease is None:
+        pre_key = (1, ())  # a final release sorts after its prereleases
+    else:
+        parts = []
+        for token in prerelease.split("."):
+            parts.append((0, int(token)) if token.isdigit() else (1, token.casefold()))
+        pre_key = (0, tuple(parts))
+    return major, minor, patch, pre_key
+
+
+def compare_release_versions(installed: str, latest: str) -> int | None:
+    """Return -1/0/1 for installed older/equal/newer, or None if unparseable."""
+    installed_key = semantic_version_key(installed)
+    latest_key = semantic_version_key(latest)
+    if installed_key is None or latest_key is None:
+        return None
+    return (installed_key > latest_key) - (installed_key < latest_key)
+
+
 def refresh_latest_version():
     global LATEST_VERSION, VERSION_CHECK_ERROR
     try:
@@ -1262,7 +1364,19 @@ def refresh_latest_version():
         response.raise_for_status()
         LATEST_VERSION = str(response.json().get("tag_name") or "").strip() or None
         VERSION_CHECK_ERROR = None
-        log.info("Version check installed=%s latest=%s", BOT_VERSION, LATEST_VERSION)
+        relation = compare_release_versions(BOT_VERSION, LATEST_VERSION)
+        relation_text = (
+            "older" if relation == -1 else
+            "equal" if relation == 0 else
+            "newer" if relation == 1 else
+            "unparseable"
+        )
+        log.info(
+            "Version check installed=%s latest=%s relation=%s",
+            BOT_VERSION,
+            LATEST_VERSION,
+            relation_text,
+        )
     except Exception as exc:
         VERSION_CHECK_ERROR = type(exc).__name__
         log.warning("Version check failed error=%s message=%r", type(exc).__name__, str(exc))
@@ -1271,9 +1385,22 @@ def refresh_latest_version():
 def version_text():
     if not LATEST_VERSION:
         return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: unavailable"
-    if LATEST_VERSION == BOT_VERSION:
+    relation = compare_release_versions(BOT_VERSION, LATEST_VERSION)
+    if relation == 0:
         return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: **{LATEST_VERSION}**\nYou're up to date."
-    return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: **{LATEST_VERSION}**\n⬆️ **Update available!**"
+    if relation == -1:
+        return f"BF4 Server Watcher **{BOT_VERSION}**\nLatest version: **{LATEST_VERSION}**\n⬆️ **Update available!**"
+    if relation == 1:
+        return (
+            f"BF4 Server Watcher **{BOT_VERSION}**\n"
+            f"Latest version: **{LATEST_VERSION}**\n"
+            "Installed version is newer than the latest published release."
+        )
+    return (
+        f"BF4 Server Watcher **{BOT_VERSION}**\n"
+        f"Latest version: **{LATEST_VERSION}**\n"
+        "Version comparison unavailable."
+    )
 
 
 def legacy_paths():
@@ -1522,6 +1649,8 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
 
     with SessionLocal() as session:
         state = session.get(GuildServerState, (guild_id, gs.server_guid))
+        global_server = session.get(BF4Server, gs.server_guid)
+        tick_rate_hz = global_server.tick_rate_hz if global_server else None
         old_channel = state.announcement_channel_id if state else None
         old_message = state.announcement_message_id if state else None
     if old_channel and old_message:
@@ -1537,6 +1666,7 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
                 gs.display_name,
                 status,
                 role_line=role_line,
+                tick_rate_hz=tick_rate_hz,
             ),
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
@@ -3480,6 +3610,7 @@ async def default_add(
             name = gs.display_name
             platform = bf.platform
             server_name = bf.server_name
+            tick_rate_hz = bf.tick_rate_hz
 
         if previous_include_users and not include_users:
             await clear_persistent_player_display(interaction.guild, server)
@@ -3631,6 +3762,7 @@ async def default_modify(
             include_users = bool(gs.include_users)
             platform = bf.platform
             server_name = bf.server_name
+            tick_rate_hz = bf.tick_rate_hz
 
         if int(old_channel_id or 0) == selected_channel.id:
             await interaction.followup.send(
@@ -3676,6 +3808,7 @@ async def default_modify(
                     interaction.guild.id,
                     get_server_status(snapshot).get("map_key"),
                 )[0],
+                tick_rate_hz=tick_rate_hz,
             ),
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
@@ -3952,7 +4085,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
             await interaction.followup.send(
                 "ℹ️ The server(s) will be added as non-default because "
                 "`make_default` requires exactly one configured announcement "
-                "channel in v2.3.0. Use `/defaultserver add` afterward to choose "
+                "channel. Use `/defaultserver add` afterward to choose "
                 "the destination.",
                 ephemeral=True,
             )
@@ -3963,6 +4096,33 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                 failed.append(ref[:80])
                 continue
             guid = parsed["guid"]
+            tick_rate_hz = None
+            with SessionLocal() as session:
+                existing_global = session.get(BF4Server, guid)
+                if existing_global is not None:
+                    tick_rate_hz = existing_global.tick_rate_hz
+
+            if tick_rate_hz is None and parsed.get("battlelog_url"):
+                try:
+                    tick_rate_hz = await asyncio.to_thread(
+                        get_battlelog_tick_rate,
+                        parsed["battlelog_url"],
+                        guid,
+                    )
+                    log.info(
+                        "Battlelog tick rate discovered server=%s tick_rate_hz=%s source=addserver",
+                        guid,
+                        tick_rate_hz,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Battlelog tick rate discovery failed server=%s source=addserver "
+                        "error=%s message=%r",
+                        guid,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+
             with SessionLocal.begin() as session:
                 global_server = session.get(BF4Server, guid)
                 if global_server is None:
@@ -3972,6 +4132,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         platform=parsed["platform"],
                         battlelog_url=parsed.get("battlelog_url"),
                         platform_source=parsed.get("platform_source"),
+                        tick_rate_hz=tick_rate_hz,
                     )
                     session.add(global_server)
                 else:
@@ -3979,6 +4140,8 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         global_server.platform = parsed["platform"]
                         global_server.battlelog_url = parsed.get("battlelog_url")
                         global_server.platform_source = "battlelog_url"
+                    if global_server.tick_rate_hz is None and tick_rate_hz is not None:
+                        global_server.tick_rate_hz = tick_rate_hz
                 gs = session.get(GuildServer, (interaction.guild.id, guid))
                 if gs is None:
                     session.add(GuildServer(
@@ -4049,6 +4212,141 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
     except Exception as exc:
         await interaction.followup.send(f"⚠️ Add server failed: `{type(exc).__name__}`", ephemeral=True)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="addserver", command_type="slash", success=False, started=started, result_code="failed", error=exc)
+
+
+@tree.command(
+    name="refreshserverhz",
+    description="Refresh one configured server's stored Battlelog tick rate",
+)
+async def refreshserverhz(interaction: discord.Interaction, server: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    try:
+        with SessionLocal() as session:
+            row = session.execute(
+                select(GuildServer, BF4Server)
+                .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+                .where(
+                    GuildServer.guild_id == interaction.guild.id,
+                    GuildServer.server_guid == server,
+                )
+            ).first()
+            if row is None:
+                await interaction.followup.send(
+                    "⛔ That server is not configured for this Discord server.",
+                    ephemeral=True,
+                )
+                audit_command(
+                    guild=interaction.guild,
+                    channel=interaction.channel,
+                    user=interaction.user,
+                    command_name="refreshserverhz",
+                    command_type="slash",
+                    success=False,
+                    started=started,
+                    result_code="server_not_found",
+                    target_type="server",
+                    target_id=server,
+                )
+                return
+            gs, bf = row
+            battlelog_url = bf.battlelog_url
+            display_name = gs.display_name
+            old_tick_rate = bf.tick_rate_hz
+
+        if not battlelog_url:
+            await interaction.followup.send(
+                "⛔ That server has no stored Battlelog URL, so its tick rate cannot be refreshed. "
+                "Re-add it using a full Battlelog server URL first.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="refreshserverhz",
+                command_type="slash",
+                success=False,
+                started=started,
+                result_code="battlelog_url_missing",
+                target_type="server",
+                target_id=server,
+                target_name=display_name,
+            )
+            return
+
+        new_tick_rate = await asyncio.to_thread(
+            get_battlelog_tick_rate,
+            battlelog_url,
+            server,
+        )
+        with SessionLocal.begin() as session:
+            bf = session.get(BF4Server, server)
+            if bf is None:
+                raise ValueError("global_server_not_found")
+            bf.tick_rate_hz = new_tick_rate
+
+        await interaction.followup.send(
+            f"✅ **{display_name}** tick rate: **{new_tick_rate} Hz**"
+            + (
+                f" (was {old_tick_rate} Hz)."
+                if old_tick_rate is not None and old_tick_rate != new_tick_rate
+                else "."
+            ),
+            ephemeral=True,
+        )
+        log.info(
+            "Battlelog tick rate refreshed guild=%s server=%s old=%s new=%s",
+            interaction.guild.id,
+            server,
+            old_tick_rate,
+            new_tick_rate,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="refreshserverhz",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="updated",
+            target_type="server",
+            target_id=server,
+            target_name=display_name,
+            metadata={"old_tick_rate_hz": old_tick_rate, "new_tick_rate_hz": new_tick_rate},
+        )
+    except Exception as exc:
+        await interaction.followup.send(
+            f"⚠️ Tick-rate refresh failed: `{type(exc).__name__}`",
+            ephemeral=True,
+        )
+        log.warning(
+            "Battlelog tick rate refresh failed guild=%s server=%s error=%s message=%r",
+            interaction.guild.id,
+            server,
+            type(exc).__name__,
+            str(exc),
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="refreshserverhz",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="failed",
+            error=exc,
+            target_type="server",
+            target_id=server,
+        )
+
+
+@refreshserverhz.autocomplete("server")
+async def refreshserverhz_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
 
 
 @tree.command(name="delserver", description="Delete a configured non-default server")
@@ -5009,7 +5307,13 @@ async def announce(interaction: discord.Interaction):
             continue
         try:
             snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
-            msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
+            msg = await channel.send(
+                build_map_announcement(
+                    gs.display_name,
+                    get_server_status(snapshot),
+                    tick_rate_hz=bf.tick_rate_hz,
+                )
+            )
             asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
             sent += 1
         except Exception as exc:
@@ -5060,7 +5364,7 @@ def help_messages(member: discord.Member):
         "`/status server` — one server, optionally with player details.",
         "`/announce` or `!announce` — temporary default-server announcements.",
         "`/debug` — Keeper diagnostics.",
-        "`/addserver`, `/delserver`, `/renameserver` — manage this guild's servers.",
+        "`/addserver`, `/delserver`, `/renameserver`, `/refreshserverhz` — manage this guild's servers and stored tick rate.",
         "`/defaultserver add|modify|remove|list` — manage defaults, per-server announcement routing, and optional persistent player rosters.",
         "`/addannouncementchannel`, `/delannouncementchannel` — manage announcement-channel choices.",
         "`/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
@@ -5223,7 +5527,13 @@ async def on_message(message: discord.Message):
                     continue
                 try:
                     snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
-                    msg = await channel.send(build_map_announcement(gs.display_name, get_server_status(snapshot)))
+                    msg = await channel.send(
+                        build_map_announcement(
+                            gs.display_name,
+                            get_server_status(snapshot),
+                            tick_rate_hz=bf.tick_rate_hz,
+                        )
+                    )
                     asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
                     sent += 1
                 except Exception:
