@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.5.1"
+BOT_VERSION = "v2.5.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -2120,6 +2120,13 @@ async def evaluate_player_watch_alerts(session_id: int):
                     "watch_persona_id": watch.persona_id,
                     "watch_normalized_name": watch.normalized_name,
                     "server_name": gs.display_name,
+                    "server_url": (
+                        battlelog_server_url_for(
+                            session.get(BF4Server, player_session.server_guid)
+                        )
+                        if session.get(BF4Server, player_session.server_guid)
+                        else None
+                    ),
                     "channel_id": int(settings.watched_player_channel_id or 0),
                     "management_role_id": int(settings.management_min_role_id or 0),
                     "persona_id": player_session.persona_id,
@@ -2167,6 +2174,16 @@ async def evaluate_player_watch_alerts(session_id: int):
         watched_name = clean_alert_value(item["watched_name"])
         current_name = clean_alert_value(item["player_name"])
         server_name = clean_alert_value(item["server_name"])
+        server_link_name = (
+            server_name.replace("\\", "\\\\")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
+        server_display = (
+            f'[{server_link_name}]({item["server_url"]})'
+            if item.get("server_url")
+            else server_name
+        )
         joined_unix = int(item["time_joined"].timestamp())
         as_text = (
             f' as "{current_name}"'
@@ -2175,7 +2192,7 @@ async def evaluate_player_watch_alerts(session_id: int):
         )
         content = (
             f'Attention {mention} - player "{watched_name}" has joined '
-            f'"{server_name}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
+            f'"{server_display}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
         )
 
         try:
@@ -6028,6 +6045,13 @@ async def watchplayer(
             )
             return
 
+        if server == "__no_additional_default_servers__":
+            await interaction.followup.send(
+                "ℹ️ No additional default servers are available for this player.",
+                ephemeral=True,
+            )
+            return
+
         gs = session.get(GuildServer, (interaction.guild.id, server))
         bf = session.get(BF4Server, server)
         if not gs or not bf or not gs.is_default:
@@ -6108,9 +6132,67 @@ async def watchplayer_player_autocomplete(interaction, current):
     return player_name_choices(interaction.guild.id, current) if interaction.guild else []
 
 
+def watchplayer_server_choices(guild_id: int, player: str, current: str):
+    """Default servers excluding those where the selected player is already watched."""
+    normalized = normalize_player_name(player)
+    needle = current.casefold().strip()
+    choices = []
+    with SessionLocal() as session:
+        watches = session.scalars(
+            select(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id)
+        ).all()
+        watches_by_server = {}
+        for watch in watches:
+            watches_by_server.setdefault(watch.server_guid, []).append(watch)
+
+        for gs, bf in sorted_guild_servers(guild_id):
+            if not gs.is_default:
+                continue
+            target_persona = (
+                known_persona_for_name(
+                    session, normalize_platform_label(bf.platform), normalized
+                )
+                if normalized else None
+            )
+            already_watched = False
+            if normalized:
+                for watch in watches_by_server.get(bf.server_guid, []):
+                    if watch.normalized_name == normalized:
+                        already_watched = True
+                        break
+                    if (
+                        target_persona is not None
+                        and watch.persona_id is not None
+                        and int(watch.persona_id) == int(target_persona)
+                    ):
+                        already_watched = True
+                        break
+            if already_watched:
+                continue
+
+            label = f"({normalize_platform_label(bf.platform)}) {gs.display_name}"
+            if needle and needle not in f"{label} {bf.server_guid}".casefold():
+                continue
+            choices.append(app_commands.Choice(name=label[:100], value=bf.server_guid))
+            if len(choices) >= 25:
+                break
+
+    if normalized and not choices:
+        return [
+            app_commands.Choice(
+                name="No additional default servers available",
+                value="__no_additional_default_servers__",
+            )
+        ]
+    return choices
+
+
 @watchplayer.autocomplete("server")
 async def watchplayer_server_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+    if not interaction.guild:
+        return []
+    player = str(getattr(interaction.namespace, "player", "") or "")
+    return watchplayer_server_choices(interaction.guild.id, player, current)
 
 
 @tree.command(name="unwatchplayer", description="Remove one watched-player rule")

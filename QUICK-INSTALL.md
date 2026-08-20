@@ -22,6 +22,8 @@ Select your Discord server and authorize the bot.
 /addannouncementchannel channel:#bf4-server-status
 ```
 
+**Multiple announcement channels are supported.** To add a second or additional announcement channel, simply run `/addannouncementchannel` again and select the next channel.
+
 ## 4. Add your BF4 server
 
 Copy the server's Battlelog URL and run:

@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.5.1
+# BF4 Server Watcher v2.5.2
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,10 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## v2.5.2 patch notes
+
+v2.5.2 improves watched-player administration and alert presentation. `/watchplayer` now hides default servers where the selected player is already watched in that guild, while retaining the execution-time duplicate guard. Watched-player join alerts render the server name as a clickable Battlelog link. This release also adds `watch-player-setup.md` and clarifies in `QUICK-INSTALL.md` that multiple announcement channels are supported. No database migration is required from v2.5.1.
 
 ## v2.5.1 patch notes
 

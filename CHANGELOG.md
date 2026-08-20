@@ -4,6 +4,18 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.5.2] - 2026-08-20
+
+### Changed
+- `/watchplayer` default-server autocomplete now excludes default servers where the selected player is already watched in the same guild. Persona ID is used when available; normalized case-insensitive player name remains the fallback. The execution-time duplicate guard is retained.
+- When every eligible default server is already watched for the selected player, autocomplete reports that no additional default servers are available.
+- Watched-player join alerts now render the guild's server display name as a clickable Battlelog server link.
+- Added `watch-player-setup.md` with concise private-channel permissions and watched-player setup instructions.
+- `QUICK-INSTALL.md` now explicitly states under announcement-channel setup that multiple announcement channels are supported and can be added by rerunning `/addannouncementchannel`.
+
+### Behavior
+- No Alembic migration is required for v2.5.2.
+
 ## [v2.5.1] - 2026-08-19
 
 ### Fixed
