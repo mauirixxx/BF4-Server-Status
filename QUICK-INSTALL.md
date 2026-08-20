@@ -75,3 +75,20 @@ After steps **1–6**, the basic server-monitoring setup is complete.
 Users can click the displayed map buttons to add or remove configured map-notification roles.
 
 ServerWatcher requires the Discord **Manage Roles** permission, and the ServerWatcher bot role must be positioned **above the map roles it assigns** in the Discord role hierarchy.
+
+
+## 9. Optional — Enable admin watched-player alerts
+
+Create a Discord text channel intended for administrators/moderators only, then run:
+
+```text
+/setwatchedplayerchannel channel:#bf4-player-alerts
+```
+
+ServerWatcher will warn if `@everyone` can view the selected channel. After it is configured, admins can add watches with:
+
+```text
+/watchplayer player:<player name> server:<default server>
+```
+
+Use `/watchedplayers` to review watches and `/unwatchplayer` to remove one. Player-history searches are available with `/playerhistory`.

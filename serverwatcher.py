@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
+import html as html_lib
+import io
 import json
 import logging
 import os
 import re
 import time
+import zipfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -15,18 +20,22 @@ import discord
 import requests
 from discord import app_commands
 from dotenv import load_dotenv
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
 from models import (
     BF4Map,
+    BF4PlayerAlias,
+    BF4PlayerSession,
     BF4Server,
     CommandAudit,
     Guild,
     GuildAnnouncementChannel,
     GuildListenChannel,
     GuildMapRolePing,
+    GuildPlayerWatch,
+    GuildPlayerWatchAlert,
     GuildRolePanelMessage,
     GuildServer,
     GuildServerPlayerMessage,
@@ -35,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.4.1"
+BOT_VERSION = "v2.5.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -111,6 +120,16 @@ KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
 watcher_started = False
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
+PLAYER_ROSTER_BASELINED: set[str] = set()
+PLAYER_ROSTER_RECOVERY_REQUIRED: set[str] = set()
+PENDING_PLAYER_ABSENCES: dict[tuple[str, int], datetime] = {}
+PLAYER_ENRICHMENT_QUEUE = deque()
+PLAYER_ENRICHMENT_QUEUED: set[str] = set()
+PLAYER_ENRICHMENT_RETRY_AFTER: dict[str, float] = {}
+PLAYER_ENRICHMENT_PENDING_SESSIONS: dict[str, set[int]] = {}
+PLAYER_ENRICHMENT_ALERT_ELIGIBLE: set[int] = set()
+PLAYER_ENRICHMENT_MAX_SERVERS_PER_CYCLE = 3
+PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS = 600
 
 
 def utcnow() -> datetime:
@@ -264,6 +283,108 @@ def get_battlelog_tick_rate(battlelog_url: str, guid: str | None = None) -> int:
     if tick_rate is None:
         raise ValueError("Battlelog page did not contain a tick rate")
     return tick_rate
+
+
+def normalize_player_name(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def battlelog_server_url_for(server: BF4Server) -> str | None:
+    if server.battlelog_url:
+        return server.battlelog_url
+    platform = normalize_platform_label(server.platform)
+    path = {"PC": "pc", "PS4/5": "ps4", "XBox": "xboxone"}.get(platform)
+    if not path:
+        return None
+    return (
+        "https://battlelog.battlefield.com/bf4/servers/show/"
+        f"{path}/{server.server_guid}/"
+    )
+
+
+def extract_battlelog_player_identities(page_html: str) -> list[dict]:
+    """Extract live scoreboard persona IDs and current names from Battlelog HTML."""
+    text = str(page_html or "")
+    result = []
+    seen: set[tuple[int, str]] = set()
+    for row_match in re.finditer(
+        r'<tr\b[^>]*\bdata-personaid="(\d+)"[^>]*>(.*?)</tr>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        persona_id = as_int(row_match.group(1))
+        if persona_id is None:
+            continue
+        row_html = row_match.group(2)
+        name_match = re.search(
+            r'<(?:span|a)\b[^>]*class="[^"]*common-playername-personaname-nolink[^"]*"[^>]*>(.*?)</(?:span|a)>',
+            row_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not name_match:
+            # Some Battlelog variants render the persona-name container with a
+            # nested link instead of the nolink span.
+            container_match = re.search(
+                r'<div\b[^>]*class="[^"]*common-playername-personaname[^"]*"[^>]*>(.*?)</div>',
+                row_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not container_match:
+                continue
+            raw_name = re.sub(r"<[^>]+>", " ", container_match.group(1))
+        else:
+            raw_name = re.sub(r"<[^>]+>", " ", name_match.group(1))
+        name = re.sub(r"\s+", " ", html_lib.unescape(raw_name)).strip()
+        normalized = normalize_player_name(name)
+        if not name or not normalized:
+            continue
+        key = (persona_id, normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            {
+                "persona_id": persona_id,
+                "player_name": name,
+                "normalized_name": normalized,
+            }
+        )
+    return result
+
+
+def get_battlelog_player_identities(battlelog_url: str) -> list[dict]:
+    response = requests.get(
+        battlelog_url,
+        headers={"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return extract_battlelog_player_identities(response.text)
+
+
+def authoritative_roster_names(snapshot: dict) -> list[str]:
+    """Return active non-commander player names from one authoritative Keeper snapshot."""
+    teams = snapshot.get("teamInfo", {})
+    if not isinstance(teams, dict):
+        return []
+    names = []
+    seen = set()
+    for team_id, team in teams.items():
+        if str(team_id) == "0" or not isinstance(team, dict):
+            continue
+        players = team.get("players", {})
+        if not isinstance(players, dict):
+            continue
+        for player in players.values():
+            if not isinstance(player, dict) or player_role(player) == "commander":
+                continue
+            name = player_display_name(player)
+            normalized = normalize_player_name(name)
+            if not normalized or name == "Unknown" or normalized in seen:
+                continue
+            seen.add(normalized)
+            names.append(name)
+    return names
 
 
 def get_keeper_snapshot(guid: str) -> dict:
@@ -745,6 +866,15 @@ def sync_guild_settings_names(
         roles_channel.name if roles_channel is not None else None
     )
 
+    watched_player_channel = (
+        discord_guild.get_channel(int(settings.watched_player_channel_id))
+        if settings.watched_player_channel_id
+        else None
+    )
+    settings.watched_player_channel_name = (
+        watched_player_channel.name if watched_player_channel is not None else None
+    )
+
 
 def refresh_guild_settings_names(discord_guild: discord.Guild):
     with SessionLocal.begin() as session:
@@ -897,6 +1027,8 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
                 status_min_role_name=None,
                 roles_channel_id=0,
                 roles_channel_name=None,
+                watched_player_channel_id=0,
+                watched_player_channel_name=None,
             )
             session.add(settings)
         sync_guild_settings_names(discord_guild, settings)
@@ -1303,6 +1435,75 @@ def command_choice_list(guild_id: int, current: str, *, defaults=None):
         if len(result) >= 25:
             break
     return result
+
+
+def player_name_choices(guild_id: int, current: str):
+    needle = normalize_player_name(current)
+    with SessionLocal() as session:
+        server_guids = session.scalars(
+            select(GuildServer.server_guid).where(GuildServer.guild_id == guild_id)
+        ).all()
+        if not server_guids:
+            return []
+        rows = session.execute(
+            select(
+                BF4PlayerSession.player_name,
+                func.max(BF4PlayerSession.last_seen).label("last_seen"),
+            )
+            .where(BF4PlayerSession.server_guid.in_(list(server_guids)))
+            .group_by(BF4PlayerSession.player_name)
+            .order_by(func.max(BF4PlayerSession.last_seen).desc())
+        ).all()
+    choices = []
+    seen = set()
+    for name, _ in rows:
+        normalized = normalize_player_name(name)
+        if normalized in seen or (needle and needle not in normalized):
+            continue
+        seen.add(normalized)
+        choices.append(app_commands.Choice(name=str(name)[:100], value=str(name)[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def watched_player_choices(guild_id: int, current: str):
+    needle = normalize_player_name(current)
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildPlayerWatch, GuildServer)
+            .join(
+                GuildServer,
+                (GuildServer.guild_id == GuildPlayerWatch.guild_id)
+                & (GuildServer.server_guid == GuildPlayerWatch.server_guid),
+            )
+            .where(GuildPlayerWatch.guild_id == guild_id)
+            .order_by(GuildServer.display_name, GuildPlayerWatch.watched_name)
+        ).all()
+    choices = []
+    for watch, gs in rows:
+        label = f'{watch.watched_name} — {gs.display_name}'
+        if needle and needle not in normalize_player_name(label):
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(watch.id)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def current_alias_for_persona(platform: str, persona_id: int | None) -> str | None:
+    if persona_id is None:
+        return None
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(BF4PlayerAlias)
+            .where(
+                BF4PlayerAlias.platform == platform,
+                BF4PlayerAlias.persona_id == int(persona_id),
+            )
+            .order_by(BF4PlayerAlias.last_seen.desc())
+        )
+        return row.player_name if row is not None else None
 
 
 def build_debug_report(snapshot: dict):
@@ -1713,6 +1914,602 @@ async def notify_default_guilds_tick_rate_change(
         sent_count,
     )
     return sent_count
+
+
+def upsert_player_alias(
+    session,
+    *,
+    platform: str,
+    persona_id: int,
+    player_name: str,
+    seen_at: datetime,
+):
+    normalized = normalize_player_name(player_name)
+    if not normalized:
+        return None
+    row = session.scalar(
+        select(BF4PlayerAlias).where(
+            BF4PlayerAlias.platform == platform,
+            BF4PlayerAlias.persona_id == persona_id,
+            BF4PlayerAlias.normalized_name == normalized,
+        )
+    )
+    if row is None:
+        row = BF4PlayerAlias(
+            platform=platform,
+            persona_id=persona_id,
+            player_name=player_name,
+            normalized_name=normalized,
+            first_seen=seen_at,
+            last_seen=seen_at,
+        )
+        session.add(row)
+        log.info(
+            "Player alias discovered platform=%s persona=%s name=%r",
+            platform,
+            persona_id,
+            player_name,
+        )
+    else:
+        row.player_name = player_name
+        row.last_seen = seen_at
+    return row
+
+
+def known_persona_for_name(session, platform: str, normalized_name: str) -> int | None:
+    ids = session.scalars(
+        select(BF4PlayerAlias.persona_id)
+        .where(
+            BF4PlayerAlias.platform == platform,
+            BF4PlayerAlias.normalized_name == normalized_name,
+        )
+        .distinct()
+    ).all()
+    unique = {int(value) for value in ids if value is not None}
+    return next(iter(unique)) if len(unique) == 1 else None
+
+
+def queue_player_enrichment(
+    server_guid: str,
+    session_ids: list[int] | set[int],
+    *,
+    alerts_allowed: bool,
+):
+    pending = PLAYER_ENRICHMENT_PENDING_SESSIONS.setdefault(server_guid, set())
+    pending.update(int(value) for value in session_ids)
+    if alerts_allowed:
+        PLAYER_ENRICHMENT_ALERT_ELIGIBLE.update(int(value) for value in session_ids)
+    if server_guid not in PLAYER_ENRICHMENT_QUEUED:
+        PLAYER_ENRICHMENT_QUEUE.append(server_guid)
+        PLAYER_ENRICHMENT_QUEUED.add(server_guid)
+        log.info(
+            "Player persona enrichment queued server=%s pending_sessions=%s",
+            server_guid,
+            len(pending),
+        )
+
+
+def clean_alert_value(value: str) -> str:
+    return (
+        re.sub(r"\s+", " ", str(value or "")).strip()
+        .replace('"', "'")
+        .replace("<", "‹")
+        .replace(">", "›")
+    )
+
+
+async def evaluate_player_watch_alerts(session_id: int):
+    """Evaluate one newly-created/recently-enriched session against guild watches."""
+    with SessionLocal() as session:
+        player_session = session.get(BF4PlayerSession, int(session_id))
+        if player_session is None:
+            return 0
+        watch_rows = session.scalars(
+            select(GuildPlayerWatch).where(
+                GuildPlayerWatch.server_guid == player_session.server_guid
+            )
+        ).all()
+        detached = []
+        for watch in watch_rows:
+            identity_match = (
+                player_session.persona_id is not None
+                and watch.persona_id is not None
+                and int(player_session.persona_id) == int(watch.persona_id)
+            )
+            # Persona ID is authoritative. Fall back to name only when at
+            # least one side has not yet been resolved to a persona ID.
+            name_match = (
+                (player_session.persona_id is None or watch.persona_id is None)
+                and watch.normalized_name == player_session.normalized_name
+            )
+            if not (identity_match or name_match):
+                continue
+            gs = session.get(
+                GuildServer,
+                (watch.guild_id, player_session.server_guid),
+            )
+            settings = session.get(GuildSettings, watch.guild_id)
+            already = session.get(
+                GuildPlayerWatchAlert,
+                (watch.id, player_session.id),
+            )
+            if not gs or not gs.is_default or settings is None or already is not None:
+                continue
+            detached.append(
+                {
+                    "watch_id": watch.id,
+                    "guild_id": watch.guild_id,
+                    "watched_name": watch.watched_name,
+                    "watch_persona_id": watch.persona_id,
+                    "watch_normalized_name": watch.normalized_name,
+                    "server_name": gs.display_name,
+                    "channel_id": int(settings.watched_player_channel_id or 0),
+                    "management_role_id": int(settings.management_min_role_id or 0),
+                    "persona_id": player_session.persona_id,
+                    "player_name": player_session.player_name,
+                    "normalized_name": player_session.normalized_name,
+                    "time_joined": player_session.time_joined,
+                }
+            )
+
+    sent = 0
+    for item in detached:
+        guild = client.get_guild(int(item["guild_id"]))
+        if guild is None:
+            log.warning(
+                "Watched player alert skipped guild=%s session=%s reason=guild_unresolved",
+                item["guild_id"],
+                session_id,
+            )
+            continue
+        if not item["channel_id"]:
+            log.warning(
+                "Watched player alert skipped guild=%s session=%s server=%s reason=channel_not_configured",
+                guild.id,
+                session_id,
+                item["server_name"],
+            )
+            continue
+        channel = guild.get_channel(item["channel_id"])
+        if channel is None:
+            log.error(
+                "Watched player alert delivery failed guild=%s channel=%s session=%s reason=channel_unresolved",
+                guild.id,
+                item["channel_id"],
+                session_id,
+            )
+            continue
+
+        role_id = item["management_role_id"]
+        management_role = guild.get_role(role_id) if role_id else None
+        mention = (
+            f"<@&{role_id}>"
+            if role_id and management_role is not None
+            else f"<@{guild.owner_id}>"
+        )
+        watched_name = clean_alert_value(item["watched_name"])
+        current_name = clean_alert_value(item["player_name"])
+        server_name = clean_alert_value(item["server_name"])
+        joined_unix = int(item["time_joined"].timestamp())
+        as_text = (
+            f' as "{current_name}"'
+            if normalize_player_name(watched_name) != normalize_player_name(current_name)
+            else ""
+        )
+        content = (
+            f'Attention {mention} - player "{watched_name}" has joined '
+            f'"{server_name}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
+        )
+
+        try:
+            message = await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                    users=True,
+                    everyone=False,
+                ),
+            )
+            with SessionLocal.begin() as session:
+                # Upgrade an explicitly name-matched watch as soon as the
+                # authoritative persona ID becomes available.
+                watch = session.get(GuildPlayerWatch, item["watch_id"])
+                if (
+                    watch is not None
+                    and watch.persona_id is None
+                    and item["persona_id"] is not None
+                    and watch.normalized_name == item["normalized_name"]
+                ):
+                    duplicate = session.scalar(
+                        select(GuildPlayerWatch).where(
+                            GuildPlayerWatch.guild_id == watch.guild_id,
+                            GuildPlayerWatch.server_guid == watch.server_guid,
+                            GuildPlayerWatch.persona_id == item["persona_id"],
+                            GuildPlayerWatch.id != watch.id,
+                        )
+                    )
+                    if duplicate is None:
+                        watch.persona_id = int(item["persona_id"])
+                if session.get(
+                    GuildPlayerWatchAlert,
+                    (item["watch_id"], int(session_id)),
+                ) is None:
+                    session.add(
+                        GuildPlayerWatchAlert(
+                            watch_id=item["watch_id"],
+                            session_id=int(session_id),
+                            alerted_at=utcnow(),
+                        )
+                    )
+            sent += 1
+            log.info(
+                "Watched player alert posted guild=%s channel=%s message=%s server=%s session=%s watched_name=%r current_name=%r persona=%s",
+                guild.id,
+                channel.id,
+                message.id,
+                item["server_name"],
+                session_id,
+                item["watched_name"],
+                item["player_name"],
+                item["persona_id"],
+            )
+        except Exception as exc:
+            log.error(
+                "Watched player alert delivery failed guild=%s channel=%s session=%s error=%s message=%r",
+                guild.id,
+                item["channel_id"],
+                session_id,
+                type(exc).__name__,
+                str(exc),
+            )
+    return sent
+
+
+async def process_player_persona_enrichment():
+    """Process at most three server-level Battlelog enrichment requests per monitor cycle."""
+    processed = succeeded = failed = enriched_sessions = 0
+    scan_budget = len(PLAYER_ENRICHMENT_QUEUE)
+    while (
+        PLAYER_ENRICHMENT_QUEUE
+        and processed < PLAYER_ENRICHMENT_MAX_SERVERS_PER_CYCLE
+        and scan_budget > 0
+    ):
+        scan_budget -= 1
+        guid = PLAYER_ENRICHMENT_QUEUE.popleft()
+        PLAYER_ENRICHMENT_QUEUED.discard(guid)
+        retry_after = PLAYER_ENRICHMENT_RETRY_AFTER.get(guid, 0.0)
+        if retry_after > time.monotonic():
+            PLAYER_ENRICHMENT_QUEUE.append(guid)
+            PLAYER_ENRICHMENT_QUEUED.add(guid)
+            continue
+
+        pending_ids = set(PLAYER_ENRICHMENT_PENDING_SESSIONS.get(guid, set()))
+        if not pending_ids:
+            PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+            continue
+
+        with SessionLocal() as session:
+            bf = session.get(BF4Server, guid)
+            if bf is None:
+                PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                continue
+            platform = normalize_platform_label(bf.platform)
+            url = battlelog_server_url_for(bf)
+
+        if not url:
+            log.info(
+                "Player persona enrichment skipped server=%s reason=battlelog_url_unavailable",
+                guid,
+            )
+            PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+            continue
+
+        processed += 1
+        try:
+            identities = await asyncio.to_thread(get_battlelog_player_identities, url)
+            if not identities:
+                raise ValueError("Battlelog page did not contain live player persona identities")
+
+            identity_by_name = {
+                row["normalized_name"]: row
+                for row in identities
+            }
+            matched_ids = set()
+            now = utcnow()
+            with SessionLocal.begin() as session:
+                pending_sessions = session.scalars(
+                    select(BF4PlayerSession).where(
+                        BF4PlayerSession.id.in_(pending_ids),
+                        BF4PlayerSession.server_guid == guid,
+                    )
+                ).all()
+                for player_session in pending_sessions:
+                    identity = identity_by_name.get(player_session.normalized_name)
+                    if identity is None:
+                        continue
+                    persona_id = int(identity["persona_id"])
+                    current_name = identity["player_name"]
+                    player_session.persona_id = persona_id
+                    player_session.player_name = current_name
+                    player_session.normalized_name = normalize_player_name(current_name)
+                    upsert_player_alias(
+                        session,
+                        platform=platform,
+                        persona_id=persona_id,
+                        player_name=current_name,
+                        seen_at=now,
+                    )
+                    matched_ids.add(int(player_session.id))
+
+                    # Upgrade name-only watches that explicitly match this
+                    # player. Preserve watched_name for human-facing alerts.
+                    watches = session.scalars(
+                        select(GuildPlayerWatch).where(
+                            GuildPlayerWatch.server_guid == guid,
+                            GuildPlayerWatch.persona_id.is_(None),
+                            GuildPlayerWatch.normalized_name == normalize_player_name(current_name),
+                        )
+                    ).all()
+                    for watch in watches:
+                        duplicate = session.scalar(
+                            select(GuildPlayerWatch).where(
+                                GuildPlayerWatch.guild_id == watch.guild_id,
+                                GuildPlayerWatch.server_guid == guid,
+                                GuildPlayerWatch.persona_id == persona_id,
+                                GuildPlayerWatch.id != watch.id,
+                            )
+                        )
+                        if duplicate is None:
+                            watch.persona_id = persona_id
+
+                # The same server-page request can enrich any other currently
+                # open name-only sessions without additional HTTP traffic.
+                open_sessions = session.scalars(
+                    select(BF4PlayerSession).where(
+                        BF4PlayerSession.server_guid == guid,
+                        BF4PlayerSession.time_left.is_(None),
+                        BF4PlayerSession.persona_id.is_(None),
+                    )
+                ).all()
+                for player_session in open_sessions:
+                    identity = identity_by_name.get(player_session.normalized_name)
+                    if identity is None:
+                        continue
+                    persona_id = int(identity["persona_id"])
+                    player_session.persona_id = persona_id
+                    player_session.player_name = identity["player_name"]
+                    player_session.normalized_name = normalize_player_name(identity["player_name"])
+                    upsert_player_alias(
+                        session,
+                        platform=platform,
+                        persona_id=persona_id,
+                        player_name=identity["player_name"],
+                        seen_at=now,
+                    )
+
+            remaining = pending_ids - matched_ids
+            if remaining:
+                PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = remaining
+                PLAYER_ENRICHMENT_RETRY_AFTER[guid] = time.monotonic() + 300
+                if guid not in PLAYER_ENRICHMENT_QUEUED:
+                    PLAYER_ENRICHMENT_QUEUE.append(guid)
+                    PLAYER_ENRICHMENT_QUEUED.add(guid)
+            else:
+                PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+
+            succeeded += 1
+            enriched_sessions += len(matched_ids)
+            log.info(
+                "Player persona enrichment complete server=%s identities=%s matched_sessions=%s remaining=%s",
+                guid,
+                len(identities),
+                len(matched_ids),
+                len(remaining),
+            )
+
+            for session_id in sorted(matched_ids):
+                if session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
+                    await evaluate_player_watch_alerts(session_id)
+                    PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
+        except Exception as exc:
+            failed += 1
+            PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
+                time.monotonic() + PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+            )
+            if guid not in PLAYER_ENRICHMENT_QUEUED:
+                PLAYER_ENRICHMENT_QUEUE.append(guid)
+                PLAYER_ENRICHMENT_QUEUED.add(guid)
+            log.warning(
+                "Player persona enrichment failed server=%s pending_sessions=%s error=%s message=%r retry_seconds=%s",
+                guid,
+                len(pending_ids),
+                type(exc).__name__,
+                str(exc),
+                PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS,
+            )
+
+    return {
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "enriched_sessions": enriched_sessions,
+        "queued": len(PLAYER_ENRICHMENT_QUEUE),
+    }
+
+
+async def process_player_history(
+    fresh: dict[str, dict],
+    tracked_guids: list[str],
+):
+    """Maintain global player sessions from authoritative Keeper rosters."""
+    for guid in tracked_guids:
+        if guid not in fresh and guid in PLAYER_ROSTER_BASELINED:
+            PLAYER_ROSTER_RECOVERY_REQUIRED.add(guid)
+
+    sessions_created = sessions_closed = joins_alerted = 0
+    baselines = 0
+    for guid, snapshot in fresh.items():
+        baseline = (
+            guid not in PLAYER_ROSTER_BASELINED
+            or guid in PLAYER_ROSTER_RECOVERY_REQUIRED
+        )
+        now = utcnow()
+        roster_names = authoritative_roster_names(snapshot)
+        current = {
+            normalize_player_name(name): name
+            for name in roster_names
+            if normalize_player_name(name)
+        }
+        status = get_server_status(snapshot)
+
+        with SessionLocal() as session:
+            bf = session.get(BF4Server, guid)
+            platform = normalize_platform_label(bf.platform if bf else "Unknown")
+
+        new_session_ids = []
+        enrichment_ids = []
+        with SessionLocal.begin() as session:
+            open_sessions = session.scalars(
+                select(BF4PlayerSession).where(
+                    BF4PlayerSession.server_guid == guid,
+                    BF4PlayerSession.time_left.is_(None),
+                )
+            ).all()
+            by_name = {row.normalized_name: row for row in open_sessions}
+            by_persona = {
+                int(row.persona_id): row
+                for row in open_sessions
+                if row.persona_id is not None
+            }
+            alias_rows = session.scalars(
+                select(BF4PlayerAlias).where(
+                    BF4PlayerAlias.platform == platform,
+                    BF4PlayerAlias.normalized_name.in_(list(current) or [""]),
+                )
+            ).all()
+            alias_ids_by_name: dict[str, set[int]] = {}
+            alias_by_identity_name: dict[tuple[int, str], BF4PlayerAlias] = {}
+            for alias in alias_rows:
+                alias_ids_by_name.setdefault(alias.normalized_name, set()).add(int(alias.persona_id))
+                alias_by_identity_name[(int(alias.persona_id), alias.normalized_name)] = alias
+            persona_by_name = {
+                normalized_name: next(iter(persona_ids))
+                for normalized_name, persona_ids in alias_ids_by_name.items()
+                if len(persona_ids) == 1
+            }
+            matched_ids = set()
+
+            for normalized, player_name in current.items():
+                persona_id = persona_by_name.get(normalized)
+                player_session = by_persona.get(persona_id) if persona_id is not None else None
+                if player_session is None:
+                    player_session = by_name.get(normalized)
+
+                if player_session is None:
+                    player_session = BF4PlayerSession(
+                        server_guid=guid,
+                        platform=platform,
+                        map_key=status["map_key"],
+                        map_name=status["map_name"],
+                        persona_id=persona_id,
+                        player_name=player_name,
+                        normalized_name=normalized,
+                        time_joined=now,
+                        last_seen=now,
+                        time_left=None,
+                    )
+                    session.add(player_session)
+                    session.flush()
+                    open_sessions.append(player_session)
+                    by_name[normalized] = player_session
+                    if persona_id is not None:
+                        by_persona[int(persona_id)] = player_session
+                    new_session_ids.append(int(player_session.id))
+                    if persona_id is None:
+                        enrichment_ids.append(int(player_session.id))
+                    sessions_created += 1
+                else:
+                    player_session.last_seen = now
+                    if persona_id is not None and player_session.persona_id is None:
+                        player_session.persona_id = int(persona_id)
+                    if player_session.persona_id is not None:
+                        player_session.player_name = player_name
+                        player_session.normalized_name = normalized
+
+                matched_ids.add(int(player_session.id))
+                PENDING_PLAYER_ABSENCES.pop((guid, int(player_session.id)), None)
+                if player_session.persona_id is not None:
+                    alias = alias_by_identity_name.get(
+                        (int(player_session.persona_id), normalized)
+                    )
+                    if alias is not None:
+                        alias.player_name = player_name
+                        alias.last_seen = now
+                    else:
+                        upsert_player_alias(
+                            session,
+                            platform=platform,
+                            persona_id=int(player_session.persona_id),
+                            player_name=player_name,
+                            seen_at=now,
+                        )
+
+            for player_session in open_sessions:
+                sid = int(player_session.id)
+                if sid in matched_ids:
+                    continue
+                absence_key = (guid, sid)
+                first_absent = PENDING_PLAYER_ABSENCES.get(absence_key)
+                if first_absent is None:
+                    PENDING_PLAYER_ABSENCES[absence_key] = now
+                else:
+                    player_session.time_left = first_absent
+                    PENDING_PLAYER_ABSENCES.pop(absence_key, None)
+                    sessions_closed += 1
+
+        if enrichment_ids:
+            queue_player_enrichment(
+                guid,
+                enrichment_ids,
+                alerts_allowed=not baseline,
+            )
+
+        if baseline:
+            baselines += 1
+            log.info(
+                "Player history baseline established server=%s players=%s new_sessions=%s alerts_suppressed=True",
+                guid,
+                len(current),
+                len(new_session_ids),
+            )
+        else:
+            for session_id in new_session_ids:
+                joins_alerted += await evaluate_player_watch_alerts(session_id)
+
+        PLAYER_ROSTER_BASELINED.add(guid)
+        PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
+
+    enrichment = await process_player_persona_enrichment()
+    log.info(
+        "Player history cycle complete fresh_servers=%s baselines=%s sessions_created=%s sessions_closed=%s alerts_sent=%s enrichment_processed=%s enrichment_succeeded=%s enrichment_failed=%s enrichment_queue=%s",
+        len(fresh),
+        baselines,
+        sessions_created,
+        sessions_closed,
+        joins_alerted,
+        enrichment["processed"],
+        enrichment["succeeded"],
+        enrichment["failed"],
+        enrichment["queued"],
+    )
+    return {
+        "baselines": baselines,
+        "created": sessions_created,
+        "closed": sessions_closed,
+        "alerts": joins_alerted,
+        "enrichment": enrichment,
+    }
 
 
 async def delete_discord_message(guild_id, channel_id, message_id):
@@ -2511,6 +3308,25 @@ async def monitor_cycle():
                 status,
             )
 
+    player_history_summary = {
+        "baselines": 0,
+        "created": 0,
+        "closed": 0,
+        "alerts": 0,
+        "enrichment": {
+            "processed": 0, "succeeded": 0, "failed": 0,
+            "enriched_sessions": 0, "queued": 0,
+        },
+    }
+    try:
+        player_history_summary = await process_player_history(fresh, unique_guids)
+    except Exception as exc:
+        log.error(
+            "Player history cycle failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
+        )
+
     player_display_summary = {
         "requested": 0,
         "unique": 0,
@@ -2543,7 +3359,8 @@ async def monitor_cycle():
         "succeeded=%s failed=%s service_failures=%s "
         "isolated_failures=%s circuit_opened=%s players=%s "
         "player_displays=%s player_displays_replaced=%s "
-        "player_displays_unchanged=%s",
+        "player_displays_unchanged=%s player_sessions_created=%s "
+        "player_sessions_closed=%s watched_alerts=%s",
         references,
         unique_count,
         duplicate_avoided,
@@ -2558,6 +3375,9 @@ async def monitor_cycle():
         player_display_summary["requested"],
         player_display_summary["replaced"],
         player_display_summary["unchanged"],
+        player_history_summary["created"],
+        player_history_summary["closed"],
+        player_history_summary["alerts"],
     )
 
 
@@ -4969,6 +5789,537 @@ async def delroleschannel(interaction: discord.Interaction):
     )
 
 
+@tree.command(
+    name="setwatchedplayerchannel",
+    description="Set the admin-only channel for watched-player join alerts",
+)
+@app_commands.describe(channel="Admin/moderator text channel for watched-player alerts")
+async def setwatchedplayerchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+
+    guild = interaction.guild
+    bot_member = guild.me
+    if bot_member is None:
+        await interaction.followup.send("⚠️ Could not resolve the bot member.", ephemeral=True)
+        return
+    perms = channel.permissions_for(bot_member)
+    missing = []
+    if not perms.view_channel:
+        missing.append("View Channel")
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.read_message_history:
+        missing.append("Read Message History")
+    if missing:
+        await interaction.followup.send(
+            "⛔ ServerWatcher is missing required permissions in "
+            f"**#{channel.name}**: {', '.join(missing)}.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="setwatchedplayerchannel",
+            command_type="slash",
+            success=False,
+            started=started,
+            result_code="missing_channel_permissions",
+            target_type="channel",
+            target_id=channel.id,
+            target_name=channel.name,
+            metadata={"missing_permissions": missing},
+        )
+        return
+
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, guild.id)
+        settings.guild_name = guild.name
+        settings.watched_player_channel_id = channel.id
+        settings.watched_player_channel_name = channel.name
+
+    warning = ""
+    everyone_perms = channel.permissions_for(guild.default_role)
+    if everyone_perms.view_channel:
+        warning = (
+            "\n⚠️ **Privacy warning:** `@everyone` can currently view this channel. "
+            "Watched-player alerts are intended for an admin/moderator-only channel."
+        )
+    await interaction.followup.send(
+        f"✅ Watched-player alert channel set to **#{channel.name}**.{warning}",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="setwatchedplayerchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="updated",
+        target_type="channel",
+        target_id=channel.id,
+        target_name=channel.name,
+        metadata={"everyone_can_view": everyone_perms.view_channel},
+    )
+
+
+@tree.command(
+    name="delwatchedplayerchannel",
+    description="Disable watched-player join alerts without deleting watches/history",
+)
+async def delwatchedplayerchannel(interaction: discord.Interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, interaction.guild.id)
+        old_id = int(settings.watched_player_channel_id or 0)
+        old_name = settings.watched_player_channel_name
+        settings.watched_player_channel_id = 0
+        settings.watched_player_channel_name = None
+    await interaction.followup.send(
+        "✅ Watched-player alerts disabled. Existing watches and player history were preserved.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="delwatchedplayerchannel",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="disabled",
+        target_type="channel",
+        target_id=old_id or None,
+        target_name=old_name,
+    )
+
+
+@tree.command(name="watchplayer", description="Alert admins when a player joins a default BF4 server")
+@app_commands.describe(
+    player="Player name; autocomplete is optional and manual names are allowed",
+    server="Default BF4 server to watch",
+)
+async def watchplayer(
+    interaction: discord.Interaction,
+    player: str,
+    server: str,
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    watched_name = re.sub(r"\s+", " ", str(player or "")).strip()[:255]
+    normalized = normalize_player_name(watched_name)
+    if not normalized:
+        await interaction.followup.send("⛔ Enter a player name to watch.", ephemeral=True)
+        return
+
+    with SessionLocal.begin() as session:
+        settings = session.get(GuildSettings, interaction.guild.id)
+        if not settings or not settings.watched_player_channel_id:
+            await interaction.followup.send(
+                "⛔ Set a dedicated watched-player channel first with `/setwatchedplayerchannel`.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="watchplayer",
+                command_type="slash",
+                success=False,
+                started=started,
+                result_code="watched_player_channel_required",
+                target_type="player",
+                target_name=watched_name,
+            )
+            return
+        alert_channel = interaction.guild.get_channel(int(settings.watched_player_channel_id))
+        if alert_channel is None:
+            await interaction.followup.send(
+                "⛔ The configured watched-player channel can no longer be resolved. "
+                "Set it again with `/setwatchedplayerchannel`.",
+                ephemeral=True,
+            )
+            return
+
+        gs = session.get(GuildServer, (interaction.guild.id, server))
+        bf = session.get(BF4Server, server)
+        if not gs or not bf or not gs.is_default:
+            await interaction.followup.send(
+                "⛔ Choose one of this Discord server's current default BF4 servers.",
+                ephemeral=True,
+            )
+            return
+
+        platform = normalize_platform_label(bf.platform)
+        persona_id = known_persona_for_name(session, platform, normalized)
+        duplicate = session.scalar(
+            select(GuildPlayerWatch).where(
+                GuildPlayerWatch.guild_id == interaction.guild.id,
+                GuildPlayerWatch.server_guid == server,
+                or_(
+                    GuildPlayerWatch.normalized_name == normalized,
+                    (
+                        GuildPlayerWatch.persona_id == persona_id
+                        if persona_id is not None
+                        else GuildPlayerWatch.id == -1
+                    ),
+                ),
+            )
+        )
+        if duplicate is not None:
+            await interaction.followup.send(
+                f"ℹ️ **{duplicate.watched_name}** is already watched on **{gs.display_name}**.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="watchplayer",
+                command_type="slash",
+                success=True,
+                started=started,
+                result_code="already_watched",
+                target_type="player",
+                target_name=duplicate.watched_name,
+                metadata={"server_guid": server},
+            )
+            return
+
+        watch = GuildPlayerWatch(
+            guild_id=interaction.guild.id,
+            server_guid=server,
+            watched_name=watched_name,
+            normalized_name=normalized,
+            persona_id=persona_id,
+            created_by_user_id=interaction.user.id,
+            created_at=utcnow(),
+        )
+        session.add(watch)
+
+    await interaction.followup.send(
+        f"✅ Watching **{watched_name}** for joins on **{gs.display_name}**.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="watchplayer",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="added",
+        target_type="player",
+        target_name=watched_name,
+        metadata={"server_guid": server, "persona_resolved": persona_id is not None},
+    )
+
+
+@watchplayer.autocomplete("player")
+async def watchplayer_player_autocomplete(interaction, current):
+    return player_name_choices(interaction.guild.id, current) if interaction.guild else []
+
+
+@watchplayer.autocomplete("server")
+async def watchplayer_server_autocomplete(interaction, current):
+    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+
+
+@tree.command(name="unwatchplayer", description="Remove one watched-player rule")
+@app_commands.describe(watch="Watched player/server rule to remove")
+async def unwatchplayer(interaction: discord.Interaction, watch: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    watch_id = as_int(watch)
+    if watch_id is None:
+        await interaction.followup.send("⛔ Choose a watch from the autocomplete list.", ephemeral=True)
+        return
+    with SessionLocal.begin() as session:
+        row = session.get(GuildPlayerWatch, watch_id)
+        if row is None or row.guild_id != interaction.guild.id:
+            await interaction.followup.send("⛔ That watched-player rule was not found.", ephemeral=True)
+            return
+        gs = session.get(GuildServer, (interaction.guild.id, row.server_guid))
+        name = row.watched_name
+        server_name = gs.display_name if gs else row.server_guid
+        session.delete(row)
+    await interaction.followup.send(
+        f"✅ Stopped watching **{name}** on **{server_name}**.",
+        ephemeral=True,
+    )
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="unwatchplayer",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="removed",
+        target_type="player_watch",
+        target_id=watch_id,
+        target_name=name,
+        metadata={"server_name": server_name},
+    )
+
+
+@unwatchplayer.autocomplete("watch")
+async def unwatchplayer_autocomplete(interaction, current):
+    return watched_player_choices(interaction.guild.id, current) if interaction.guild else []
+
+
+@tree.command(name="watchedplayers", description="List this Discord server's watched-player rules")
+async def watchedplayers(interaction: discord.Interaction):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    with SessionLocal() as session:
+        settings = session.get(GuildSettings, interaction.guild.id)
+        rows = session.execute(
+            select(GuildPlayerWatch, GuildServer, BF4Server)
+            .join(
+                GuildServer,
+                (GuildServer.guild_id == GuildPlayerWatch.guild_id)
+                & (GuildServer.server_guid == GuildPlayerWatch.server_guid),
+            )
+            .join(BF4Server, BF4Server.server_guid == GuildPlayerWatch.server_guid)
+            .where(GuildPlayerWatch.guild_id == interaction.guild.id)
+            .order_by(GuildServer.display_name, GuildPlayerWatch.watched_name)
+        ).all()
+        channel_id = int(settings.watched_player_channel_id or 0) if settings else 0
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        header = "⚠️ **Watched-player alerts are disabled:** no valid watched-player channel is configured."
+    else:
+        header = f"🔔 Watched-player alerts: **#{channel.name}**"
+    lines = [header]
+    if not rows:
+        lines.append("No watched players configured.")
+    else:
+        for watch, gs, bf in rows:
+            current_name = current_alias_for_persona(
+                normalize_platform_label(bf.platform),
+                watch.persona_id,
+            )
+            alias_text = (
+                f" (current: {current_name})"
+                if current_name
+                and normalize_player_name(current_name) != watch.normalized_name
+                else ""
+            )
+            default_text = "" if gs.is_default else " [server is no longer default]"
+            lines.append(f"• {watch.watched_name}{alias_text} — {gs.display_name}{default_text}")
+    text = "\n".join(lines)
+    for index in range(0, len(text), 1900):
+        await interaction.followup.send(text[index:index + 1900], ephemeral=True)
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="watchedplayers",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code="ok",
+        metadata={"count": len(rows), "alerts_enabled": channel is not None},
+    )
+
+
+@tree.command(name="playerhistory", description="Search BF4 player join/leave history for this guild's configured servers")
+@app_commands.describe(
+    player="Player name or known alias",
+    results="Number of recent sessions to show, or ALL for a ZIP/CSV export",
+)
+@app_commands.choices(results=[
+    app_commands.Choice(name="1", value="1"),
+    app_commands.Choice(name="5", value="5"),
+    app_commands.Choice(name="10", value="10"),
+    app_commands.Choice(name="ALL (ZIP/CSV)", value="ALL"),
+])
+async def playerhistory(
+    interaction: discord.Interaction,
+    player: str,
+    results: str = "5",
+):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    requested_name = re.sub(r"\s+", " ", str(player or "")).strip()
+    normalized = normalize_player_name(requested_name)
+    if not normalized:
+        await interaction.followup.send("⛔ Enter a player name.", ephemeral=True)
+        return
+
+    with SessionLocal() as session:
+        guild_servers = session.scalars(
+            select(GuildServer).where(GuildServer.guild_id == interaction.guild.id)
+        ).all()
+        server_names = {row.server_guid: row.display_name for row in guild_servers}
+        server_guids = list(server_names)
+        if not server_guids:
+            await interaction.followup.send("No configured BF4 servers are available.", ephemeral=True)
+            return
+
+        persona_ids = set(
+            int(value)
+            for value in session.scalars(
+                select(BF4PlayerAlias.persona_id).where(
+                    BF4PlayerAlias.normalized_name == normalized
+                )
+            ).all()
+            if value is not None
+        )
+        persona_ids.update(
+            int(value)
+            for value in session.scalars(
+                select(BF4PlayerSession.persona_id).where(
+                    BF4PlayerSession.normalized_name == normalized,
+                    BF4PlayerSession.persona_id.is_not(None),
+                )
+            ).all()
+            if value is not None
+        )
+
+        identity_clause = BF4PlayerSession.normalized_name == normalized
+        if persona_ids:
+            identity_clause = or_(
+                identity_clause,
+                BF4PlayerSession.persona_id.in_(sorted(persona_ids)),
+            )
+        query = (
+            select(BF4PlayerSession)
+            .where(
+                BF4PlayerSession.server_guid.in_(server_guids),
+                identity_clause,
+            )
+            .order_by(BF4PlayerSession.time_joined.desc())
+        )
+        rows = session.scalars(query).all()
+
+    if not rows:
+        await interaction.followup.send(
+            f'No player history found for **{requested_name}** on this Discord server\'s configured BF4 servers.',
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="playerhistory",
+            command_type="slash",
+            success=True,
+            started=started,
+            result_code="no_results",
+            target_type="player",
+            target_name=requested_name,
+        )
+        return
+
+    if str(results).upper() == "ALL":
+        csv_buffer = io.StringIO(newline="")
+        writer = csv.writer(csv_buffer)
+        writer.writerow([
+            "server_name",
+            "server_guid",
+            "map_name",
+            "persona_id",
+            "player_name",
+            "time_joined",
+            "last_seen",
+            "time_left",
+        ])
+        for row in rows:
+            writer.writerow([
+                server_names.get(row.server_guid, row.server_guid),
+                row.server_guid,
+                row.map_name,
+                row.persona_id if row.persona_id is not None else "",
+                row.player_name,
+                row.time_joined.isoformat(),
+                row.last_seen.isoformat(),
+                row.time_left.isoformat() if row.time_left else "",
+            ])
+        csv_bytes = csv_buffer.getvalue().encode("utf-8-sig")
+        zip_buffer = io.BytesIO()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", requested_name).strip("_") or "player"
+        csv_name = f"player-history-{safe_name}.csv"
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(csv_name, csv_bytes)
+        zip_buffer.seek(0)
+        await interaction.followup.send(
+            f"✅ Exported **{len(rows)}** history row(s) for **{requested_name}**.",
+            file=discord.File(zip_buffer, filename=f"player-history-{safe_name}.zip"),
+            ephemeral=True,
+        )
+        result_code = "exported_all"
+        shown = len(rows)
+    else:
+        limit = int(results) if str(results) in {"1", "5", "10"} else 5
+        selected = rows[:limit]
+        blocks = [f"**Player history — {requested_name}**"]
+        for row in selected:
+            joined = int(row.time_joined.timestamp())
+            last_seen = int(row.last_seen.timestamp())
+            server_name = server_names.get(row.server_guid, row.server_guid)
+            left_text = (
+                f"<t:{int(row.time_left.timestamp())}:R> (<t:{int(row.time_left.timestamp())}:f>)"
+                if row.time_left
+                else "Still present at last successful check"
+            )
+            blocks.append(
+                f"**{row.player_name}** — **{server_name}** / **{row.map_name}**\n"
+                f"Joined: <t:{joined}:R> (<t:{joined}:f>)\n"
+                f"Last seen: <t:{last_seen}:R>\n"
+                f"Left: {left_text}"
+            )
+        chunks = []
+        current = ""
+        for block_text in blocks:
+            candidate = block_text if not current else current + "\n\n" + block_text
+            if len(candidate) > 1900 and current:
+                chunks.append(current)
+                current = block_text
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+        result_code = "ok"
+        shown = len(selected)
+
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name="playerhistory",
+        command_type="slash",
+        success=True,
+        started=started,
+        result_code=result_code,
+        target_type="player",
+        target_name=requested_name,
+        metadata={"rows": len(rows), "shown": shown, "requested_results": results},
+    )
+
+
+@playerhistory.autocomplete("player")
+async def playerhistory_player_autocomplete(interaction, current):
+    return player_name_choices(interaction.guild.id, current) if interaction.guild else []
+
+
 @tree.command(name="addlistenchannel", description="Add one listen channel")
 @app_commands.describe(channel="Text channel to allow regular user commands in")
 async def addlistenchannel(
@@ -5519,6 +6870,9 @@ def help_messages(member: discord.Member):
         "`/defaultserver add|modify|remove|list` — manage defaults, per-server announcement routing, and optional persistent player rosters.",
         "`/addannouncementchannel`, `/delannouncementchannel` — manage announcement-channel choices.",
         "`/setroleschannel`, `/delroleschannel` — manage the self-service map-role panel channel.",
+        "`/setwatchedplayerchannel`, `/delwatchedplayerchannel` — manage the admin-only watched-player alert channel.",
+        "`/watchplayer`, `/unwatchplayer`, `/watchedplayers` — manage watched-player join alerts.",
+        "`/playerhistory` — search recent player sessions or export ALL as ZIP/CSV.",
         "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
         "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",
         "`/setmaprole`, `/editmaprole`, `/delmaprole` — manage map role pings.",
@@ -5549,6 +6903,13 @@ def help_messages(member: discord.Member):
 
     summary = "\n".join([
         f"**Configured announcement channels:** {channel_text}",
+        "**Watched-player alerts:** "
+        + (
+            f"#{member.guild.get_channel(int(settings.watched_player_channel_id)).name}"
+            if settings.watched_player_channel_id
+            and member.guild.get_channel(int(settings.watched_player_channel_id))
+            else "Disabled"
+        ),
         "**Listen channels:** "
         + (
             ", ".join(str(x) for x in sorted(listen_channel_ids(member.guild.id)))

@@ -136,3 +136,21 @@ The value is global per BF4 server GUID and stores only the numeric rate reporte
 A failed Battlelog request or parse leaves the field `NULL` (or preserves an existing value). Automatic announcements omit the Tick Rate line when the field is `NULL`. Alembic revision `0007_v2_4_0` adds the column without backfilling existing servers over the network. Existing configured servers can be populated later with `/refreshserverhz`.
 
 v2.4.1 adds no schema change. When `tick_rate_hz` actually changes, ServerWatcher fans out a Discord alert only to guilds where the affected GUID is currently a default server, using each default server row's assigned `announcement_channel_id`. No database row is added for the alert itself.
+
+
+## Player history and watched-player schema (v2.5.0)
+
+Alembic revision `0008_v2_5_0` adds the following guild setting fields:
+
+```text
+watched_player_channel_id BIGINT NOT NULL DEFAULT 0
+watched_player_channel_name VARCHAR(255) NULL
+```
+
+It also adds global `bf4_player_sessions` history. One physical session represents one player presence on one BF4 server from approximate join until approximate leave; guilds do not duplicate the same server session. Fields include `server_guid`, platform, join `map_key`/`map_name`, nullable `persona_id`, player name/normalized name, `time_joined`, `last_seen`, and nullable `time_left`. The internal map key is intentionally omitted from the human-oriented CSV export.
+
+`bf4_player_aliases` records observed names for authoritative `(platform, persona_id)` identities with first/last-seen timestamps. Persona ID is authoritative when available; normalized case-insensitive name is the fallback identity when it is not.
+
+`guild_player_watches` stores guild-scoped watch rules for a specific BF4 server, preserving the administrator's originally watched name even after persona-ID resolution/name changes. `guild_player_watch_alerts` deduplicates a watch against a player session so one join cannot produce repeated alerts for the same rule.
+
+History is retained indefinitely by v2.5.0. `/playerhistory ALL` filters global history through the requesting guild's configured-server relationships and creates a ZIP/CSV containing `server_name`, `server_guid`, `map_name`, `persona_id`, `player_name`, `time_joined`, `last_seen`, and `time_left`.

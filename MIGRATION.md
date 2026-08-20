@@ -199,3 +199,18 @@ After upgrading, administrators may add more destinations with `/addannouncement
 Alembic revision `0007_v2_4_0` adds nullable `bf4_servers.tick_rate_hz`. The migration performs no external HTTP requests and does not backfill existing rows. Existing configured servers continue working with `tick_rate_hz = NULL`; their map announcements omit the Tick Rate line until the value is populated.
 
 After upgrade, an administrator may run `/refreshserverhz server:<configured server>` for any existing server with a stored Battlelog URL. Newly added Battlelog servers attempt the one-time tick-rate discovery automatically.
+
+
+## v2.4.x to v2.5.0 player-history migration
+
+Alembic revision `0008_v2_5_0` adds the watched-player channel settings plus the new player-session, alias, watch, and watch-alert tables.
+
+The migration does **not** scrape Battlelog and does not attempt to reconstruct history before v2.5.0. Player history starts fresh when v2.5.0 begins monitoring. Existing guild/server/default/announcement/map-role/tick-rate data is preserved.
+
+After upgrading, administrators who want join alerts should create an admin/moderator-only Discord channel and run:
+
+```text
+/setwatchedplayerchannel channel:<text channel>
+```
+
+Then add watches with `/watchplayer`. No watched-player rules are created automatically.

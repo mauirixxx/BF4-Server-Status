@@ -4,6 +4,28 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.5.0] - 2026-08-19
+
+### Added
+- Added global BF4 player-session history for every configured server, including player name, nullable persona ID, join map, approximate join/last-seen/leave timestamps, and indefinite retention.
+- Added Battlelog server-level persona-ID/name enrichment with a maximum of 3 server-page enrichment requests per monitor cycle and FIFO queue/backoff behavior.
+- Added player alias/name-change history keyed by authoritative platform + persona ID.
+- Added `/setwatchedplayerchannel` and `/delwatchedplayerchannel` for a dedicated admin/moderator watched-player alert destination.
+- Added management-only `/watchplayer`, `/unwatchplayer`, and `/watchedplayers`.
+- Added management-only `/playerhistory` with 1/5/10 Discord-local timestamp results and `ALL` ZIP/CSV export.
+- Added Alembic revision `0008_v2_5_0` for watched-player channel settings and player-history/watch tables.
+
+### Behavior
+- The first successful roster after startup or roster-source recovery establishes a baseline and suppresses join alerts.
+- Failed roster fetches never alter player presence state.
+- Joins are detected immediately from the next authoritative roster; leaves require two consecutive successful absent snapshots and use the first absent snapshot as approximate `time_left`.
+- Open sessions survive restarts and are reconciled without generating fake join alerts.
+- A watched-player rule is scoped to one guild + one default BF4 server and cannot be created until a watched-player alert channel is configured.
+- Alerts are independent per guild and ping the configured management role, falling back to the guild owner when no management role is set.
+- Persona ID becomes authoritative when learned. Explicit name-only watches upgrade automatically and continue following the same player across later name changes while preserving the original watched name in alerts.
+- Normal Discord outputs do not expose persona IDs; `/playerhistory ALL` includes persona ID in the exported CSV when known.
+- Player history is global per server GUID but `/playerhistory` exposes only sessions from servers configured by the requesting guild.
+
 ## [v2.4.1] - 2026-08-19
 
 ### Added

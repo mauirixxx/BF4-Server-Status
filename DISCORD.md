@@ -52,6 +52,7 @@ announcement channel = 0
 listen channels = none
 management minimum role = 0
 status minimum role = 0
+watched-player alert channel = 0
 Operation Locker map role:
   role_id = 0
   message = Operation Locker is now live!
@@ -98,6 +99,40 @@ Use:
 to manage channels where normal users may use `!` commands.
 
 Managers may use management commands in any configured announcement channel or listen channels.
+
+## Watched-player admin channel
+
+v2.5.0 can alert administrators when a configured player joins a specific default BF4 server. These notifications should use a dedicated channel visible only to the guild's admin/moderator team and ServerWatcher.
+
+Configure or disable it with:
+
+```text
+/setwatchedplayerchannel channel:<text channel>
+/delwatchedplayerchannel
+```
+
+ServerWatcher validates that it can View Channel, Send Messages, and Read Message History. It warns (without blocking setup) if `@everyone` can view the selected channel.
+
+Suggested channel overrides:
+
+- `@everyone`: **View Channel = Deny**.
+- Admin/moderator role(s): **View Channel = Allow**, plus normal read/send permissions as desired.
+- ServerWatcher bot role: **View Channel = Allow**, **Send Messages = Allow**, **Read Message History = Allow**.
+
+`/watchplayer` cannot create a watch until this channel has been explicitly configured. If the channel is later deleted or becomes inaccessible, existing watch rules and player history remain stored; delivery failures are logged and `/watchedplayers` reports that alerts are disabled/unavailable.
+
+Manage watch rules with:
+
+```text
+/watchplayer player:<name> server:<default server>
+/unwatchplayer watch:<selection>
+/watchedplayers
+/playerhistory player:<name> results:<1|5|10|ALL>
+```
+
+The watch server list contains only current default servers. Player autocomplete is case-insensitive and a manually typed unseen player name is also accepted. A watched join pings the configured management role; if none is configured, it pings the guild owner.
+
+Normal Discord history results intentionally hide persona IDs. `ALL` exports a ZIP/CSV and includes persona ID when known.
 
 ## Self-service map-role channel
 

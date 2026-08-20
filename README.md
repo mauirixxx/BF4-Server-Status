@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.4.1
+# BF4 Server Watcher v2.5.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,45 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## Player history and watched-player alerts (v2.5.0)
+
+v2.5.0 records player join/leave sessions for every configured BF4 server from the same authoritative Keeper snapshots already used by the monitor. History is global per BF4 server GUID and is filtered to the requesting guild's configured servers when an administrator searches it.
+
+Player sessions record the player name, nullable persona ID, join map, approximate join/last-seen/leave timestamps, and remain stored indefinitely. The first successful roster after startup or roster recovery is treated as a baseline so a restart/outage cannot generate a wave of false join alerts. A leave is closed only after two consecutive successful snapshots omit the player; the first missing snapshot is retained as the approximate leave time.
+
+Use an admin/moderator-only notification channel:
+
+```text
+/setwatchedplayerchannel channel:<text channel>
+/delwatchedplayerchannel
+```
+
+`/watchplayer` is blocked until that channel is configured. ServerWatcher warns if `@everyone` can view the selected channel, but the Discord administrator remains responsible for channel visibility.
+
+Manage watches with:
+
+```text
+/watchplayer player:<name> server:<default server>
+/unwatchplayer watch:<selection>
+/watchedplayers
+```
+
+Player names autocomplete case-insensitively from accumulated history, while `/watchplayer` also accepts a manually typed unseen name. Watches are scoped to one guild + one default BF4 server. Alerts ping the configured management role, or the guild owner when no management role is set.
+
+Search history with:
+
+```text
+/playerhistory player:<name> results:<1|5|10|ALL>
+```
+
+The 1/5/10 results use Discord-local timestamps. `ALL` returns a ZIP containing a human-readable CSV; persona IDs are included only in the CSV, not normal Discord output.
+
+### Persona-ID and name-change enrichment
+
+Keeper/BFLIST roster names drive join/leave detection without extra Battlelog traffic. When a new name-only session is created, ServerWatcher queues that server for a Battlelog server-page enrichment request. One Battlelog page can provide name + persona ID for the entire live scoreboard, so all matching sessions on that server are enriched from one request.
+
+At most **3 server enrichment requests per monitor cycle** are attempted; additional servers wait in a FIFO queue. Failed enrichment never blocks history or join alerts and is retried later with backoff. Name-matched watched-player alerts fire immediately; once persona ID is learned it becomes authoritative, watches are upgraded, aliases are recorded, and later name changes continue following the same identity. When the current name differs from the administrator's originally watched name, the alert preserves both names.
 
 ## Multiple default servers
 

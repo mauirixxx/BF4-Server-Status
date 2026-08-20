@@ -35,6 +35,8 @@ class GuildSettings(Base):
     status_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     roles_channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     roles_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    watched_player_channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    watched_player_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class GuildAnnouncementChannel(Base):
@@ -118,6 +120,75 @@ class GuildServerPlayerMessage(Base):
     channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class BF4PlayerSession(Base):
+    __tablename__ = "bf4_player_sessions"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    server_guid: Mapped[str] = mapped_column(
+        String(36), ForeignKey("bf4_servers.server_guid"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(String(32), nullable=False, default="Unknown")
+    map_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    map_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    persona_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    player_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    time_joined: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    time_left: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BF4PlayerAlias(Base):
+    __tablename__ = "bf4_player_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform", "persona_id", "normalized_name",
+            name="uq_bf4_player_alias_identity_name",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False, default="Unknown")
+    persona_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    player_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class GuildPlayerWatch(Base):
+    __tablename__ = "guild_player_watches"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id", "server_guid", "normalized_name",
+            name="uq_guild_player_watch_name",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False
+    )
+    server_guid: Mapped[str] = mapped_column(
+        String(36), ForeignKey("bf4_servers.server_guid"), nullable=False
+    )
+    watched_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    persona_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_by_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class GuildPlayerWatchAlert(Base):
+    __tablename__ = "guild_player_watch_alerts"
+    watch_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guild_player_watches.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    session_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("bf4_player_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class BF4Map(Base):
