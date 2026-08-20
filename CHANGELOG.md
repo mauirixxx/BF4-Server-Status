@@ -4,6 +4,23 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.1] - 2026-08-20
+
+### Fixed
+- Suppressed Discord Battlelog preview embeds on the watched-player join-alert path while preserving the clickable server link.
+- Routed `/addserver` Battlelog tick-rate discovery, `/refreshserverhz`, and persona enrichment through shared request pacing.
+- Added a global Battlelog HTTP 429 cooldown and `Retry-After` handling, with a configurable fallback cooldown.
+- Added safe multi-message `!list` chunking for guilds with hundreds of configured servers.
+- Prevented failed/fully-skipped monitor cycles from replacing rich presence with `0 players`.
+- Prevented overdue monitor iterations from running back-to-back after long cycles.
+
+### Configuration
+- Added `BATTLELOG_DEFAULT_429_BACKOFF_SECONDS` (default `30`) for 429 responses that do not include `Retry-After`.
+
+### Behavior
+- `EXTERNAL_LOOKUP_WORKERS=3` and `EXTERNAL_REQUESTS_PER_SECOND=1.0` remain the recommended defaults.
+- No Alembic migration is required for v2.6.1.
+
 ## [v2.6.0] - 2026-08-20
 
 ### Performance

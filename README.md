@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.6.0
+# BF4 Server Watcher v2.6.1
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,18 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## v2.6.1 hotfix release
+
+v2.6.1 fixes several issues exposed by large-scale server imports and 200+ monitored servers:
+
+- Watched-player Battlelog server names remain clickable while Discord link-preview cards are suppressed on the actual watched-player alert send path.
+- `/addserver`, `/refreshserverhz`, and Battlelog persona-enrichment requests now share the same external request pacing, and Battlelog HTTP 429 responses trigger a global Battlelog cooldown that honors `Retry-After` when present.
+- `!list` now safely chunks large configured-server lists across multiple Discord messages with cumulative headers instead of exceeding Discord's content limit.
+- Rich presence retains the last successful player aggregate when a monitor cycle produces no successful Keeper snapshots because of cooldown/circuit-breaker skipping.
+- Monitor cycles are scheduled from completion, preventing overdue back-to-back catch-up cycles when a large poll takes longer than `CHECK_INTERVAL_SECONDS`.
+
+No database migration is required from v2.6.0.
 
 ## v2.6.0 performance release
 

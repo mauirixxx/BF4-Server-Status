@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.0"
+BOT_VERSION = "v2.6.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -122,6 +122,12 @@ EXTERNAL_REQUESTS_PER_SECOND = max(
 EXTERNAL_REQUEST_INTERVAL_SECONDS = 1.0 / EXTERNAL_REQUESTS_PER_SECOND
 EXTERNAL_REQUEST_LOCK: asyncio.Lock | None = None
 EXTERNAL_NEXT_REQUEST_AT = 0.0
+BATTLELOG_BACKOFF_UNTIL = 0.0
+BATTLELOG_DEFAULT_429_BACKOFF_SECONDS = max(
+    5,
+    int(os.getenv("BATTLELOG_DEFAULT_429_BACKOFF_SECONDS", "30")),
+)
+LAST_GOOD_PRESENCE_PLAYERS = 0
 KEEPER_SERVICE_FAILURE_THRESHOLD = 3
 KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
@@ -160,6 +166,52 @@ async def wait_for_external_request_slot():
 async def rate_limited_to_thread(func, *args):
     await wait_for_external_request_slot()
     return await asyncio.to_thread(func, *args)
+
+
+def _battlelog_retry_after_seconds(response) -> int:
+    value = None
+    if response is not None:
+        value = response.headers.get("Retry-After")
+    if value:
+        try:
+            return max(1, int(float(value)))
+        except (TypeError, ValueError):
+            pass
+    return BATTLELOG_DEFAULT_429_BACKOFF_SECONDS
+
+
+async def wait_for_battlelog_cooldown():
+    while True:
+        remaining = BATTLELOG_BACKOFF_UNTIL - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(remaining)
+
+
+async def rate_limited_battlelog_to_thread(func, *args):
+    """Pace every Battlelog request and globally cool down after HTTP 429."""
+    global BATTLELOG_BACKOFF_UNTIL
+
+    await wait_for_battlelog_cooldown()
+    await wait_for_external_request_slot()
+    try:
+        return await asyncio.to_thread(func, *args)
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status == 429:
+            retry_seconds = _battlelog_retry_after_seconds(response)
+            BATTLELOG_BACKOFF_UNTIL = max(
+                BATTLELOG_BACKOFF_UNTIL,
+                time.monotonic() + retry_seconds,
+            )
+            log.warning(
+                "Battlelog global cooldown activated status=429 "
+                "retry_seconds=%s retry_after=%r",
+                retry_seconds,
+                response.headers.get("Retry-After") if response is not None else None,
+            )
+        raise
 
 
 def utcnow() -> datetime:
@@ -1414,6 +1466,51 @@ def platform_server_list(guild_id: int, include_guid=False):
     return "\n".join(lines)
 
 
+def server_list_chunks(guild_id: int, limit: int = 3800):
+    """Return complete-entry chunks for !list, with cumulative progress headers."""
+    body = platform_server_list(guild_id)
+    if body == "None":
+        return ["**BF4 Servers 0 of 0**\n```text\nNone\n```"]
+
+    lines = body.splitlines()
+    total = len(lines)
+    chunks = []
+    current = []
+    completed_before = 0
+
+    for line in lines:
+        candidate = current + [line]
+        end_index = completed_before + len(candidate)
+        rendered = (
+            f"**BF4 Servers {end_index} of {total}**\n"
+            "```text\n"
+            + "\n".join(candidate)
+            + "\n```"
+        )
+        if current and len(rendered) > limit:
+            end_index = completed_before + len(current)
+            chunks.append(
+                f"**BF4 Servers {end_index} of {total}**\n"
+                "```text\n"
+                + "\n".join(current)
+                + "\n```"
+            )
+            completed_before = end_index
+            current = [line]
+        else:
+            current = candidate
+
+    if current:
+        end_index = completed_before + len(current)
+        chunks.append(
+            f"**BF4 Servers {end_index} of {total}**\n"
+            "```text\n"
+            + "\n".join(current)
+            + "\n```"
+        )
+    return chunks
+
+
 def all_map_choices(current: str):
     """Return up to 25 BF4 map choices, alphabetically, filtered across all maps."""
     needle = (current or "").strip().casefold()
@@ -2234,6 +2331,7 @@ async def evaluate_player_watch_alerts(session_id: int):
                     users=True,
                     everyone=False,
                 ),
+                suppress_embeds=True,
             )
             with SessionLocal.begin() as session:
                 # Upgrade an explicitly name-matched watch as soon as the
@@ -2350,7 +2448,7 @@ async def process_player_persona_enrichment():
                 processed += 1
 
             try:
-                identities = await rate_limited_to_thread(
+                identities = await rate_limited_battlelog_to_thread(
                     get_battlelog_player_identities,
                     url,
                 )
@@ -3307,6 +3405,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
 
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
+    global LAST_GOOD_PRESENCE_PLAYERS
 
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
@@ -3561,11 +3660,20 @@ async def monitor_cycle():
             str(exc),
         )
 
-    # Presence/player totals also use fresh snapshots only.
+    # Cycle total always reflects only snapshots fetched this cycle.
     player_total = sum(
         get_server_status(snapshot)["players"]
         for snapshot in fresh.values()
     )
+    # Presence retains the last non-empty successful aggregate when a cycle
+    # is entirely skipped/aborted by Keeper cooldown or the circuit breaker.
+    if fresh:
+        LAST_GOOD_PRESENCE_PLAYERS = player_total
+    else:
+        log.info(
+            "Presence aggregate retained players=%s reason=no_successful_snapshots",
+            LAST_GOOD_PRESENCE_PLAYERS,
+        )
 
     log.info(
         "Monitor cycle complete references=%s unique_servers=%s "
@@ -3597,13 +3705,12 @@ async def monitor_cycle():
 
 async def monitor_loop():
     while not client.is_closed():
-        started = time.perf_counter()
         try:
             await monitor_cycle()
         except Exception as exc:
             log.error("Monitor cycle fatal error=%s message=%r", type(exc).__name__, str(exc))
-        elapsed = time.perf_counter() - started
-        await asyncio.sleep(max(1, CHECK_INTERVAL_SECONDS - elapsed))
+        # Schedule from completion so long cycles never trigger catch-up bursts.
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 async def presence_loop():
@@ -3612,7 +3719,7 @@ async def presence_loop():
         try:
             with SessionLocal() as session:
                 unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
-            players = sum(get_server_status(s)["players"] for s in FRESH_SERVER_CACHE.values())
+            players = LAST_GOOD_PRESENCE_PLAYERS
             activities = [
                 f"Tracking {unique_count} BF4 servers",
                 f"{players:,} players across all tracked servers",
@@ -5286,7 +5393,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
 
             if tick_rate_hz is None and parsed.get("battlelog_url"):
                 try:
-                    tick_rate_hz = await asyncio.to_thread(
+                    tick_rate_hz = await rate_limited_battlelog_to_thread(
                         get_battlelog_tick_rate,
                         parsed["battlelog_url"],
                         guid,
@@ -5475,7 +5582,7 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
             )
             return
 
-        new_tick_rate = await asyncio.to_thread(
+        new_tick_rate = await rate_limited_battlelog_to_thread(
             get_battlelog_tick_rate,
             battlelog_url,
             server,
@@ -7320,8 +7427,26 @@ async def on_message(message: discord.Message):
             if not can_use_user_commands(message.author):
                 await deny_user_command_role(message, "list", started)
                 return
-            await message.channel.send(f"```text\n{platform_server_list(message.guild.id)}\n```")
-            audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="list", command_type="prefix", success=True, started=started, result_code="ok")
+            chunks = server_list_chunks(message.guild.id)
+            for chunk in chunks:
+                await message.channel.send(
+                    chunk,
+                    suppress_embeds=True,
+                )
+            audit_command(
+                guild=message.guild,
+                channel=message.channel,
+                user=message.author,
+                command_name="list",
+                command_type="prefix",
+                success=True,
+                started=started,
+                result_code="ok",
+                metadata={
+                    "chunks": len(chunks),
+                    "servers": len(sorted_guild_servers(message.guild.id)),
+                },
+            )
             return
 
         if command == "!announce":
