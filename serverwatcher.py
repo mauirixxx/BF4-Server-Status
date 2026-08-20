@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.5.4"
+BOT_VERSION = "v2.6.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -114,7 +114,14 @@ FRESH_SERVER_CACHE: dict[str, dict] = {}
 LAST_SUCCESS_CACHE: dict[str, dict] = {}
 BFLIST_CACHE: dict[str, tuple[float, dict | None]] = {}
 BFLIST_CACHE_SECONDS = 15
-KEEPER_REQUEST_SPACING_SECONDS = 3.0
+EXTERNAL_LOOKUP_WORKERS = max(1, int(os.getenv("EXTERNAL_LOOKUP_WORKERS", "3")))
+EXTERNAL_REQUESTS_PER_SECOND = max(
+    0.1,
+    float(os.getenv("EXTERNAL_REQUESTS_PER_SECOND", "1.0")),
+)
+EXTERNAL_REQUEST_INTERVAL_SECONDS = 1.0 / EXTERNAL_REQUESTS_PER_SECOND
+EXTERNAL_REQUEST_LOCK: asyncio.Lock | None = None
+EXTERNAL_NEXT_REQUEST_AT = 0.0
 KEEPER_SERVICE_FAILURE_THRESHOLD = 3
 KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
@@ -128,8 +135,31 @@ PLAYER_ENRICHMENT_QUEUED: set[str] = set()
 PLAYER_ENRICHMENT_RETRY_AFTER: dict[str, float] = {}
 PLAYER_ENRICHMENT_PENDING_SESSIONS: dict[str, set[int]] = {}
 PLAYER_ENRICHMENT_ALERT_ELIGIBLE: set[int] = set()
-PLAYER_ENRICHMENT_MAX_SERVERS_PER_CYCLE = 3
 PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS = 600
+
+
+def external_request_lock() -> asyncio.Lock:
+    global EXTERNAL_REQUEST_LOCK
+    if EXTERNAL_REQUEST_LOCK is None:
+        EXTERNAL_REQUEST_LOCK = asyncio.Lock()
+    return EXTERNAL_REQUEST_LOCK
+
+
+async def wait_for_external_request_slot():
+    """Globally pace Keeper/Battlelog request starts across concurrent workers."""
+    global EXTERNAL_NEXT_REQUEST_AT
+    async with external_request_lock():
+        now = time.monotonic()
+        wait_seconds = max(0.0, EXTERNAL_NEXT_REQUEST_AT - now)
+        if wait_seconds:
+            await asyncio.sleep(wait_seconds)
+        started = time.monotonic()
+        EXTERNAL_NEXT_REQUEST_AT = started + EXTERNAL_REQUEST_INTERVAL_SECONDS
+
+
+async def rate_limited_to_thread(func, *args):
+    await wait_for_external_request_slot()
+    return await asyncio.to_thread(func, *args)
 
 
 def utcnow() -> datetime:
@@ -2261,17 +2291,16 @@ async def evaluate_player_watch_alerts(session_id: int):
 
 
 async def process_player_persona_enrichment():
-    """Process at most three server-level Battlelog enrichment requests per monitor cycle."""
+    """Drain eligible server-level Battlelog enrichment work with bounded concurrency."""
     processed = succeeded = failed = enriched_sessions = 0
+
     scan_budget = len(PLAYER_ENRICHMENT_QUEUE)
-    while (
-        PLAYER_ENRICHMENT_QUEUE
-        and processed < PLAYER_ENRICHMENT_MAX_SERVERS_PER_CYCLE
-        and scan_budget > 0
-    ):
+    work_items: list[tuple[str, set[int]]] = []
+    while PLAYER_ENRICHMENT_QUEUE and scan_budget > 0:
         scan_budget -= 1
         guid = PLAYER_ENRICHMENT_QUEUE.popleft()
         PLAYER_ENRICHMENT_QUEUED.discard(guid)
+
         retry_after = PLAYER_ENRICHMENT_RETRY_AFTER.get(guid, 0.0)
         if retry_after > time.monotonic():
             PLAYER_ENRICHMENT_QUEUE.append(guid)
@@ -2283,146 +2312,212 @@ async def process_player_persona_enrichment():
             PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
             continue
 
-        with SessionLocal() as session:
-            bf = session.get(BF4Server, guid)
-            if bf is None:
+        work_items.append((guid, pending_ids))
+
+    if not work_items:
+        return {
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "enriched_sessions": 0,
+            "queued": len(PLAYER_ENRICHMENT_QUEUE),
+        }
+
+    semaphore = asyncio.Semaphore(EXTERNAL_LOOKUP_WORKERS)
+    counter_lock = asyncio.Lock()
+
+    async def enrich_one(guid: str, pending_ids: set[int]):
+        nonlocal processed, succeeded, failed, enriched_sessions
+
+        async with semaphore:
+            with SessionLocal() as session:
+                bf = session.get(BF4Server, guid)
+                if bf is None:
+                    PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                    return
+                platform = normalize_platform_label(bf.platform)
+                url = battlelog_server_url_for(bf)
+
+            if not url:
+                log.info(
+                    "Player persona enrichment skipped server=%s reason=battlelog_url_unavailable",
+                    guid,
+                )
                 PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
-                continue
-            platform = normalize_platform_label(bf.platform)
-            url = battlelog_server_url_for(bf)
+                return
 
-        if not url:
-            log.info(
-                "Player persona enrichment skipped server=%s reason=battlelog_url_unavailable",
-                guid,
-            )
-            PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
-            continue
+            async with counter_lock:
+                processed += 1
 
-        processed += 1
-        try:
-            identities = await asyncio.to_thread(get_battlelog_player_identities, url)
-            if not identities:
-                raise ValueError("Battlelog page did not contain live player persona identities")
-
-            identity_by_name = {
-                row["normalized_name"]: row
-                for row in identities
-            }
-            matched_ids = set()
-            now = utcnow()
-            with SessionLocal.begin() as session:
-                pending_sessions = session.scalars(
-                    select(BF4PlayerSession).where(
-                        BF4PlayerSession.id.in_(pending_ids),
-                        BF4PlayerSession.server_guid == guid,
+            try:
+                identities = await rate_limited_to_thread(
+                    get_battlelog_player_identities,
+                    url,
+                )
+                if not identities:
+                    raise ValueError(
+                        "Battlelog page did not contain live player persona identities"
                     )
-                ).all()
-                for player_session in pending_sessions:
-                    identity = identity_by_name.get(player_session.normalized_name)
-                    if identity is None:
-                        continue
-                    persona_id = int(identity["persona_id"])
-                    current_name = identity["player_name"]
-                    player_session.persona_id = persona_id
-                    player_session.player_name = current_name
-                    player_session.normalized_name = normalize_player_name(current_name)
-                    upsert_player_alias(
-                        session,
-                        platform=platform,
-                        persona_id=persona_id,
-                        player_name=current_name,
-                        seen_at=now,
-                    )
-                    matched_ids.add(int(player_session.id))
 
-                    # Upgrade name-only watches that explicitly match this
-                    # player. Preserve watched_name for human-facing alerts.
-                    watches = session.scalars(
-                        select(GuildPlayerWatch).where(
-                            GuildPlayerWatch.server_guid == guid,
-                            GuildPlayerWatch.persona_id.is_(None),
-                            GuildPlayerWatch.normalized_name == normalize_player_name(current_name),
+                identity_by_name = {
+                    row["normalized_name"]: row
+                    for row in identities
+                }
+                matched_ids = set()
+                now = utcnow()
+
+                with SessionLocal.begin() as session:
+                    pending_sessions = session.scalars(
+                        select(BF4PlayerSession).where(
+                            BF4PlayerSession.id.in_(pending_ids),
+                            BF4PlayerSession.server_guid == guid,
                         )
                     ).all()
-                    for watch in watches:
-                        duplicate = session.scalar(
-                            select(GuildPlayerWatch).where(
-                                GuildPlayerWatch.guild_id == watch.guild_id,
-                                GuildPlayerWatch.server_guid == guid,
-                                GuildPlayerWatch.persona_id == persona_id,
-                                GuildPlayerWatch.id != watch.id,
-                            )
+
+                    for player_session in pending_sessions:
+                        identity = identity_by_name.get(
+                            player_session.normalized_name
                         )
-                        if duplicate is None:
-                            watch.persona_id = persona_id
+                        if identity is None:
+                            continue
+                        persona_id = int(identity["persona_id"])
+                        current_name = identity["player_name"]
+                        player_session.persona_id = persona_id
+                        player_session.player_name = current_name
+                        player_session.normalized_name = normalize_player_name(
+                            current_name
+                        )
+                        upsert_player_alias(
+                            session,
+                            platform=platform,
+                            persona_id=persona_id,
+                            player_name=current_name,
+                            seen_at=now,
+                        )
+                        matched_ids.add(int(player_session.id))
 
-                # The same server-page request can enrich any other currently
-                # open name-only sessions without additional HTTP traffic.
-                open_sessions = session.scalars(
-                    select(BF4PlayerSession).where(
-                        BF4PlayerSession.server_guid == guid,
-                        BF4PlayerSession.time_left.is_(None),
-                        BF4PlayerSession.persona_id.is_(None),
-                    )
-                ).all()
-                for player_session in open_sessions:
-                    identity = identity_by_name.get(player_session.normalized_name)
-                    if identity is None:
-                        continue
-                    persona_id = int(identity["persona_id"])
-                    player_session.persona_id = persona_id
-                    player_session.player_name = identity["player_name"]
-                    player_session.normalized_name = normalize_player_name(identity["player_name"])
-                    upsert_player_alias(
-                        session,
-                        platform=platform,
-                        persona_id=persona_id,
-                        player_name=identity["player_name"],
-                        seen_at=now,
-                    )
+                        watches = session.scalars(
+                            select(GuildPlayerWatch).where(
+                                GuildPlayerWatch.server_guid == guid,
+                                GuildPlayerWatch.persona_id.is_(None),
+                                GuildPlayerWatch.normalized_name
+                                == normalize_player_name(current_name),
+                            )
+                        ).all()
+                        for watch in watches:
+                            duplicate = session.scalar(
+                                select(GuildPlayerWatch).where(
+                                    GuildPlayerWatch.guild_id == watch.guild_id,
+                                    GuildPlayerWatch.server_guid
+                                    == watch.server_guid,
+                                    GuildPlayerWatch.persona_id == persona_id,
+                                    GuildPlayerWatch.id != watch.id,
+                                )
+                            )
+                            if duplicate is None:
+                                watch.persona_id = persona_id
 
-            remaining = pending_ids - matched_ids
-            if remaining:
-                PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = remaining
-                PLAYER_ENRICHMENT_RETRY_AFTER[guid] = time.monotonic() + 300
+                    # One Battlelog page can enrich other open sessions for
+                    # this server without any extra HTTP request.
+                    open_sessions = session.scalars(
+                        select(BF4PlayerSession).where(
+                            BF4PlayerSession.server_guid == guid,
+                            BF4PlayerSession.time_left.is_(None),
+                            BF4PlayerSession.persona_id.is_(None),
+                        )
+                    ).all()
+                    for player_session in open_sessions:
+                        identity = identity_by_name.get(
+                            player_session.normalized_name
+                        )
+                        if identity is None:
+                            continue
+                        persona_id = int(identity["persona_id"])
+                        player_session.persona_id = persona_id
+                        player_session.player_name = identity["player_name"]
+                        player_session.normalized_name = normalize_player_name(
+                            identity["player_name"]
+                        )
+                        upsert_player_alias(
+                            session,
+                            platform=platform,
+                            persona_id=persona_id,
+                            player_name=identity["player_name"],
+                            seen_at=now,
+                        )
+
+                remaining = pending_ids - matched_ids
+                if remaining:
+                    PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = remaining
+                    PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
+                        time.monotonic() + 300
+                    )
+                    if guid not in PLAYER_ENRICHMENT_QUEUED:
+                        PLAYER_ENRICHMENT_QUEUE.append(guid)
+                        PLAYER_ENRICHMENT_QUEUED.add(guid)
+                else:
+                    PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                    PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+
+                async with counter_lock:
+                    succeeded += 1
+                    enriched_sessions += len(matched_ids)
+
+                log.info(
+                    "Player persona enrichment complete server=%s "
+                    "identities=%s matched_sessions=%s remaining=%s",
+                    guid,
+                    len(identities),
+                    len(matched_ids),
+                    len(remaining),
+                )
+
+                for session_id in sorted(matched_ids):
+                    if session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
+                        await evaluate_player_watch_alerts(session_id)
+                        PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
+
+            except Exception as exc:
+                async with counter_lock:
+                    failed += 1
+
+                PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
+                    time.monotonic()
+                    + PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+                )
                 if guid not in PLAYER_ENRICHMENT_QUEUED:
                     PLAYER_ENRICHMENT_QUEUE.append(guid)
                     PLAYER_ENRICHMENT_QUEUED.add(guid)
-            else:
-                PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
-                PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
 
-            succeeded += 1
-            enriched_sessions += len(matched_ids)
-            log.info(
-                "Player persona enrichment complete server=%s identities=%s matched_sessions=%s remaining=%s",
-                guid,
-                len(identities),
-                len(matched_ids),
-                len(remaining),
-            )
+                retry_seconds = PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+                if isinstance(exc, requests.HTTPError):
+                    response = getattr(exc, "response", None)
+                    status = getattr(response, "status_code", None)
+                    if status in {403, 429} or (
+                        isinstance(status, int) and status >= 500
+                    ):
+                        log.warning(
+                            "Player persona enrichment service backoff "
+                            "server=%s status=%s retry_seconds=%s",
+                            guid,
+                            status,
+                            retry_seconds,
+                        )
 
-            for session_id in sorted(matched_ids):
-                if session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
-                    await evaluate_player_watch_alerts(session_id)
-                    PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
-        except Exception as exc:
-            failed += 1
-            PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
-                time.monotonic() + PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
-            )
-            if guid not in PLAYER_ENRICHMENT_QUEUED:
-                PLAYER_ENRICHMENT_QUEUE.append(guid)
-                PLAYER_ENRICHMENT_QUEUED.add(guid)
-            log.warning(
-                "Player persona enrichment failed server=%s pending_sessions=%s error=%s message=%r retry_seconds=%s",
-                guid,
-                len(pending_ids),
-                type(exc).__name__,
-                str(exc),
-                PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS,
-            )
+                log.warning(
+                    "Player persona enrichment failed server=%s "
+                    "pending_sessions=%s error=%s message=%r "
+                    "retry_seconds=%s",
+                    guid,
+                    len(pending_ids),
+                    type(exc).__name__,
+                    str(exc),
+                    retry_seconds,
+                )
+
+    await asyncio.gather(
+        *(enrich_one(guid, pending_ids) for guid, pending_ids in work_items)
+    )
 
     return {
         "processed": processed,
@@ -3223,11 +3318,13 @@ async def monitor_cycle():
 
     log.info(
         "Monitor cycle started references=%s unique_servers=%s "
-        "duplicate_lookups_avoided=%s keeper_spacing_seconds=%s",
+        "duplicate_lookups_avoided=%s lookup_workers=%s "
+        "external_requests_per_second=%s",
         references,
         unique_count,
         duplicate_avoided,
-        KEEPER_REQUEST_SPACING_SECONDS,
+        EXTERNAL_LOOKUP_WORKERS,
+        EXTERNAL_REQUESTS_PER_SECOND,
     )
 
     fresh = {}
@@ -3250,84 +3347,106 @@ async def monitor_cycle():
             remaining,
         )
     else:
-        last_request_started = None
+        semaphore = asyncio.Semaphore(EXTERNAL_LOOKUP_WORKERS)
+        state_lock = asyncio.Lock()
+        circuit_event = asyncio.Event()
 
-        for index, guid in enumerate(unique_guids, 1):
-            if circuit_opened:
-                skipped += 1
-                continue
+        async def fetch_keeper(index: int, guid: str):
+            nonlocal attempted, skipped, failures
+            nonlocal service_failures, isolated_failures
+            nonlocal consecutive_service_failures, circuit_opened
+            global KEEPER_BACKOFF_UNTIL
 
-            if last_request_started is not None:
-                elapsed = time.monotonic() - last_request_started
-                wait_seconds = max(
-                    0.0,
-                    KEEPER_REQUEST_SPACING_SECONDS - elapsed,
-                )
-                if wait_seconds:
-                    await asyncio.sleep(wait_seconds)
+            async with semaphore:
+                if circuit_event.is_set():
+                    async with state_lock:
+                        skipped += 1
+                    return
 
-            last_request_started = time.monotonic()
-            attempted += 1
+                await wait_for_external_request_slot()
 
-            try:
-                snapshot = await asyncio.to_thread(
-                    get_keeper_snapshot,
-                    guid,
-                )
-                fresh[guid] = snapshot
-                LAST_SUCCESS_CACHE[guid] = snapshot
-                consecutive_service_failures = 0
-            except Exception as exc:
-                failures += 1
-                service_reason = keeper_service_failure_reason(exc)
+                if circuit_event.is_set():
+                    async with state_lock:
+                        skipped += 1
+                    return
 
-                if service_reason:
-                    service_failures += 1
-                    consecutive_service_failures += 1
-                    log.warning(
-                        "Monitor Keeper service failure server=%s "
-                        "progress=%s/%s streak=%s/%s reason=%s "
-                        "error=%s message=%r",
+                async with state_lock:
+                    attempted += 1
+
+                try:
+                    snapshot = await asyncio.to_thread(
+                        get_keeper_snapshot,
                         guid,
-                        index,
-                        unique_count,
-                        consecutive_service_failures,
-                        KEEPER_SERVICE_FAILURE_THRESHOLD,
-                        service_reason,
-                        type(exc).__name__,
-                        str(exc),
                     )
+                    fresh[guid] = snapshot
+                    LAST_SUCCESS_CACHE[guid] = snapshot
+                    async with state_lock:
+                        consecutive_service_failures = 0
+                except Exception as exc:
+                    service_reason = keeper_service_failure_reason(exc)
+                    async with state_lock:
+                        failures += 1
+                        if service_reason:
+                            service_failures += 1
+                            consecutive_service_failures += 1
+                            streak = consecutive_service_failures
+                        else:
+                            isolated_failures += 1
+                            streak = consecutive_service_failures
 
-                    if (
-                        consecutive_service_failures
-                        >= KEEPER_SERVICE_FAILURE_THRESHOLD
-                    ):
-                        circuit_opened = True
-                        skipped = unique_count - attempted
-                        KEEPER_BACKOFF_UNTIL = (
-                            time.monotonic()
-                            + KEEPER_SERVICE_BACKOFF_SECONDS
+                    if service_reason:
+                        log.warning(
+                            "Monitor Keeper service failure server=%s "
+                            "progress=%s/%s streak=%s/%s reason=%s "
+                            "error=%s message=%r",
+                            guid,
+                            index,
+                            unique_count,
+                            streak,
+                            KEEPER_SERVICE_FAILURE_THRESHOLD,
+                            service_reason,
+                            type(exc).__name__,
+                            str(exc),
                         )
-                        log.error(
-                            "Keeper circuit opened attempted=%s skipped=%s "
-                            "service_failures=%s backoff_seconds=%s",
-                            attempted,
-                            skipped,
-                            service_failures,
-                            KEEPER_SERVICE_BACKOFF_SECONDS,
+
+                        if streak >= KEEPER_SERVICE_FAILURE_THRESHOLD:
+                            async with state_lock:
+                                if not circuit_opened:
+                                    circuit_opened = True
+                                    KEEPER_BACKOFF_UNTIL = (
+                                        time.monotonic()
+                                        + KEEPER_SERVICE_BACKOFF_SECONDS
+                                    )
+                                    circuit_event.set()
+                                    log.error(
+                                        "Keeper circuit opened attempted=%s "
+                                        "service_failures=%s "
+                                        "backoff_seconds=%s",
+                                        attempted,
+                                        service_failures,
+                                        KEEPER_SERVICE_BACKOFF_SECONDS,
+                                    )
+                    else:
+                        log.warning(
+                            "Monitor server failed server=%s progress=%s/%s "
+                            "error=%s message=%r",
+                            guid,
+                            index,
+                            unique_count,
+                            type(exc).__name__,
+                            str(exc),
                         )
-                        break
-                else:
-                    isolated_failures += 1
-                    log.warning(
-                        "Monitor server failed server=%s progress=%s/%s "
-                        "error=%s message=%r",
-                        guid,
-                        index,
-                        unique_count,
-                        type(exc).__name__,
-                        str(exc),
-                    )
+
+        await asyncio.gather(
+            *(
+                fetch_keeper(index, guid)
+                for index, guid in enumerate(unique_guids, 1)
+            )
+        )
+
+        if circuit_opened:
+            skipped = max(skipped, unique_count - attempted)
+
 
         FRESH_SERVER_CACHE = fresh
 

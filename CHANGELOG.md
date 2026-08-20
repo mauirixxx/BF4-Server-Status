@@ -4,6 +4,25 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.0] - 2026-08-20
+
+### Performance
+- Replaced fully serial Keeper/server lookup scheduling with a bounded worker pool.
+- Added one shared global request-start limiter across Keeper polling and Battlelog persona enrichment.
+- Default concurrency is 3 workers with a conservative aggregate start rate of 1.0 external request/second.
+- Persona enrichment now drains all currently eligible server-level work in a cycle rather than limiting processing to only three servers per cycle; the worker pool and shared rate limiter control pressure instead.
+- Independent HTTP requests can overlap while the global limiter prevents bursty request starts.
+
+### Configuration
+- Added `EXTERNAL_LOOKUP_WORKERS` (default `3`).
+- Added `EXTERNAL_REQUESTS_PER_SECOND` (default `1.0`).
+
+### Preserved behavior
+- Unique server GUID deduplication and per-cycle result reuse remain intact.
+- Keeper failure isolation and circuit-breaker/backoff behavior remain intact.
+- Battlelog persona-enrichment retry/backoff remains intact, including conservative handling of 403/429/5xx responses.
+- No Alembic migration is required for v2.6.0.
+
 ## [v2.5.4] - 2026-08-20
 
 ### Changed
