@@ -4,6 +4,18 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.5.3] - 2026-08-20
+
+### Fixed
+- Restored persistent map-role button callbacks after bot/container restarts.
+- Existing role-panel messages are re-registered against their Discord message IDs during startup/reconciliation.
+- Unchanged panels no longer time out with “BF4 Server Tracker didn't respond in time.”
+- Added explicit persistent-view registration logging.
+
+### Behavior
+- Existing role-panel messages are preserved; recreating the panel is not required.
+- No Alembic migration is required for v2.5.3.
+
 ## [v2.5.2] - 2026-08-20
 
 ### Changed

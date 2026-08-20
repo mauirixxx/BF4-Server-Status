@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.5.2"
+BOT_VERSION = "v2.5.3"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -4083,6 +4083,7 @@ ROLE_PANEL_RECONCILE_LOCKS: dict[int, asyncio.Lock] = {}
 ROLE_PANEL_DEBOUNCE_TASKS: dict[int, asyncio.Task] = {}
 ROLE_PANEL_DEBOUNCE_DEADLINES: dict[int, float] = {}
 ROLE_PANEL_DEBOUNCE_REASONS: dict[int, str] = {}
+ROLE_PANEL_REGISTERED_MESSAGE_IDS: set[int] = set()
 
 
 def role_panel_reconcile_lock(guild_id: int) -> asyncio.Lock:
@@ -4176,6 +4177,28 @@ async def fetch_panel_message(channel, message_id):
         return await channel.fetch_message(int(message_id))
     except (discord.NotFound, discord.Forbidden):
         return None
+
+
+def register_persistent_role_panel_view(
+    guild: discord.Guild,
+    message_id: int,
+    items: list[dict],
+):
+    """Register callbacks for an existing persistent role-panel message once per process."""
+    if not items:
+        return
+    message_id = int(message_id)
+    if message_id in ROLE_PANEL_REGISTERED_MESSAGE_IDS:
+        return
+    view = MapRolePanelView(guild.id, items)
+    client.add_view(view, message_id=message_id)
+    ROLE_PANEL_REGISTERED_MESSAGE_IDS.add(message_id)
+    log.info(
+        "Role panel persistent view registered guild=%s message=%s buttons=%s",
+        guild.id,
+        message_id,
+        len(items),
+    )
 
 
 async def delete_role_panel_messages(guild: discord.Guild, rows):
@@ -4368,6 +4391,9 @@ async def _reconcile_role_panel_unlocked(guild: discord.Guild):
                     panel_count,
                     len(items),
                 )
+
+        if view is not None:
+            register_persistent_role_panel_view(guild, message.id, items)
 
         final_rows.append((panel_index, message, items))
 
