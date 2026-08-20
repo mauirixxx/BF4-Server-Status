@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.5.3"
+BOT_VERSION = "v2.5.4"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -1956,6 +1956,7 @@ async def notify_default_guilds_tick_rate_change(
                     users=True,
                     everyone=False,
                 ),
+                suppress_embeds=True,
             )
             sent_count += 1
             log.info(

@@ -4,6 +4,15 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.5.4] - 2026-08-20
+
+### Changed
+- Watched-player join notifications keep the guild server name as a clickable Battlelog link but now suppress Discord link-preview/embed cards.
+- Management-role pings, watched/current player-name behavior, alert wording, and Discord-local timestamps are unchanged.
+
+### Behavior
+- No Alembic migration is required for v2.5.4.
+
 ## [v2.5.3] - 2026-08-20
 
 ### Fixed
