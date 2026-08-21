@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.4"
+BOT_VERSION = "v2.6.5"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -132,6 +132,8 @@ KEEPER_SERVICE_FAILURE_THRESHOLD = 3
 KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
 KEEPER_SERVER_RETRY_AFTER: dict[str, float] = {}
+KEEPER_SERVER_CONSECUTIVE_404S: dict[str, int] = {}
+KEEPER_SERVER_404_WARNING_THRESHOLD = 5
 KEEPER_SERVER_403_BACKOFF_SECONDS = max(
     30,
     int(os.getenv("KEEPER_SERVER_403_BACKOFF_SECONDS", "300")),
@@ -157,6 +159,8 @@ PLAYER_ENRICHMENT_RETRY_AFTER: dict[str, float] = {}
 PLAYER_ENRICHMENT_PENDING_SESSIONS: dict[str, set[int]] = {}
 PLAYER_ENRICHMENT_ALERT_ELIGIBLE: set[int] = set()
 PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS = 600
+PLAYER_ENRICHMENT_NO_PROGRESS_STREAK: dict[str, int] = {}
+PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS = (600, 1200, 1800, 3600)
 
 
 def external_request_lock() -> asyncio.Lock:
@@ -675,8 +679,25 @@ def display_value(value):
     return "Unavailable" if value is None else str(value)
 
 
-def build_status_message(title: str, status: dict) -> str:
+def keeper_404_status_warning(server_guid: str | None) -> str | None:
+    if not server_guid:
+        return None
+    failures = KEEPER_SERVER_CONSECUTIVE_404S.get(str(server_guid), 0)
+    if failures < KEEPER_SERVER_404_WARNING_THRESHOLD:
+        return None
     return (
+        "⚠️ Keeper has been unable to retrieve this server for "
+        f"{KEEPER_SERVER_404_WARNING_THRESHOLD} consecutive checks. "
+        "Server data may be unavailable or stale."
+    )
+
+
+def build_status_message(
+    title: str,
+    status: dict,
+    server_guid: str | None = None,
+) -> str:
+    content = (
         f"🎮 **{title}**\n"
         f"🗺️ Current Map: **{status['map_name']}**\n"
         f"👥 Players: **{status['players']}/{status['max_players']}**\n"
@@ -684,6 +705,8 @@ def build_status_message(title: str, status: dict) -> str:
         f"🎖️ Commanders: **{display_value(status.get('commanders'))}**\n"
         f"🎟️ Minimum tickets remaining: **{display_value(status.get('min_tickets'))}**"
     )
+    warning = keeper_404_status_warning(server_guid)
+    return content + (f"\n\n{warning}" if warning else "")
 
 
 def build_map_announcement(
@@ -1251,7 +1274,7 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
             ))
 
     refresh_guild_readable_snapshots(discord_guild)
-    log.info(
+    (log.info if (created or rejoined) else log.debug)(
         "Guild bootstrap guild=%s name=%r created=%s rejoined=%s aaa_default=%s",
         discord_guild.id, discord_guild.name, created, rejoined, created
     )
@@ -1848,7 +1871,7 @@ def refresh_latest_version(force: bool = False):
             "newer" if relation == 1 else
             "unparseable"
         )
-        log.info(
+        (log.debug if relation == 0 else log.info)(
             "Version check cache hit installed=%s latest=%s relation=%s "
             "age_seconds=%s",
             BOT_VERSION,
@@ -1883,7 +1906,7 @@ def refresh_latest_version(force: bool = False):
             "newer" if relation == 1 else
             "unparseable"
         )
-        log.info(
+        (log.debug if relation == 0 else log.info)(
             "Version check installed=%s latest=%s relation=%s cache_seconds=%s",
             BOT_VERSION,
             LATEST_VERSION,
@@ -2275,7 +2298,7 @@ def upsert_player_alias(
             last_seen=seen_at,
         )
         session.add(row)
-        log.info(
+        log.debug(
             "Player alias discovered platform=%s persona=%s name=%r",
             platform,
             persona_id,
@@ -2313,7 +2336,7 @@ def queue_player_enrichment(
     if server_guid not in PLAYER_ENRICHMENT_QUEUED:
         PLAYER_ENRICHMENT_QUEUE.append(server_guid)
         PLAYER_ENRICHMENT_QUEUED.add(server_guid)
-        log.info(
+        log.debug(
             "Player persona enrichment queued server=%s pending_sessions=%s",
             server_guid,
             len(pending),
@@ -2532,10 +2555,28 @@ async def process_player_persona_enrichment():
             continue
 
         pending_ids = set(PLAYER_ENRICHMENT_PENDING_SESSIONS.get(guid, set()))
+        if pending_ids:
+            with SessionLocal() as session:
+                pending_ids = {
+                    int(value)
+                    for value in session.scalars(
+                        select(BF4PlayerSession.id).where(
+                            BF4PlayerSession.id.in_(pending_ids),
+                            BF4PlayerSession.server_guid == guid,
+                            BF4PlayerSession.time_left.is_(None),
+                            BF4PlayerSession.persona_id.is_(None),
+                        )
+                    ).all()
+                }
         if not pending_ids:
-            PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+            stale_ids = PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, set())
+            PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+            PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
+            for session_id in stale_ids:
+                PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(int(session_id))
             continue
 
+        PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = set(pending_ids)
         work_items.append((guid, pending_ids))
 
     if not work_items:
@@ -2595,6 +2636,8 @@ async def process_player_persona_enrichment():
                         select(BF4PlayerSession).where(
                             BF4PlayerSession.id.in_(pending_ids),
                             BF4PlayerSession.server_guid == guid,
+                            BF4PlayerSession.time_left.is_(None),
+                            BF4PlayerSession.persona_id.is_(None),
                         )
                     ).all()
 
@@ -2671,10 +2714,20 @@ async def process_player_persona_enrichment():
                         )
 
                 remaining = pending_ids - matched_ids
+                retry_seconds = None
                 if remaining:
                     PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = remaining
+                    if matched_ids:
+                        PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
+                        retry_seconds = PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+                    else:
+                        streak = PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.get(guid, 0) + 1
+                        PLAYER_ENRICHMENT_NO_PROGRESS_STREAK[guid] = streak
+                        retry_seconds = PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS[
+                            min(streak, len(PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS)) - 1
+                        ]
                     PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
-                        time.monotonic() + 300
+                        time.monotonic() + retry_seconds
                     )
                     if guid not in PLAYER_ENRICHMENT_QUEUED:
                         PLAYER_ENRICHMENT_QUEUE.append(guid)
@@ -2682,19 +2735,30 @@ async def process_player_persona_enrichment():
                 else:
                     PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
                     PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+                    PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
 
                 async with counter_lock:
                     succeeded += 1
                     enriched_sessions += len(matched_ids)
 
-                log.info(
-                    "Player persona enrichment complete server=%s "
-                    "identities=%s matched_sessions=%s remaining=%s",
-                    guid,
-                    len(identities),
-                    len(matched_ids),
-                    len(remaining),
-                )
+                if matched_ids:
+                    log.info(
+                        "Player persona enrichment complete server=%s "
+                        "identities=%s matched_sessions=%s remaining=%s",
+                        guid,
+                        len(identities),
+                        len(matched_ids),
+                        len(remaining),
+                    )
+                else:
+                    log.info(
+                        "Player persona enrichment no progress server=%s "
+                        "identities=%s pending_sessions=%s retry_seconds=%s",
+                        guid,
+                        len(identities),
+                        len(remaining),
+                        retry_seconds,
+                    )
 
                 for session_id in sorted(matched_ids):
                     if session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
@@ -2705,15 +2769,38 @@ async def process_player_persona_enrichment():
                 async with counter_lock:
                     failed += 1
 
+                no_live_identities = (
+                    isinstance(exc, ValueError)
+                    and str(exc)
+                    == "Battlelog page did not contain live player persona identities"
+                )
+                if no_live_identities:
+                    streak = PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.get(guid, 0) + 1
+                    PLAYER_ENRICHMENT_NO_PROGRESS_STREAK[guid] = streak
+                    retry_seconds = PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS[
+                        min(streak, len(PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS)) - 1
+                    ]
+                else:
+                    retry_seconds = PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+
                 PLAYER_ENRICHMENT_RETRY_AFTER[guid] = (
-                    time.monotonic()
-                    + PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+                    time.monotonic() + retry_seconds
                 )
                 if guid not in PLAYER_ENRICHMENT_QUEUED:
                     PLAYER_ENRICHMENT_QUEUE.append(guid)
                     PLAYER_ENRICHMENT_QUEUED.add(guid)
 
-                retry_seconds = PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS
+                if no_live_identities:
+                    log.info(
+                        "Player persona enrichment unavailable server=%s "
+                        "pending_sessions=%s reason=no_live_persona_identities "
+                        "retry_seconds=%s",
+                        guid,
+                        len(pending_ids),
+                        retry_seconds,
+                    )
+                    return
+
                 if isinstance(exc, requests.HTTPError):
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
@@ -2891,7 +2978,7 @@ async def process_player_history(
 
         if baseline:
             baselines += 1
-            log.info(
+            (log.info if (current or new_session_ids) else log.debug)(
                 "Player history baseline established server=%s players=%s new_sessions=%s alerts_suppressed=True",
                 guid,
                 len(current),
@@ -3114,7 +3201,7 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
             message = await channel.fetch_message(int(row["message_id"]))
             await message.delete()
             deleted += 1
-            log.info(
+            log.debug(
                 "Deleted player display message guild=%s server=%s channel=%s "
                 "message=%s chunk=%s",
                 guild.id,
@@ -3125,7 +3212,7 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
             )
         except discord.NotFound:
             deleted += 1
-            log.info(
+            log.debug(
                 "Player display message already absent guild=%s server=%s "
                 "channel=%s message=%s chunk=%s",
                 guild.id,
@@ -3275,7 +3362,7 @@ async def update_persistent_player_display(
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             created.append((chunk_index, message))
-            log.info(
+            log.debug(
                 "Player display message posted guild=%s server=%s channel=%s "
                 "message=%s chunk=%s/%s",
                 guild.id,
@@ -3331,7 +3418,7 @@ async def update_persistent_player_display(
 
     deleted, delete_failed = await delete_player_message_rows(guild, old_rows)
     PLAYER_DISPLAY_VALIDATED.add(key)
-    log.info(
+    log.debug(
         "Player display replaced guild=%s server=%s chunks=%s old_rows=%s "
         "old_deleted=%s old_delete_failed=%s hash=%s",
         guild.id,
@@ -3389,7 +3476,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
 
     unique_guids = sorted({row["server_guid"] for row in requested})
     duplicate_avoided = len(requested) - len(unique_guids)
-    log.info(
+    log.debug(
         "Player display cycle started requested=%s unique_servers=%s "
         "duplicate_roster_lookups_avoided=%s",
         len(requested),
@@ -3419,7 +3506,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
                 guid,
                 snapshot,
             )
-            log.info(
+            log.debug(
                 "Player roster lookup complete server=%s progress=%s/%s "
                 "source=%s",
                 guid,
@@ -3617,6 +3704,7 @@ async def monitor_cycle():
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
                     KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
+                    KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
                     async with state_lock:
                         consecutive_service_failures = 0
                 except Exception as exc:
@@ -3625,6 +3713,10 @@ async def monitor_cycle():
                     if status == 403:
                         KEEPER_SERVER_RETRY_AFTER[guid] = (
                             time.monotonic() + KEEPER_SERVER_403_BACKOFF_SECONDS
+                        )
+                    if status == 404:
+                        KEEPER_SERVER_CONSECUTIVE_404S[guid] = (
+                            KEEPER_SERVER_CONSECUTIVE_404S.get(guid, 0) + 1
                         )
                     service_reason = keeper_service_failure_reason(exc)
                     async with state_lock:
@@ -4604,7 +4696,7 @@ def register_persistent_role_panel_view(
     view = MapRolePanelView(guild.id, items)
     client.add_view(view, message_id=message_id)
     ROLE_PANEL_REGISTERED_MESSAGE_IDS.add(message_id)
-    log.info(
+    log.debug(
         "Role panel persistent view registered guild=%s message=%s buttons=%s",
         guild.id,
         message_id,
@@ -4792,7 +4884,7 @@ async def _reconcile_role_panel_unlocked(guild: discord.Guild):
                     len(items),
                 )
             else:
-                log.info(
+                log.debug(
                     "Role panel unchanged guild=%s channel=%s message=%s "
                     "panel=%s/%s buttons=%s edit_skipped=True",
                     guild.id,
@@ -4832,7 +4924,7 @@ async def _reconcile_role_panel_unlocked(guild: discord.Guild):
             live.roles_channel_id = channel.id
             live.roles_channel_name = channel.name
 
-    log.info(
+    log.debug(
         "Role panel reconciliation complete guild=%s channel=%s panels=%s buttons=%s",
         guild.id,
         channel.id,
@@ -4886,7 +4978,7 @@ async def status_all(interaction: discord.Interaction):
             if snapshot is None:
                 snapshot = await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
             marker = " (default)" if gs.is_default else ""
-            await interaction.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot)))
+            await interaction.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot), bf.server_guid))
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=True, started=started, result_code="ok", metadata={"server_count": len(rows)})
     except Exception as exc:
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=False, started=started, result_code="failed", error=exc)
@@ -4916,7 +5008,7 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
         snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
         if not players:
             marker = " (default)" if gs.is_default else ""
-            await interaction.followup.send(build_status_message(f"BF4 Server Status — {display_name}{marker}", get_server_status(snapshot)), ephemeral=True)
+            await interaction.followup.send(build_status_message(f"BF4 Server Status — {display_name}{marker}", get_server_status(snapshot), server), ephemeral=True)
         else:
             chunks = None
             if normalize_platform_label(platform) == "PC":
@@ -6869,11 +6961,27 @@ async def playerhistory(
             joined = int(row.time_joined.timestamp())
             last_seen = int(row.last_seen.timestamp())
             server_name = server_names.get(row.server_guid, row.server_guid)
-            left_text = (
-                f"<t:{int(row.time_left.timestamp())}:R> (<t:{int(row.time_left.timestamp())}:f>)"
-                if row.time_left
-                else "Still present at last successful check"
+            pending_absence = (
+                PENDING_PLAYER_ABSENCES.get(
+                    (row.server_guid, int(row.id))
+                )
+                if row.time_left is None
+                else None
             )
+            if row.time_left:
+                left_text = (
+                    f"<t:{int(row.time_left.timestamp())}:R> "
+                    f"(<t:{int(row.time_left.timestamp())}:f>)"
+                )
+            elif pending_absence:
+                first_missing = int(pending_absence.timestamp())
+                left_text = (
+                    "Departure pending confirmation\n"
+                    f"First missing: <t:{first_missing}:R> "
+                    f"(<t:{first_missing}:f>)"
+                )
+            else:
+                left_text = "Still present at last successful check"
             blocks.append(
                 f"**{row.player_name}** — **{server_name}** / **{row.map_name}**\n"
                 f"Joined: <t:{joined}:R> (<t:{joined}:f>)\n"
@@ -7712,7 +7820,7 @@ async def on_message(message: discord.Message):
                     return
                 for gs, bf in defaults:
                     snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
-                    await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name} (default)", get_server_status(snapshot)))
+                    await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name} (default)", get_server_status(snapshot), bf.server_guid))
                 audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="defaults", metadata={"count": len(defaults)})
                 return
             matches = find_guild_server(message.guild.id, selector)
@@ -7760,7 +7868,7 @@ async def on_message(message: discord.Message):
                     await message.channel.send(chunk)
             else:
                 marker = " (default)" if gs.is_default else ""
-                await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot)))
+                await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot), bf.server_guid))
             audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="ok", target_type="server", target_id=bf.server_guid, target_name=gs.display_name, metadata={"players": players})
     except Exception as exc:
         log.error(

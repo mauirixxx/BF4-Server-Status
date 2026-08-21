@@ -4,6 +4,22 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.5] - 2026-08-20
+
+### Fixed / Improved
+- Reduced INFO log noise by moving routine no-op and per-item player/role/display details to DEBUG.
+- Changed benign `no_live_persona_identities` enrichment failures to INFO-level `Player persona enrichment unavailable`.
+- Added a five-consecutive-404 Keeper health warning to per-server status output; one successful Keeper response clears the warning.
+- Added `/playerhistory` departure-pending presentation with first-missing Discord timestamps while preserving the existing two-successful-absence debounce.
+- Automatic persona enrichment now excludes closed unresolved sessions from retry work.
+- Added progressive no-progress persona-enrichment backoff: 600s, 1200s, 1800s, then 3600s for fourth and later no-progress attempts. A successful match resets the streak.
+- Routine cached/equal GitHub version checks now log at DEBUG; meaningful version-state changes remain INFO and failures remain WARNING.
+
+### Preserved
+- Keeper request rate and inter-sweep cooldown remain unchanged from v2.6.4.
+- Session-closing semantics remain unchanged.
+- No Alembic migration is required.
+
 ## [v2.6.4] - 2026-08-20
 
 ### Fixed
