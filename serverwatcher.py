@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.2"
+BOT_VERSION = "v2.6.3"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -562,13 +562,26 @@ def keeper_service_failure_reason(exc: Exception) -> str | None:
     if isinstance(exc, requests.HTTPError):
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
-        if status in {403, 429} or (isinstance(status, int) and status >= 500):
+
+        # Keeper 403s have been observed to be transient and server/request
+        # specific. They must not advance the global circuit-breaker streak.
+        if status == 403:
+            return None
+
+        if status == 429:
+            return "http_429"
+
+        if isinstance(status, int) and status >= 500:
             return f"http_{status}"
+
         return None
+
     if isinstance(exc, requests.Timeout):
         return "timeout"
+
     if isinstance(exc, requests.ConnectionError):
         return "connection_error"
+
     return None
 
 

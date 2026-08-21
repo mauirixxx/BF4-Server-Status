@@ -4,6 +4,17 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.3] - 2026-08-20
+
+### Fixed
+- Corrected `keeper_service_failure_reason()` so Keeper HTTP 403 explicitly returns no service-failure classification and cannot increment the global circuit-breaker streak.
+- Preserved the v2.6.2 per-server Keeper 403 cooldown/backoff.
+
+### Validation
+- Added release validation for the Keeper classifier behavior: HTTP 403 is isolated, HTTP 429 and 5xx are breaker-eligible, and timeout/connection failures remain breaker-eligible.
+- Confirmed the v2.6.2 `!list` 1850-character chunking and presence safeguards remain present.
+- No Alembic migration is required.
+
 ## [v2.6.2] - 2026-08-20
 
 ### Fixed
