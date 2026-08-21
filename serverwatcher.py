@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.1"
+BOT_VERSION = "v2.6.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -127,10 +127,15 @@ BATTLELOG_DEFAULT_429_BACKOFF_SECONDS = max(
     5,
     int(os.getenv("BATTLELOG_DEFAULT_429_BACKOFF_SECONDS", "30")),
 )
-LAST_GOOD_PRESENCE_PLAYERS = 0
+LAST_GOOD_PRESENCE_PLAYERS: int | None = None
 KEEPER_SERVICE_FAILURE_THRESHOLD = 3
 KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
+KEEPER_SERVER_RETRY_AFTER: dict[str, float] = {}
+KEEPER_SERVER_403_BACKOFF_SECONDS = max(
+    30,
+    int(os.getenv("KEEPER_SERVER_403_BACKOFF_SECONDS", "300")),
+)
 watcher_started = False
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
 PLAYER_ROSTER_BASELINED: set[str] = set()
@@ -1466,7 +1471,7 @@ def platform_server_list(guild_id: int, include_guid=False):
     return "\n".join(lines)
 
 
-def server_list_chunks(guild_id: int, limit: int = 3800):
+def server_list_chunks(guild_id: int, limit: int = 1850):
     """Return complete-entry chunks for !list, with cumulative progress headers."""
     body = platform_server_list(guild_id)
     if body == "None":
@@ -3462,6 +3467,17 @@ async def monitor_cycle():
                         skipped += 1
                     return
 
+                retry_after = KEEPER_SERVER_RETRY_AFTER.get(guid, 0.0)
+                if retry_after > time.monotonic():
+                    async with state_lock:
+                        skipped += 1
+                    log.info(
+                        "Monitor server cooldown active server=%s retry_in_seconds=%s",
+                        guid,
+                        max(0, int(retry_after - time.monotonic())),
+                    )
+                    return
+
                 await wait_for_external_request_slot()
 
                 if circuit_event.is_set():
@@ -3479,9 +3495,16 @@ async def monitor_cycle():
                     )
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
+                    KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
                     async with state_lock:
                         consecutive_service_failures = 0
                 except Exception as exc:
+                    response = getattr(exc, "response", None)
+                    status = getattr(response, "status_code", None)
+                    if status == 403:
+                        KEEPER_SERVER_RETRY_AFTER[guid] = (
+                            time.monotonic() + KEEPER_SERVER_403_BACKOFF_SECONDS
+                        )
                     service_reason = keeper_service_failure_reason(exc)
                     async with state_lock:
                         failures += 1
@@ -3528,12 +3551,18 @@ async def monitor_cycle():
                     else:
                         log.warning(
                             "Monitor server failed server=%s progress=%s/%s "
-                            "error=%s message=%r",
+                            "status=%s error=%s message=%r%s",
                             guid,
                             index,
                             unique_count,
+                            status,
                             type(exc).__name__,
                             str(exc),
+                            (
+                                f" retry_seconds={KEEPER_SERVER_403_BACKOFF_SECONDS}"
+                                if status == 403
+                                else ""
+                            ),
                         )
 
         await asyncio.gather(
@@ -3665,14 +3694,31 @@ async def monitor_cycle():
         get_server_status(snapshot)["players"]
         for snapshot in fresh.values()
     )
-    # Presence retains the last non-empty successful aggregate when a cycle
-    # is entirely skipped/aborted by Keeper cooldown or the circuit breaker.
-    if fresh:
+    complete_success = (
+        unique_count == 0
+        or (
+            len(fresh) == unique_count
+            and failures == 0
+            and skipped == 0
+            and not circuit_opened
+        )
+    )
+    if complete_success:
         LAST_GOOD_PRESENCE_PLAYERS = player_total
+        log.info(
+            "Presence aggregate updated players=%s complete_success=True",
+            player_total,
+        )
     else:
         log.info(
-            "Presence aggregate retained players=%s reason=no_successful_snapshots",
+            "Presence aggregate retained players=%s reason=incomplete_cycle "
+            "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s",
             LAST_GOOD_PRESENCE_PLAYERS,
+            len(fresh),
+            unique_count,
+            failures,
+            skipped,
+            circuit_opened,
         )
 
     log.info(
@@ -3719,12 +3765,16 @@ async def presence_loop():
         try:
             with SessionLocal() as session:
                 unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
-            players = LAST_GOOD_PRESENCE_PLAYERS
-            activities = [
-                f"Tracking {unique_count} BF4 servers",
-                f"{players:,} players across all tracked servers",
-            ]
-            await client.change_presence(activity=discord.CustomActivity(name=activities[index % 2]))
+            if LAST_GOOD_PRESENCE_PLAYERS is None:
+                activities = [f"Tracking {unique_count} BF4 servers"]
+            else:
+                activities = [
+                    f"Tracking {unique_count} BF4 servers",
+                    f"{LAST_GOOD_PRESENCE_PLAYERS:,} players across all tracked servers",
+                ]
+            await client.change_presence(
+                activity=discord.CustomActivity(name=activities[index % len(activities)])
+            )
             index += 1
         except Exception as exc:
             log.warning("Presence update failed error=%s message=%r", type(exc).__name__, str(exc))

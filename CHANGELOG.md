@@ -4,6 +4,22 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.2] - 2026-08-20
+
+### Fixed
+- Reduced `!list` chunk size to 1850 characters.
+- Presence no longer starts with a false `0 players`; only complete successful monitor sweeps establish the player-count aggregate.
+- Partial/skipped/circuit-broken cycles retain the previous complete aggregate.
+- Keeper HTTP 403 is now isolated per server, does not increment the global circuit breaker, and receives a configurable cooldown.
+
+### Configuration
+- Added `KEEPER_SERVER_403_BACKOFF_SECONDS` (default `300`).
+
+### Preserved behavior
+- Keeper HTTP 429 remains a global rate-limit signal.
+- Repeated Keeper 5xx/connectivity failures remain breaker-eligible.
+- No Alembic migration is required.
+
 ## [v2.6.1] - 2026-08-20
 
 ### Fixed

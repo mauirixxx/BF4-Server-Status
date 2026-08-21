@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.6.1
+# BF4 Server Watcher v2.6.2
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,15 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## v2.6.2 hotfix release
+
+- `!list` now chunks to 1850 characters, safely below Discord's 2000-character content limit.
+- Rich presence withholds player totals until the first complete successful monitor sweep, then retains only the last complete successful aggregate across partial/skipped/circuit-broken cycles.
+- Keeper HTTP 403 is treated as an isolated transient per-server failure with cooldown and no longer increments the global circuit-breaker streak.
+- Keeper HTTP 429 remains a global rate-limit signal; repeated 5xx/connectivity failures remain breaker-eligible.
+- v2.6.1 Battlelog rate-limit coverage and no-catch-up scheduling remain unchanged.
+- No database migration is required.
 
 ## v2.6.1 hotfix release
 

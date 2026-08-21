@@ -1,7 +1,7 @@
 services:
   bf4-server-watcher:
     build: .
-    image: bf4-server-watcher:2.6.1
+    image: bf4-server-watcher:2.6.2
     container_name: BF4_ServerWatcher
     restart: unless-stopped
     env_file:
