@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.6.5
+# BF4 Server Watcher v2.6.6-pr1
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,22 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## v2.6.6 Pre-Release 1 — Keeper batching experiment
+
+This pre-release is an intentionally controlled Keeper pacing test based on repeated production observations that HTTP 403 responses begin after approximately 71 consecutive snapshot requests. It is not yet the final v2.6.6 polling policy.
+
+- Keeps `EXTERNAL_REQUESTS_PER_SECOND=0.33` unchanged so request-start pacing is not a test variable.
+- Processes at most `60` Keeper servers per batch.
+- Pauses `60` seconds between Keeper batches before continuing the same sweep.
+- Adds `KEEPER_BATCH_SIZE` (default `60`) and `KEEPER_BATCH_PAUSE_SECONDS` (default `60`).
+- Detects a sustained Keeper 403 wall and stops the current sweep after `3` consecutive HTTP 403 responses instead of continuing to hammer Keeper.
+- Adds `KEEPER_403_FLOOD_THRESHOLD` (default `3`).
+- A 403-flood stop uses the existing 300-second Keeper 403 backoff window.
+- The normal post-sweep `KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=300` remains unchanged.
+- No database migration is required.
+
+The purpose of PR1 is to determine whether a 60-second pause after 60 snapshot requests replenishes enough Keeper allowance for the sweep to continue beyond the observed ~71-request ceiling.
 
 ## v2.6.5 stability and observability release
 

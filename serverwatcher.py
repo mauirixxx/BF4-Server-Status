@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.5"
+BOT_VERSION = "v2.6.6-pr1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -141,6 +141,18 @@ KEEPER_SERVER_403_BACKOFF_SECONDS = max(
 KEEPER_INTER_SWEEP_COOLDOWN_SECONDS = max(
     CHECK_INTERVAL_SECONDS,
     int(os.getenv("KEEPER_INTER_SWEEP_COOLDOWN_SECONDS", "300")),
+)
+KEEPER_BATCH_SIZE = max(
+    1,
+    int(os.getenv("KEEPER_BATCH_SIZE", "60")),
+)
+KEEPER_BATCH_PAUSE_SECONDS = max(
+    0,
+    int(os.getenv("KEEPER_BATCH_PAUSE_SECONDS", "60")),
+)
+KEEPER_403_FLOOD_THRESHOLD = max(
+    2,
+    int(os.getenv("KEEPER_403_FLOOD_THRESHOLD", "3")),
 )
 KEEPER_PRESENCE_MIN_SUCCESS_RATIO = min(
     1.0,
@@ -3631,12 +3643,15 @@ async def monitor_cycle():
     log.info(
         "Monitor cycle started references=%s unique_servers=%s "
         "duplicate_lookups_avoided=%s lookup_workers=%s "
-        "external_requests_per_second=%s",
+        "external_requests_per_second=%s keeper_batch_size=%s "
+        "keeper_batch_pause_seconds=%s",
         references,
         unique_count,
         duplicate_avoided,
         EXTERNAL_LOOKUP_WORKERS,
         EXTERNAL_REQUESTS_PER_SECOND,
+        KEEPER_BATCH_SIZE,
+        KEEPER_BATCH_PAUSE_SECONDS,
     )
 
     fresh = {}
@@ -3646,6 +3661,7 @@ async def monitor_cycle():
     service_failures = 0
     isolated_failures = 0
     consecutive_service_failures = 0
+    consecutive_403_failures = 0
     circuit_opened = False
 
     now_mono = time.monotonic()
@@ -3666,7 +3682,8 @@ async def monitor_cycle():
         async def fetch_keeper(index: int, guid: str):
             nonlocal attempted, skipped, failures
             nonlocal service_failures, isolated_failures
-            nonlocal consecutive_service_failures, circuit_opened
+            nonlocal consecutive_service_failures, consecutive_403_failures
+            nonlocal circuit_opened
             global KEEPER_BACKOFF_UNTIL
 
             async with semaphore:
@@ -3707,6 +3724,7 @@ async def monitor_cycle():
                     KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
                     async with state_lock:
                         consecutive_service_failures = 0
+                        consecutive_403_failures = 0
                 except Exception as exc:
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
@@ -3721,13 +3739,42 @@ async def monitor_cycle():
                     service_reason = keeper_service_failure_reason(exc)
                     async with state_lock:
                         failures += 1
-                        if service_reason:
-                            service_failures += 1
-                            consecutive_service_failures += 1
+                        if status == 403:
+                            isolated_failures += 1
+                            consecutive_403_failures += 1
+                            flood_streak = consecutive_403_failures
                             streak = consecutive_service_failures
                         else:
-                            isolated_failures += 1
-                            streak = consecutive_service_failures
+                            consecutive_403_failures = 0
+                            flood_streak = 0
+                            if service_reason:
+                                service_failures += 1
+                                consecutive_service_failures += 1
+                                streak = consecutive_service_failures
+                            else:
+                                isolated_failures += 1
+                                streak = consecutive_service_failures
+
+                    if status == 403 and flood_streak >= KEEPER_403_FLOOD_THRESHOLD:
+                        async with state_lock:
+                            if not circuit_opened:
+                                circuit_opened = True
+                                KEEPER_BACKOFF_UNTIL = (
+                                    time.monotonic()
+                                    + KEEPER_SERVER_403_BACKOFF_SECONDS
+                                )
+                                circuit_event.set()
+                                log.error(
+                                    "Keeper 403 flood circuit opened "
+                                    "attempted=%s isolated_failures=%s "
+                                    "consecutive_403s=%s threshold=%s "
+                                    "backoff_seconds=%s",
+                                    attempted,
+                                    isolated_failures,
+                                    flood_streak,
+                                    KEEPER_403_FLOOD_THRESHOLD,
+                                    KEEPER_SERVER_403_BACKOFF_SECONDS,
+                                )
 
                     if service_reason:
                         log.warning(
@@ -3778,12 +3825,47 @@ async def monitor_cycle():
                             ),
                         )
 
-        await asyncio.gather(
-            *(
-                fetch_keeper(index, guid)
-                for index, guid in enumerate(unique_guids, 1)
+        for batch_start in range(0, unique_count, KEEPER_BATCH_SIZE):
+            batch = unique_guids[batch_start:batch_start + KEEPER_BATCH_SIZE]
+            batch_number = (batch_start // KEEPER_BATCH_SIZE) + 1
+            batch_end = batch_start + len(batch)
+
+            log.info(
+                "Keeper batch started batch=%s range=%s-%s total=%s",
+                batch_number,
+                batch_start + 1,
+                batch_end,
+                unique_count,
             )
-        )
+
+            await asyncio.gather(
+                *(
+                    fetch_keeper(batch_start + offset, guid)
+                    for offset, guid in enumerate(batch, 1)
+                )
+            )
+
+            if circuit_event.is_set():
+                log.warning(
+                    "Keeper batch processing stopped batch=%s "
+                    "attempted=%s succeeded=%s failed=%s",
+                    batch_number,
+                    attempted,
+                    len(fresh),
+                    failures,
+                )
+                break
+
+            if batch_end < unique_count and KEEPER_BATCH_PAUSE_SECONDS > 0:
+                log.info(
+                    "Keeper inter-batch cooldown batch=%s completed=%s/%s "
+                    "seconds=%s",
+                    batch_number,
+                    batch_end,
+                    unique_count,
+                    KEEPER_BATCH_PAUSE_SECONDS,
+                )
+                await asyncio.sleep(KEEPER_BATCH_PAUSE_SECONDS)
 
         if circuit_opened:
             skipped = max(skipped, unique_count - attempted)

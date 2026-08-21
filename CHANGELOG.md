@@ -4,6 +4,23 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.6-pr1] - 2026-08-21
+
+### Experimental Keeper pacing
+- Added a controlled 60-server Keeper batch size followed by a 60-second inter-batch pause.
+- Kept the external request-start rate unchanged at `0.33` requests/second so PR1 isolates batching/cooldown behavior.
+- Added `KEEPER_BATCH_SIZE` (default `60`) and `KEEPER_BATCH_PAUSE_SECONDS` (default `60`).
+- Added a dedicated consecutive-403 flood detector. Three consecutive Keeper HTTP 403 responses stop the current sweep rather than allowing the monitor to continue through the remaining servers.
+- Added `KEEPER_403_FLOOD_THRESHOLD` (default `3`).
+- A 403-flood stop uses the existing 300-second Keeper 403 backoff.
+- The existing 300-second post-sweep cooldown remains unchanged.
+
+### Purpose
+- PR1 is a controlled test of the repeatedly observed Keeper wall at approximately 71 consecutive snapshot requests.
+- The test asks whether pausing for 60 seconds after 60 requests allows the sweep to continue past that observed ceiling.
+- This is not yet the final v2.6.6 production polling policy.
+- No Alembic migration is required.
+
 ## [v2.6.5] - 2026-08-20
 
 ### Fixed / Improved
