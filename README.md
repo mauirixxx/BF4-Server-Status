@@ -1,4 +1,4 @@
-# BF4 Server Watcher v2.6.3
+# BF4 Server Watcher v2.6.4
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -397,6 +397,15 @@ Use the management-only command below if an administrator later notices that a s
 The refresh command requires a stored Battlelog URL. Successful automatic map-change and temporary announcement messages display `⚡ Tick Rate: **XX Hz**` directly below the Players line when a stored value exists.
 
 Starting with v2.4.1, an actual stored tick-rate change (including `NULL` to a numeric value) notifies every guild where that server is currently configured as a default. The alert is sent to that default server's assigned announcement channel and pings the configured management role, or the guild owner when no management role is configured. Re-reading the same Hz value does not send an alert.
+
+## v2.6.4 hotfix release
+
+- Uses a conservative default Keeper request rate of `0.33` requests/second.
+- Adds a configurable 300-second total inter-sweep recovery window after each completed Keeper sweep, preventing the next large sweep from restarting after only the normal 120-second check interval.
+- Rich presence may now establish/update from a near-complete healthy sweep (default 99% successful) when there are no Keeper service failures, skipped servers, or circuit-breaker event. This prevents one isolated 404 among hundreds of servers from blocking the player aggregate indefinitely.
+- Adds a persistent 24-hour GitHub latest-release cache. `/version` and the background checker reuse the cache; installing a new local ServerWatcher version invalidates the old cache and forces a fresh lookup.
+- Preserves v2.6.3 per-server 403 isolation/backoff, v2.6.2 `!list` chunking, Battlelog pacing, and no-catch-up scheduling.
+- No database migration is required.
 
 ## v2.6.3 hotfix release
 

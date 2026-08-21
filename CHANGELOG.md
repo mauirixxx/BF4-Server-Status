@@ -4,6 +4,26 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.4] - 2026-08-20
+
+### Fixed
+- Added a 300-second total recovery window between completed large Keeper sweeps.
+- Relaxed presence completeness to a configurable 99% healthy-success threshold while still rejecting skipped, circuit-broken, or service-failure cycles.
+- Changed the built-in default external request rate to `0.33` requests/second based on sustained 221-server testing.
+
+### Improved
+- Added persistent 24-hour GitHub release-result caching for `/version` and background version checks.
+- A newly installed local version invalidates the prior version cache and immediately refreshes it, even when GitHub reports the same version.
+
+### Configuration
+- Added `KEEPER_INTER_SWEEP_COOLDOWN_SECONDS` (default `300`).
+- Added `KEEPER_PRESENCE_MIN_SUCCESS_RATIO` (default `0.99`).
+
+### Preserved behavior
+- Keeper 403 remains isolated per-server with cooldown.
+- Keeper 429/5xx/timeouts/connectivity failures retain existing service-failure handling.
+- No Alembic migration is required.
+
 ## [v2.6.3] - 2026-08-20
 
 ### Fixed

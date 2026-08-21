@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.3"
+BOT_VERSION = "v2.6.4"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -117,7 +117,7 @@ BFLIST_CACHE_SECONDS = 15
 EXTERNAL_LOOKUP_WORKERS = max(1, int(os.getenv("EXTERNAL_LOOKUP_WORKERS", "3")))
 EXTERNAL_REQUESTS_PER_SECOND = max(
     0.1,
-    float(os.getenv("EXTERNAL_REQUESTS_PER_SECOND", "1.0")),
+    float(os.getenv("EXTERNAL_REQUESTS_PER_SECOND", "0.33")),
 )
 EXTERNAL_REQUEST_INTERVAL_SECONDS = 1.0 / EXTERNAL_REQUESTS_PER_SECOND
 EXTERNAL_REQUEST_LOCK: asyncio.Lock | None = None
@@ -136,6 +136,16 @@ KEEPER_SERVER_403_BACKOFF_SECONDS = max(
     30,
     int(os.getenv("KEEPER_SERVER_403_BACKOFF_SECONDS", "300")),
 )
+KEEPER_INTER_SWEEP_COOLDOWN_SECONDS = max(
+    CHECK_INTERVAL_SECONDS,
+    int(os.getenv("KEEPER_INTER_SWEEP_COOLDOWN_SECONDS", "300")),
+)
+KEEPER_PRESENCE_MIN_SUCCESS_RATIO = min(
+    1.0,
+    max(0.5, float(os.getenv("KEEPER_PRESENCE_MIN_SUCCESS_RATIO", "0.99"))),
+)
+VERSION_CACHE_SECONDS = 24 * 60 * 60
+VERSION_CACHE_PATH = RUNTIME_DIR / "version-check-cache.json"
 watcher_started = False
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
 PLAYER_ROSTER_BASELINED: set[str] = set()
@@ -1776,16 +1786,60 @@ def compare_release_versions(installed: str, latest: str) -> int | None:
     return (installed_key > latest_key) - (installed_key < latest_key)
 
 
-def refresh_latest_version():
-    global LATEST_VERSION, VERSION_CHECK_ERROR
+def _load_version_cache():
     try:
-        response = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",
-            headers={"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"},
-            timeout=10,
+        data = json.loads(VERSION_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_version_cache(latest_version: str | None):
+    try:
+        payload = {
+            "installed_version": BOT_VERSION,
+            "latest_version": latest_version,
+            "checked_at": time.time(),
+        }
+        VERSION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        VERSION_CACHE_PATH.write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
         )
-        response.raise_for_status()
-        LATEST_VERSION = str(response.json().get("tag_name") or "").strip() or None
+    except OSError as exc:
+        log.warning(
+            "Version cache write failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
+        )
+
+
+def refresh_latest_version(force: bool = False):
+    global LATEST_VERSION, VERSION_CHECK_ERROR
+
+    cached = _load_version_cache()
+    cache_matches_installed = (
+        cached is not None
+        and cached.get("installed_version") == BOT_VERSION
+    )
+    cache_age = None
+    if cached is not None:
+        try:
+            cache_age = max(0.0, time.time() - float(cached.get("checked_at", 0)))
+        except (TypeError, ValueError):
+            cache_age = None
+
+    if (
+        not force
+        and cache_matches_installed
+        and cache_age is not None
+        and cache_age < VERSION_CACHE_SECONDS
+    ):
+        LATEST_VERSION = (
+            str(cached.get("latest_version") or "").strip() or None
+        )
         VERSION_CHECK_ERROR = None
         relation = compare_release_versions(BOT_VERSION, LATEST_VERSION)
         relation_text = (
@@ -1795,14 +1849,68 @@ def refresh_latest_version():
             "unparseable"
         )
         log.info(
-            "Version check installed=%s latest=%s relation=%s",
+            "Version check cache hit installed=%s latest=%s relation=%s "
+            "age_seconds=%s",
             BOT_VERSION,
             LATEST_VERSION,
             relation_text,
+            int(cache_age),
+        )
+        return
+
+    # A cache from another installed version is intentionally invalidated.
+    if cached is not None and not cache_matches_installed:
+        try:
+            VERSION_CACHE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        cached = None
+
+    try:
+        response = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",
+            headers={"User-Agent": f"BF4-Server-Watcher/{BOT_VERSION}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        LATEST_VERSION = str(response.json().get("tag_name") or "").strip() or None
+        VERSION_CHECK_ERROR = None
+        _save_version_cache(LATEST_VERSION)
+        relation = compare_release_versions(BOT_VERSION, LATEST_VERSION)
+        relation_text = (
+            "older" if relation == -1 else
+            "equal" if relation == 0 else
+            "newer" if relation == 1 else
+            "unparseable"
+        )
+        log.info(
+            "Version check installed=%s latest=%s relation=%s cache_seconds=%s",
+            BOT_VERSION,
+            LATEST_VERSION,
+            relation_text,
+            VERSION_CACHE_SECONDS,
         )
     except Exception as exc:
         VERSION_CHECK_ERROR = type(exc).__name__
-        log.warning("Version check failed error=%s message=%r", type(exc).__name__, str(exc))
+        # If this was a routine refresh and an otherwise valid cache existed,
+        # retain it rather than discarding useful version information.
+        if cache_matches_installed and cached is not None:
+            LATEST_VERSION = (
+                str(cached.get("latest_version") or "").strip() or None
+            )
+            log.warning(
+                "Version check failed; retained cached result latest=%s "
+                "error=%s message=%r",
+                LATEST_VERSION,
+                type(exc).__name__,
+                str(exc),
+            )
+        else:
+            log.warning(
+                "Version check failed error=%s message=%r",
+                type(exc).__name__,
+                str(exc),
+            )
 
 
 def version_text():
@@ -3707,24 +3815,32 @@ async def monitor_cycle():
         get_server_status(snapshot)["players"]
         for snapshot in fresh.values()
     )
-    complete_success = (
+    success_ratio = (
+        1.0 if unique_count == 0
+        else len(fresh) / unique_count
+    )
+    presence_healthy = (
         unique_count == 0
         or (
-            len(fresh) == unique_count
-            and failures == 0
+            len(fresh) > 0
             and skipped == 0
+            and service_failures == 0
             and not circuit_opened
+            and success_ratio >= KEEPER_PRESENCE_MIN_SUCCESS_RATIO
         )
     )
-    if complete_success:
+    if presence_healthy:
         LAST_GOOD_PRESENCE_PLAYERS = player_total
         log.info(
-            "Presence aggregate updated players=%s complete_success=True",
+            "Presence aggregate updated players=%s healthy=True "
+            "success_ratio=%.4f isolated_failures=%s",
             player_total,
+            success_ratio,
+            isolated_failures,
         )
     else:
         log.info(
-            "Presence aggregate retained players=%s reason=incomplete_cycle "
+            "Presence aggregate retained players=%s reason=unhealthy_cycle "
             "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s",
             LAST_GOOD_PRESENCE_PLAYERS,
             len(fresh),
@@ -3768,8 +3884,13 @@ async def monitor_loop():
             await monitor_cycle()
         except Exception as exc:
             log.error("Monitor cycle fatal error=%s message=%r", type(exc).__name__, str(exc))
-        # Schedule from completion so long cycles never trigger catch-up bursts.
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        # Schedule from completion and enforce a recovery window between large
+        # Keeper sweeps. This is a total post-cycle idle, not an added delay.
+        log.info(
+            "Monitor inter-sweep cooldown seconds=%s",
+            KEEPER_INTER_SWEEP_COOLDOWN_SECONDS,
+        )
+        await asyncio.sleep(KEEPER_INTER_SWEEP_COOLDOWN_SECONDS)
 
 
 async def presence_loop():
