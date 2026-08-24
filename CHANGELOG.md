@@ -4,6 +4,22 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
+## [v2.6.6-pr2] - 2026-08-23
+
+### Keeper pacing selected
+- Promoted the validated single-worker Keeper pacing to `EXTERNAL_REQUESTS_PER_SECOND=0.33`, `KEEPER_BATCH_SIZE=40`, `KEEPER_BATCH_PAUSE_SECONDS=120`, and `KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=120`.
+- The controlled `40 / 120 / 120` endurance run did not reproduce the previous Keeper HTTP 403/429 wall.
+- Preserved the PR1 consecutive-403 flood detector, per-server 403 cooldown, service-failure circuit breaker, and global GUID deduplication.
+
+### Improved
+- Default BF4 servers are now placed at the front of every deduplicated Keeper sweep, improving responsiveness for announcement-critical and watched-player servers without increasing request volume.
+- `/delserver` now offers guild-scoped bulk deletion of all non-default PC, PlayStation, or Xbox servers. Default servers are always skipped and reported rather than removed.
+- Explicitly watched players discovered during the initial startup baseline now receive a one-time informational `currently online` alert. Ordinary baseline join spam remains suppressed, and startup alerts are deduplicated using the existing watch/session alert table.
+- Startup-baseline persona enrichment remains able to resolve a watched identity before issuing the one-time informational alert. Recovery baselines after transient Keeper/network gaps do not generate startup-online alerts.
+
+### Database
+- No Alembic migration is required for PR2.
+
 ## [v2.6.6-pr1] - 2026-08-21
 
 ### Experimental Keeper pacing

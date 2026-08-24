@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.6-pr1"
+BOT_VERSION = "v2.6.6-pr2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -140,15 +140,15 @@ KEEPER_SERVER_403_BACKOFF_SECONDS = max(
 )
 KEEPER_INTER_SWEEP_COOLDOWN_SECONDS = max(
     CHECK_INTERVAL_SECONDS,
-    int(os.getenv("KEEPER_INTER_SWEEP_COOLDOWN_SECONDS", "300")),
+    int(os.getenv("KEEPER_INTER_SWEEP_COOLDOWN_SECONDS", "120")),
 )
 KEEPER_BATCH_SIZE = max(
     1,
-    int(os.getenv("KEEPER_BATCH_SIZE", "60")),
+    int(os.getenv("KEEPER_BATCH_SIZE", "40")),
 )
 KEEPER_BATCH_PAUSE_SECONDS = max(
     0,
-    int(os.getenv("KEEPER_BATCH_PAUSE_SECONDS", "60")),
+    int(os.getenv("KEEPER_BATCH_PAUSE_SECONDS", "120")),
 )
 KEEPER_403_FLOOD_THRESHOLD = max(
     2,
@@ -170,6 +170,7 @@ PLAYER_ENRICHMENT_QUEUED: set[str] = set()
 PLAYER_ENRICHMENT_RETRY_AFTER: dict[str, float] = {}
 PLAYER_ENRICHMENT_PENDING_SESSIONS: dict[str, set[int]] = {}
 PLAYER_ENRICHMENT_ALERT_ELIGIBLE: set[int] = set()
+PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE: set[int] = set()
 PLAYER_ENRICHMENT_FAILURE_BACKOFF_SECONDS = 600
 PLAYER_ENRICHMENT_NO_PROGRESS_STREAK: dict[str, int] = {}
 PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS = (600, 1200, 1800, 3600)
@@ -2340,11 +2341,16 @@ def queue_player_enrichment(
     session_ids: list[int] | set[int],
     *,
     alerts_allowed: bool,
+    startup_alerts: bool = False,
 ):
     pending = PLAYER_ENRICHMENT_PENDING_SESSIONS.setdefault(server_guid, set())
     pending.update(int(value) for value in session_ids)
     if alerts_allowed:
         PLAYER_ENRICHMENT_ALERT_ELIGIBLE.update(int(value) for value in session_ids)
+    if startup_alerts:
+        PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.update(
+            int(value) for value in session_ids
+        )
     if server_guid not in PLAYER_ENRICHMENT_QUEUED:
         PLAYER_ENRICHMENT_QUEUE.append(server_guid)
         PLAYER_ENRICHMENT_QUEUED.add(server_guid)
@@ -2364,8 +2370,8 @@ def clean_alert_value(value: str) -> str:
     )
 
 
-async def evaluate_player_watch_alerts(session_id: int):
-    """Evaluate one newly-created/recently-enriched session against guild watches."""
+async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool = False):
+    """Evaluate one session against guild watches and deduplicate delivery."""
     with SessionLocal() as session:
         player_session = session.get(BF4PlayerSession, int(session_id))
         if player_session is None:
@@ -2479,10 +2485,16 @@ async def evaluate_player_watch_alerts(session_id: int):
             if normalize_player_name(watched_name) != normalize_player_name(current_name)
             else ""
         )
-        content = (
-            f'Attention {mention} - player "{watched_name}" has joined '
-            f'"{server_display}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
-        )
+        if startup_current:
+            content = (
+                f'Attention {mention} - 🎯 player "{watched_name}" is currently online '
+                f'on "{server_display}"{as_text}.'
+            )
+        else:
+            content = (
+                f'Attention {mention} - player "{watched_name}" has joined '
+                f'"{server_display}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
+            )
 
         try:
             message = await channel.send(
@@ -2527,7 +2539,7 @@ async def evaluate_player_watch_alerts(session_id: int):
                     )
             sent += 1
             log.info(
-                "Watched player alert posted guild=%s channel=%s message=%s server=%s session=%s watched_name=%r current_name=%r persona=%s",
+                "Watched player alert posted guild=%s channel=%s message=%s server=%s session=%s watched_name=%r current_name=%r persona=%s startup_current=%s",
                 guild.id,
                 channel.id,
                 message.id,
@@ -2536,6 +2548,7 @@ async def evaluate_player_watch_alerts(session_id: int):
                 item["watched_name"],
                 item["player_name"],
                 item["persona_id"],
+                startup_current,
             )
         except Exception as exc:
             log.error(
@@ -2586,6 +2599,7 @@ async def process_player_persona_enrichment():
             PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
             for session_id in stale_ids:
                 PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(int(session_id))
+                PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.discard(int(session_id))
             continue
 
         PLAYER_ENRICHMENT_PENDING_SESSIONS[guid] = set(pending_ids)
@@ -2773,7 +2787,13 @@ async def process_player_persona_enrichment():
                     )
 
                 for session_id in sorted(matched_ids):
-                    if session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
+                    if session_id in PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE:
+                        await evaluate_player_watch_alerts(
+                            session_id, startup_current=True
+                        )
+                        PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.discard(session_id)
+                        PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
+                    elif session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
                         await evaluate_player_watch_alerts(session_id)
                         PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
 
@@ -2863,10 +2883,9 @@ async def process_player_history(
     sessions_created = sessions_closed = joins_alerted = 0
     baselines = 0
     for guid, snapshot in fresh.items():
-        baseline = (
-            guid not in PLAYER_ROSTER_BASELINED
-            or guid in PLAYER_ROSTER_RECOVERY_REQUIRED
-        )
+        initial_baseline = guid not in PLAYER_ROSTER_BASELINED
+        recovery_baseline = guid in PLAYER_ROSTER_RECOVERY_REQUIRED
+        baseline = initial_baseline or recovery_baseline
         now = utcnow()
         roster_names = authoritative_roster_names(snapshot)
         current = {
@@ -2986,7 +3005,14 @@ async def process_player_history(
                 guid,
                 enrichment_ids,
                 alerts_allowed=not baseline,
+                startup_alerts=initial_baseline,
             )
+
+        if initial_baseline:
+            for session_id in new_session_ids:
+                joins_alerted += await evaluate_player_watch_alerts(
+                    session_id, startup_current=True
+                )
 
         if baseline:
             baselines += 1
@@ -3634,7 +3660,14 @@ async def monitor_cycle():
 
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
-        unique_guids = sorted({row.server_guid for row in relations})
+        default_guids = {
+            row.server_guid for row in relations if row.is_default
+        }
+        all_guids = {row.server_guid for row in relations}
+        unique_guids = (
+            sorted(default_guids)
+            + sorted(all_guids - default_guids)
+        )
 
     references = len(relations)
     unique_count = len(unique_guids)
@@ -3642,12 +3675,13 @@ async def monitor_cycle():
 
     log.info(
         "Monitor cycle started references=%s unique_servers=%s "
-        "duplicate_lookups_avoided=%s lookup_workers=%s "
+        "duplicate_lookups_avoided=%s default_servers_first=%s lookup_workers=%s "
         "external_requests_per_second=%s keeper_batch_size=%s "
         "keeper_batch_pause_seconds=%s",
         references,
         unique_count,
         duplicate_avoided,
+        len(default_guids),
         EXTERNAL_LOOKUP_WORKERS,
         EXTERNAL_REQUESTS_PER_SECOND,
         KEEPER_BATCH_SIZE,
@@ -6025,35 +6059,151 @@ async def refreshserverhz_autocomplete(interaction, current):
     return command_choice_list(interaction.guild.id, current) if interaction.guild else []
 
 
-@tree.command(name="delserver", description="Delete a configured non-default server")
+@tree.command(name="delserver", description="Delete one server or all non-default servers on a platform")
+@app_commands.describe(server="Configured server, or a platform bulk-delete option")
 async def delserver(interaction: discord.Interaction, server: str):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
+
+    bulk_targets = {
+        "__all_pc__": ("PC", "PC"),
+        "__all_playstation__": ("PS4/5", "PlayStation"),
+        "__all_xbox__": ("XBox", "Xbox"),
+    }
+
     try:
+        if server in bulk_targets:
+            platform_value, platform_label = bulk_targets[server]
+            removed_names = []
+            skipped_defaults = []
+            with SessionLocal.begin() as session:
+                rows = session.execute(
+                    select(GuildServer, BF4Server)
+                    .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+                    .where(GuildServer.guild_id == interaction.guild.id)
+                ).all()
+                for gs, bf in rows:
+                    if normalize_platform_label(bf.platform) != platform_value:
+                        continue
+                    if gs.is_default:
+                        skipped_defaults.append(gs.display_name)
+                        continue
+                    state = session.get(
+                        GuildServerState,
+                        (interaction.guild.id, gs.server_guid),
+                    )
+                    if state:
+                        session.delete(state)
+                    removed_names.append(gs.display_name)
+                    session.delete(gs)
+
+            removed_names.sort(key=str.casefold)
+            skipped_defaults.sort(key=str.casefold)
+            if removed_names:
+                text = (
+                    f"✅ Removed **{len(removed_names)}** non-default {platform_label} "
+                    f"server{'s' if len(removed_names) != 1 else ''} from this guild."
+                )
+            else:
+                text = f"ℹ️ No non-default {platform_label} servers were available to remove."
+            if skipped_defaults:
+                shown = ", ".join(f"**{name}**" for name in skipped_defaults[:10])
+                if len(skipped_defaults) > 10:
+                    shown += f" and {len(skipped_defaults) - 10} more"
+                text += (
+                    f"\n⛔ Skipped {len(skipped_defaults)} default "
+                    f"server{'s' if len(skipped_defaults) != 1 else ''}: {shown}."
+                )
+
+            await interaction.followup.send(text, ephemeral=True)
+            audit_command(
+                guild=interaction.guild,
+                channel=interaction.channel,
+                user=interaction.user,
+                command_name="delserver",
+                command_type="slash",
+                success=True,
+                started=started,
+                result_code="bulk_removed",
+                target_type="platform",
+                target_id=platform_value,
+                target_name=platform_label,
+                metadata={
+                    "removed": len(removed_names),
+                    "skipped_defaults": len(skipped_defaults),
+                },
+            )
+            return
+
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
                 raise ValueError("server_not_found")
             if gs.is_default:
-                await interaction.followup.send("⛔ Remove this server from defaults first.", ephemeral=True)
-                audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=False, started=started, result_code="server_is_default", target_type="server", target_id=server, target_name=gs.display_name)
+                await interaction.followup.send(
+                    "⛔ Remove this server from defaults first.", ephemeral=True
+                )
+                audit_command(
+                    guild=interaction.guild, channel=interaction.channel,
+                    user=interaction.user, command_name="delserver",
+                    command_type="slash", success=False, started=started,
+                    result_code="server_is_default", target_type="server",
+                    target_id=server, target_name=gs.display_name,
+                )
                 return
             name = gs.display_name
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
                 session.delete(state)
             session.delete(gs)
-        await interaction.followup.send(f"✅ Removed **{name}** from this guild.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=True, started=started, result_code="removed", target_type="server", target_id=server, target_name=name)
+        await interaction.followup.send(
+            f"✅ Removed **{name}** from this guild.", ephemeral=True
+        )
+        audit_command(
+            guild=interaction.guild, channel=interaction.channel,
+            user=interaction.user, command_name="delserver", command_type="slash",
+            success=True, started=started, result_code="removed",
+            target_type="server", target_id=server, target_name=name,
+        )
     except Exception as exc:
         await interaction.followup.send("⚠️ Server removal failed.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="delserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        audit_command(
+            guild=interaction.guild, channel=interaction.channel,
+            user=interaction.user, command_name="delserver", command_type="slash",
+            success=False, started=started, result_code="failed", error=exc,
+            target_type="server", target_id=server,
+        )
 
 
 @delserver.autocomplete("server")
 async def delserver_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+    if not interaction.guild:
+        return []
+    needle = (current or "").casefold().strip()
+    bulk = [
+        app_commands.Choice(
+            name="Bulk: all non-default PC servers", value="__all_pc__"
+        ),
+        app_commands.Choice(
+            name="Bulk: all non-default PlayStation servers",
+            value="__all_playstation__",
+        ),
+        app_commands.Choice(
+            name="Bulk: all non-default Xbox servers", value="__all_xbox__"
+        ),
+    ]
+    choices = [
+        choice for choice in bulk
+        if not needle or needle in choice.name.casefold()
+    ]
+    for choice in command_choice_list(
+        interaction.guild.id, current, defaults=False
+    ):
+        if len(choices) >= 25:
+            break
+        choices.append(choice)
+    return choices[:25]
 
 
 @tree.command(name="renameserver", description="Rename a configured server for this guild")
