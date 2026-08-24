@@ -27,8 +27,6 @@ class GuildSettings(Base):
         primary_key=True, autoincrement=False
     )
     guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    announcement_channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    announcement_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     management_min_role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     management_min_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status_min_role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
@@ -160,17 +158,15 @@ class GuildPlayerWatch(Base):
     __tablename__ = "guild_player_watches"
     __table_args__ = (
         UniqueConstraint(
-            "guild_id", "server_guid", "normalized_name",
-            name="uq_guild_player_watch_name",
+            "guild_id", "platform", "normalized_name",
+            name="uq_guild_player_watch_platform_name",
         ),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     guild_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False
     )
-    server_guid: Mapped[str] = mapped_column(
-        String(36), ForeignKey("bf4_servers.server_guid"), nullable=False
-    )
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
     watched_name: Mapped[str] = mapped_column(String(255), nullable=False)
     normalized_name: Mapped[str] = mapped_column(String(255), nullable=False)
     persona_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -230,6 +226,9 @@ class GuildServerState(Base):
     announcement_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     announcement_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     announcement_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    player_eta_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    player_eta_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    player_eta_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class CommandAudit(Base):

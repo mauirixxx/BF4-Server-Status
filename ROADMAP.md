@@ -1,7 +1,7 @@
 # BF4 Server Watcher --- Roadmap
 
-> **Status:** Planning document\
-> **Last updated:** 2026-08-23\
+> **Status:** Source of truth / active roadmap\
+> **Last updated:** 2026-08-24\
 > **Project:** BF4 Server Watcher / Distributed BF4 Server Watcher
 
 This roadmap describes planned work from the `v2.6.6-pr2` pre-release
@@ -308,6 +308,21 @@ Requirements:
     selector:
 
     `All tracked servers already have a discovered tick rate.`
+
+## Rich-presence isolated-failure health policy
+
+Refine the player-count presence health rule so isolated per-server Keeper
+failures do not freeze an otherwise healthy aggregate.
+
+Requirements:
+
+-   Isolated Keeper snapshot failures such as HTTP 404 do **not** prevent
+    publishing the player total from successfully fetched snapshots.
+-   Continue retaining the previous known-good presence aggregate when a
+    genuine service/network failure pattern occurs.
+-   Circuit-breaker activation or mass skipped work remains unhealthy.
+-   This specifically prevents permanently/offline console GUIDs from
+    freezing rich presence while the rest of the tracked fleet is healthy.
 
 ## Remove obsolete legacy announcement columns
 

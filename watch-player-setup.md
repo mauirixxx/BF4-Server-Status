@@ -38,3 +38,7 @@ create a private Discord channel for the notifications.
 Player join history can be reviewed separately with `/playerhistory`.
 Disabling the watched-player alert channel does **not** delete existing
 player history or watches.
+
+## v2.7.0 watch scope
+
+A watch is stored once per Discord guild and BF4 platform family. The `server` choice in `/watchplayer` selects the platform; the watch then applies automatically to all current matching default servers in that guild. Adding/removing matching defaults changes the effective scope without requiring additional watch rows.

@@ -125,13 +125,13 @@ Suggested channel overrides:
 Manage watch rules with:
 
 ```text
-/watchplayer player:<name> server:<default server>
+/watchplayer player:<name> server:<default server used to select platform>
 /unwatchplayer watch:<selection>
 /watchedplayers
 /playerhistory player:<name> results:<1|5|10|ALL>
 ```
 
-The watch server list contains only current default servers. Player autocomplete is case-insensitive and a manually typed unseen player name is also accepted. A watched join pings the configured management role; if none is configured, it pings the guild owner.
+The server selector uses a current default server only to choose a platform family. The resulting watch applies dynamically to all current same-platform default servers in that guild, including matching defaults added later. Player autocomplete is case-insensitive and a manually typed unseen player name is also accepted. A watched join pings the configured management role; if none is configured, it pings the guild owner. When persona resolution is available, the watched-player name links to Battlelog and link previews remain suppressed.
 
 Normal Discord history results intentionally hide persona IDs. `ALL` exports a ZIP/CSV and includes persona ID when known.
 

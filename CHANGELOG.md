@@ -2,6 +2,30 @@
 
 All notable changes to BF4 Server Watcher are recorded here.
 
+## [v2.7.0] - 2026-08-24
+
+### Persistent player-list UX
+- Added a Discord-native next-refresh ETA message between each default-server map announcement and its persistent player list.
+- Normal ETA refreshes edit in place; map changes deliberately delete/repost ETA + player-list content after the new map announcement to preserve chronological layout.
+- Persistent player-list chunks now edit/reuse existing Discord messages where possible; only additional/excess chunks are posted/deleted when the chunk count changes.
+- Added a native Discord `Last updated` timestamp to the primary player-list header. The timestamp changes only when roster content changes and is excluded from the content hash.
+
+### Watched players
+- Redesigned watches as one guild + platform-family rule instead of one row per server. A watched PC/Xbox/PlayStation player now applies dynamically to all current same-platform default servers in that guild.
+- Added an Alembic migration that consolidates existing per-server duplicate watches while preserving alert history.
+- Watched-player names are clickable Battlelog profile links whenever a resolved persona ID is available; unresolved identities remain plain text and embeds stay suppressed.
+
+### UX / schema cleanup
+- Added dynamically sized dashed separators to automatic map announcements when a guild has multiple default servers.
+- `/refreshserverhz` now offers only servers whose tick rate is unresolved; if none remain it reports that all tracked servers already have a discovered tick rate.
+- Removed obsolete `guild_settings.announcement_channel_id` and `guild_settings.announcement_channel_name`; routing remains in `guild_announcement_channels` and per-default `guild_servers` fields.
+
+### Presence
+- Isolated Keeper failures such as server-specific HTTP 404s no longer freeze the aggregate rich-presence player count. Genuine service/network failures, skipped sweeps, and circuit-breaker events still retain the previous known-good aggregate.
+
+### Preserved polling policy
+- Retains the validated PR2 pacing: `EXTERNAL_REQUESTS_PER_SECOND=0.33`, `KEEPER_BATCH_SIZE=40`, `KEEPER_BATCH_PAUSE_SECONDS=120`, and `KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=120`.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. v2.0.0 is a major architecture release.
 
 ## [v2.6.6-pr2] - 2026-08-23

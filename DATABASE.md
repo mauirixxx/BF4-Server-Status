@@ -92,7 +92,9 @@ message_id
 content_hash
 ```
 
-The table stores Discord/configuration state only. Live player roster/stat data is intentionally not persisted. `content_hash` is a deterministic fingerprint of the complete rendered roster and is repeated across that roster's chunk rows so unchanged displays can avoid Discord post/delete churn.
+The table stores Discord/configuration state only. Live player roster/stat data is intentionally not persisted. `content_hash` is a deterministic fingerprint of roster data only; the v2.7.0 `Last updated` timestamp is intentionally excluded so an unchanged roster does not force an edit.
+
+v2.7.0 also stores the persistent player-list ETA message on `guild_server_state` using `player_eta_channel_id`, `player_eta_channel_name`, and `player_eta_message_id`. Ordinary refreshes edit that ETA in place. Map changes clear/recreate ETA + roster messages after the new announcement to preserve Discord chronology.
 
 Fresh BFLIST/player-detail results are volatile per-monitor-cycle data and are deduplicated by unique BF4 server before being reused across guild displays.
 
@@ -120,7 +122,7 @@ announcement_channel_name
 
 for the destination used while that relationship is a default server. Map-change announcements and optional persistent player rosters use this per-server assignment.
 
-Alembic revision `0006_v2_3_0` copies any existing nonzero legacy `guild_settings.announcement_channel_id/name` into `guild_announcement_channels` and assigns it to the guild's existing default servers. The legacy columns remain present for migration/backward-reading safety but are no longer used for normal v2.3.0 routing.
+Alembic revision `0006_v2_3_0` copies any existing nonzero legacy `guild_settings.announcement_channel_id/name` into `guild_announcement_channels` and assigns it to the guild's existing default servers. Alembic revision `0009_v2_7_0` removes those obsolete `guild_settings` columns after verifying normal routing uses the replacement tables/fields.
 
 
 ## Global Battlelog tick-rate metadata (v2.4.0)
@@ -151,6 +153,6 @@ It also adds global `bf4_player_sessions` history. One physical session represen
 
 `bf4_player_aliases` records observed names for authoritative `(platform, persona_id)` identities with first/last-seen timestamps. Persona ID is authoritative when available; normalized case-insensitive name is the fallback identity when it is not.
 
-`guild_player_watches` stores guild-scoped watch rules for a specific BF4 server, preserving the administrator's originally watched name even after persona-ID resolution/name changes. `guild_player_watch_alerts` deduplicates a watch against a player session so one join cannot produce repeated alerts for the same rule.
+`guild_player_watches` originally stored one guild-scoped rule per BF4 server. Alembic revision `0009_v2_7_0` changes that model to one rule per guild + platform family (`PC`, `PS4/5`, or `XBox`) and consolidates duplicate per-server rules while preserving alert history. At runtime, each rule dynamically applies to all current same-platform default servers in that guild. `guild_player_watch_alerts` continues to deduplicate a watch against a player session so one session cannot produce repeated alerts for the same semantic rule.
 
 History is retained indefinitely by v2.5.0. `/playerhistory ALL` filters global history through the requesting guild's configured-server relationships and creates a ZIP/CSV containing `server_name`, `server_guid`, `map_name`, `persona_id`, `player_name`, `time_joined`, `last_seen`, and `time_left`.

@@ -1,8 +1,32 @@
-# BF4 Server Watcher v2.6.6-pr2 — Release Instructions
+# BF4 Server Watcher v2.7.0 — Release Instructions
 
-## PR2 Keeper settings
+## GitHub workflow
 
-Confirm the deployment `.env` contains:
+```bash
+cd ~/bf4-server-status
+git status
+git add .
+git status
+git commit -m "Release BF4 Server Watcher v2.7.0"
+git push origin main
+git tag -a v2.7.0 -m "BF4 Server Watcher v2.7.0"
+git push origin v2.7.0
+git status
+```
+
+## Database backup before upgrade
+
+`v2.7.0` includes a schema migration that consolidates watched-player rows by platform and removes obsolete columns. Take a PostgreSQL backup before deployment:
+
+```bash
+pg_dump -h localhost -p 5432 -U bf4_serverwatcher -d bf4_serverwatcher -Fc -f /tmp/bf4_serverwatcher-pre-v2.7.0.dump
+```
+
+Keep the dump until the upgraded bot has completed migrations and functional checks.
+
+## Production pacing
+
+Keep these values in the live `.env`:
 
 ```env
 EXTERNAL_REQUESTS_PER_SECOND=0.33
@@ -11,27 +35,9 @@ KEEPER_BATCH_PAUSE_SECONDS=120
 KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=120
 ```
 
-Do not copy `.env.example` over the live `.env`; update only the intended values while preserving the live Discord token, database URL, and other deployment-specific settings.
-
-## GitHub release workflow
-
-From the local repository after copying/reconciling the PR2 release files:
-
-```bash
-cd ~/bf4-server-status
-git status
-git add .
-git status
-git commit -m "Release BF4 Server Watcher v2.6.6-pr2"
-git push origin main
-git tag -a v2.6.6-pr2 -m "BF4 Server Watcher v2.6.6-pr2"
-git push origin v2.6.6-pr2
-git status
-```
+Do not replace the live `.env` with `.env.example`.
 
 ## Docker deployment
-
-On the production Docker host:
 
 ```bash
 cd /opt/bf4-serverstatus
@@ -41,18 +47,15 @@ docker compose up -d
 docker logs -f BF4_ServerWatcher
 ```
 
-At startup, verify the log reports `version=v2.6.6-pr2` and the monitor-cycle configuration shows:
+Alembic runs automatically at container startup. v2.7.0 includes migration `0009_v2_7_0`.
 
-```text
-external_requests_per_second=0.33
-keeper_batch_size=40
-keeper_batch_pause_seconds=120
-```
+Verify startup reports `version=v2.7.0`, then confirm normal monitor cycles use `keeper_batch_size=40`, `keeper_batch_pause_seconds=120`, and the post-sweep cooldown is 120 seconds.
 
-After a completed sweep, verify:
+Recommended functional checks after upgrade:
 
-```text
-Monitor inter-sweep cooldown seconds=120
-```
-
-Default-server priority is visible in the monitor-start summary as `default_servers_first=<count>`.
+- Verify existing watched-player rules were consolidated by platform and `/watchedplayers` looks correct.
+- Verify a player-list-enabled default shows announcement → ETA → player list in that order.
+- Verify a normal roster change edits the player-list message rather than replacing it.
+- Verify a map change recreates ETA/player-list messages below the new map announcement.
+- Verify `/refreshserverhz` only offers unresolved tick-rate servers.
+- Verify rich presence continues updating when one or more servers return isolated Keeper 404s.

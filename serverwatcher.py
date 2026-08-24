@@ -44,7 +44,7 @@ from models import (
     MigrationState,
 )
 
-BOT_VERSION = "v2.6.6-pr2"
+BOT_VERSION = "v2.7.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -154,10 +154,6 @@ KEEPER_403_FLOOD_THRESHOLD = max(
     2,
     int(os.getenv("KEEPER_403_FLOOD_THRESHOLD", "3")),
 )
-KEEPER_PRESENCE_MIN_SUCCESS_RATIO = min(
-    1.0,
-    max(0.5, float(os.getenv("KEEPER_PRESENCE_MIN_SUCCESS_RATIO", "0.99"))),
-)
 VERSION_CACHE_SECONDS = 24 * 60 * 60
 VERSION_CACHE_PATH = RUNTIME_DIR / "version-check-cache.json"
 watcher_started = False
@@ -266,6 +262,23 @@ def normalize_platform_label(value) -> str:
         "unknown": "Unknown",
     }
     return aliases.get(normalized, str(value or "").strip() or "Unknown")
+
+
+def battlelog_player_profile_url(player_name: str, persona_id: int | None, platform: str) -> str | None:
+    if persona_id is None:
+        return None
+    family = normalize_platform_label(platform)
+    platform_path = {"PC": "pc", "PS4/5": "ps4", "XBox": "xboxone"}.get(family)
+    if not platform_path:
+        return None
+    return (
+        "https://battlelog.battlefield.com/bf4/soldier/"
+        f"{quote(str(player_name or 'player'), safe='')}/stats/{int(persona_id)}/{platform_path}/"
+    )
+
+
+def markdown_link_label(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
 def parse_battlelog_server_url(value):
@@ -722,11 +735,24 @@ def build_status_message(
     return content + (f"\n\n{warning}" if warning else "")
 
 
+def visible_discord_line_length(value: str) -> int:
+    """Approximate rendered Discord text width without markup/hidden IDs."""
+    text = str(value or "")
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    text = re.sub(r"<@&\d+>", "@role", text)
+    text = re.sub(r"<@!?\d+>", "@user", text)
+    text = re.sub(r"<#[0-9]+>", "#channel", text)
+    text = re.sub(r"<a?:[A-Za-z0-9_]+:[0-9]+>", "😀", text)
+    text = text.replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
+    return len(text)
+
+
 def build_map_announcement(
     server_name: str,
     status: dict,
     role_line: str | None = None,
     tick_rate_hz: int | None = None,
+    add_separator: bool = False,
 ) -> str:
     """Build one complete automatic map-change message."""
     lines = ["🎮 **BF4 Map Change**"]
@@ -739,6 +765,9 @@ def build_map_announcement(
     ])
     if tick_rate_hz is not None:
         lines.append(f"⚡ Tick Rate: **{tick_rate_hz} Hz**")
+    if add_separator:
+        width = max(12, min(80, max(visible_discord_line_length(line) for line in lines)))
+        lines.append("-" * width)
     return "\n".join(lines)
 
 
@@ -1049,15 +1078,6 @@ def sync_guild_settings_names(
     """Refresh informational Discord names while keeping IDs authoritative."""
     settings.guild_name = discord_guild.name
 
-    announcement = (
-        discord_guild.get_channel(int(settings.announcement_channel_id))
-        if settings.announcement_channel_id
-        else None
-    )
-    settings.announcement_channel_name = (
-        announcement.name if announcement is not None else None
-    )
-
     management_role = (
         discord_guild.get_role(int(settings.management_min_role_id))
         if settings.management_min_role_id
@@ -1238,8 +1258,6 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
             settings = GuildSettings(
                 guild_id=discord_guild.id,
                 guild_name=discord_guild.name,
-                announcement_channel_id=0,
-                announcement_channel_name=None,
                 management_min_role_id=0,
                 management_min_role_name=None,
                 status_min_role_id=0,
@@ -1688,6 +1706,13 @@ async def prepare_management(interaction: discord.Interaction):
     return True
 
 
+def current_unique_server_count() -> int:
+    with SessionLocal() as session:
+        return int(
+            session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
+        )
+
+
 def command_choice_list(guild_id: int, current: str, *, defaults=None):
     needle = current.casefold().strip()
     result = []
@@ -1738,19 +1763,14 @@ def player_name_choices(guild_id: int, current: str):
 def watched_player_choices(guild_id: int, current: str):
     needle = normalize_player_name(current)
     with SessionLocal() as session:
-        rows = session.execute(
-            select(GuildPlayerWatch, GuildServer)
-            .join(
-                GuildServer,
-                (GuildServer.guild_id == GuildPlayerWatch.guild_id)
-                & (GuildServer.server_guid == GuildPlayerWatch.server_guid),
-            )
+        rows = session.scalars(
+            select(GuildPlayerWatch)
             .where(GuildPlayerWatch.guild_id == guild_id)
-            .order_by(GuildServer.display_name, GuildPlayerWatch.watched_name)
+            .order_by(GuildPlayerWatch.platform, GuildPlayerWatch.watched_name)
         ).all()
     choices = []
-    for watch, gs in rows:
-        label = f'{watch.watched_name} — {gs.display_name}'
+    for watch in rows:
+        label = f"{watch.watched_name} — all {watch.platform} defaults"
         if needle and needle not in normalize_player_name(label):
             continue
         choices.append(app_commands.Choice(name=label[:100], value=str(watch.id)))
@@ -2057,7 +2077,6 @@ def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
                 settings = GuildSettings(guild_id=target.id)
                 session.add(settings)
             legacy_announcement_channel_id = int(config.get("announcement_channel_id", 0) or 0)
-            settings.announcement_channel_id = legacy_announcement_channel_id
             settings.management_min_role_id = int(config.get("management_min_role_id", 0) or 0)
             settings.status_min_role_id = int(config.get("status_min_role_id", 0) or 0)
 
@@ -2376,9 +2395,10 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
         player_session = session.get(BF4PlayerSession, int(session_id))
         if player_session is None:
             return 0
+        session_platform = normalize_platform_label(player_session.platform)
         watch_rows = session.scalars(
             select(GuildPlayerWatch).where(
-                GuildPlayerWatch.server_guid == player_session.server_guid
+                GuildPlayerWatch.platform == session_platform
             )
         ).all()
         detached = []
@@ -2414,6 +2434,7 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
                     "watched_name": watch.watched_name,
                     "watch_persona_id": watch.persona_id,
                     "watch_normalized_name": watch.normalized_name,
+                    "platform": watch.platform,
                     "server_name": gs.display_name,
                     "server_url": (
                         battlelog_server_url_for(
@@ -2468,6 +2489,13 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
         )
         watched_name = clean_alert_value(item["watched_name"])
         current_name = clean_alert_value(item["player_name"])
+        profile_url = battlelog_player_profile_url(
+            current_name, item.get("persona_id") or item.get("watch_persona_id"), item.get("platform")
+        )
+        watched_display = (
+            f'[{markdown_link_label(watched_name)}]({profile_url})'
+            if profile_url else watched_name
+        )
         server_name = clean_alert_value(item["server_name"])
         server_link_name = (
             server_name.replace("\\", "\\\\")
@@ -2487,12 +2515,12 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
         )
         if startup_current:
             content = (
-                f'Attention {mention} - 🎯 player "{watched_name}" is currently online '
+                f'Attention {mention} - 🎯 player "{watched_display}" is currently online '
                 f'on "{server_display}"{as_text}.'
             )
         else:
             content = (
-                f'Attention {mention} - player "{watched_name}" has joined '
+                f'Attention {mention} - player "{watched_display}" has joined '
                 f'"{server_display}"{as_text} on <t:{joined_unix}:D> @ <t:{joined_unix}:t>'
             )
 
@@ -2519,7 +2547,7 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
                     duplicate = session.scalar(
                         select(GuildPlayerWatch).where(
                             GuildPlayerWatch.guild_id == watch.guild_id,
-                            GuildPlayerWatch.server_guid == watch.server_guid,
+                            GuildPlayerWatch.platform == watch.platform,
                             GuildPlayerWatch.persona_id == item["persona_id"],
                             GuildPlayerWatch.id != watch.id,
                         )
@@ -2691,7 +2719,7 @@ async def process_player_persona_enrichment():
 
                         watches = session.scalars(
                             select(GuildPlayerWatch).where(
-                                GuildPlayerWatch.server_guid == guid,
+                                GuildPlayerWatch.platform == platform,
                                 GuildPlayerWatch.persona_id.is_(None),
                                 GuildPlayerWatch.normalized_name
                                 == normalize_player_name(current_name),
@@ -2701,8 +2729,7 @@ async def process_player_persona_enrichment():
                             duplicate = session.scalar(
                                 select(GuildPlayerWatch).where(
                                     GuildPlayerWatch.guild_id == watch.guild_id,
-                                    GuildPlayerWatch.server_guid
-                                    == watch.server_guid,
+                                    GuildPlayerWatch.platform == watch.platform,
                                     GuildPlayerWatch.persona_id == persona_id,
                                     GuildPlayerWatch.id != watch.id,
                                 )
@@ -3104,6 +3131,12 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         state = session.get(GuildServerState, (guild_id, gs.server_guid))
         global_server = session.get(BF4Server, gs.server_guid)
         tick_rate_hz = global_server.tick_rate_hz if global_server else None
+        default_count = session.scalar(
+            select(func.count()).select_from(GuildServer).where(
+                GuildServer.guild_id == guild_id,
+                GuildServer.is_default.is_(True),
+            )
+        ) or 0
         old_channel = state.announcement_channel_id if state else None
         old_message = state.announcement_message_id if state else None
     if old_channel and old_message:
@@ -3120,6 +3153,7 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
                 status,
                 role_line=role_line,
                 tick_rate_hz=tick_rate_hz,
+                add_separator=default_count > 1,
             ),
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
@@ -3127,6 +3161,10 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
                 everyone=False,
             ),
         )
+        if map_change and gs.include_users and guild is not None:
+            # New announcement is now in place. Remove the older ETA/roster so
+            # their replacements will be posted below this announcement.
+            await clear_persistent_player_stack(guild, gs.server_guid)
         with SessionLocal.begin() as session:
             state = session.get(GuildServerState, (guild_id, gs.server_guid))
             if state is None:
@@ -3161,6 +3199,7 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
 
 
 def rendered_roster_hash(chunks: list[str]) -> str:
+    """Hash roster data only; timestamps are intentionally excluded."""
     payload = "\x1e".join(chunks).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -3187,6 +3226,31 @@ def persistent_roster_chunks(
     if not teams:
         teams = keeper_team_rosters(snapshot)
     return compact_roster_messages(teams, gs.display_name)
+
+
+def roster_chunks_with_last_updated(chunks: list[str], updated_unix: int) -> list[str]:
+    """Add the native Discord timestamp to the primary roster header only."""
+    if not chunks:
+        return []
+    rendered = list(chunks)
+    first, sep, rest = rendered[0].partition("\n")
+    first = f"{first} — **Last updated <t:{updated_unix}:F>**"
+    rendered[0] = first + (sep + rest if sep else "")
+    return rendered
+
+
+def next_player_display_eta_unix(unique_count: int) -> int:
+    """Approximate the next display refresh from the configured pacing."""
+    batches = max(1, (max(0, unique_count) + KEEPER_BATCH_SIZE - 1) // KEEPER_BATCH_SIZE)
+    request_span = max(0.0, (max(0, unique_count) - 1) * EXTERNAL_REQUEST_INTERVAL_SECONDS)
+    batch_pauses = max(0, batches - 1) * KEEPER_BATCH_PAUSE_SECONDS
+    # Allow a small post-fetch budget for announcements/history/roster work.
+    estimate = KEEPER_INTER_SWEEP_COOLDOWN_SECONDS + request_span + batch_pauses + 45
+    return int((utcnow() + timedelta(seconds=estimate)).timestamp())
+
+
+def player_eta_content(next_update_unix: int) -> str:
+    return f"Next playerlist update at *approximately* <t:{next_update_unix}:F>"
 
 
 def player_message_rows(guild_id: int, server_guid: str | None = None):
@@ -3240,46 +3304,22 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
             await message.delete()
             deleted += 1
             log.debug(
-                "Deleted player display message guild=%s server=%s channel=%s "
-                "message=%s chunk=%s",
-                guild.id,
-                row["server_guid"],
-                channel.id,
-                row["message_id"],
-                row["chunk_index"],
+                "Deleted player display message guild=%s server=%s channel=%s message=%s chunk=%s",
+                guild.id, row["server_guid"], channel.id, row["message_id"], row["chunk_index"],
             )
         except discord.NotFound:
             deleted += 1
-            log.debug(
-                "Player display message already absent guild=%s server=%s "
-                "channel=%s message=%s chunk=%s",
-                guild.id,
-                row["server_guid"],
-                channel.id,
-                row["message_id"],
-                row["chunk_index"],
-            )
         except discord.Forbidden:
             failed += 1
             log.warning(
-                "Forbidden deleting player display message guild=%s server=%s "
-                "channel=%s message=%s",
-                guild.id,
-                row["server_guid"],
-                channel.id,
-                row["message_id"],
+                "Forbidden deleting player display message guild=%s server=%s channel=%s message=%s",
+                guild.id, row["server_guid"], channel.id, row["message_id"],
             )
         except Exception as exc:
             failed += 1
             log.error(
-                "Player display message delete failed guild=%s server=%s "
-                "channel=%s message=%s error=%s message_text=%r",
-                guild.id,
-                row["server_guid"],
-                channel.id,
-                row["message_id"],
-                type(exc).__name__,
-                str(exc),
+                "Player display message delete failed guild=%s server=%s channel=%s message=%s error=%s message_text=%r",
+                guild.id, row["server_guid"], channel.id, row["message_id"], type(exc).__name__, str(exc),
             )
     return deleted, failed
 
@@ -3295,26 +3335,56 @@ async def clear_persistent_player_display(
             GuildServerPlayerMessage.guild_id == guild.id
         )
         if server_guid is not None:
-            stmt = stmt.where(
-                GuildServerPlayerMessage.server_guid == server_guid
-            )
+            stmt = stmt.where(GuildServerPlayerMessage.server_guid == server_guid)
         session.execute(stmt)
     if rows:
         log.info(
             "Player display cleared guild=%s server=%s rows=%s deleted=%s failed=%s",
-            guild.id,
-            server_guid or "all",
-            len(rows),
-            deleted,
-            failed,
+            guild.id, server_guid or "all", len(rows), deleted, failed,
         )
     return deleted, failed
 
 
-async def player_display_messages_exist(
-    guild: discord.Guild,
-    rows,
-) -> bool:
+async def clear_persistent_player_eta(guild: discord.Guild, server_guid: str) -> tuple[int, int]:
+    with SessionLocal() as session:
+        state = session.get(GuildServerState, (guild.id, server_guid))
+        channel_id = int(state.player_eta_channel_id or 0) if state else 0
+        message_id = int(state.player_eta_message_id or 0) if state else 0
+    deleted = failed = 0
+    if channel_id and message_id:
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            failed = 1
+        else:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.delete()
+                deleted = 1
+            except discord.NotFound:
+                deleted = 1
+            except Exception as exc:
+                failed = 1
+                log.warning(
+                    "Player ETA delete failed guild=%s server=%s channel=%s message=%s error=%s",
+                    guild.id, server_guid, channel_id, message_id, type(exc).__name__,
+                )
+    with SessionLocal.begin() as session:
+        state = session.get(GuildServerState, (guild.id, server_guid))
+        if state:
+            state.player_eta_channel_id = None
+            state.player_eta_channel_name = None
+            state.player_eta_message_id = None
+    return deleted, failed
+
+
+async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) -> None:
+    """Remove ETA and roster so a map-change announcement can be posted first."""
+    await clear_persistent_player_eta(guild, server_guid)
+    await clear_persistent_player_display(guild, server_guid)
+    PLAYER_DISPLAY_VALIDATED.discard((guild.id, server_guid))
+
+
+async def player_display_messages_exist(guild: discord.Guild, rows) -> bool:
     for row in rows:
         channel = guild.get_channel(int(row["channel_id"]))
         if channel is None:
@@ -3325,13 +3395,8 @@ async def player_display_messages_exist(
             return False
         except Exception as exc:
             log.warning(
-                "Player display validation failed guild=%s server=%s "
-                "channel=%s message=%s error=%s",
-                guild.id,
-                row["server_guid"],
-                row["channel_id"],
-                row["message_id"],
-                type(exc).__name__,
+                "Player display validation failed guild=%s server=%s channel=%s message=%s error=%s",
+                guild.id, row["server_guid"], row["channel_id"], row["message_id"], type(exc).__name__,
             )
             return False
     return True
@@ -3340,98 +3405,140 @@ async def player_display_messages_exist(
 PLAYER_DISPLAY_VALIDATED: set[tuple[int, str]] = set()
 
 
+async def upsert_player_eta(
+    guild: discord.Guild,
+    gs: GuildServer,
+    channel: discord.TextChannel,
+    next_update_unix: int,
+) -> str:
+    """Edit the ETA in place during normal refreshes; post only if absent/moved."""
+    content = player_eta_content(next_update_unix)
+    with SessionLocal() as session:
+        state = session.get(GuildServerState, (guild.id, gs.server_guid))
+        old_channel_id = int(state.player_eta_channel_id or 0) if state else 0
+        old_message_id = int(state.player_eta_message_id or 0) if state else 0
+
+    if old_channel_id == channel.id and old_message_id:
+        try:
+            message = await channel.fetch_message(old_message_id)
+            await message.edit(content=content)
+            return "edited"
+        except discord.NotFound:
+            pass
+        except Exception as exc:
+            log.warning(
+                "Player ETA edit failed guild=%s server=%s message=%s error=%s message_text=%r",
+                guild.id, gs.server_guid, old_message_id, type(exc).__name__, str(exc),
+            )
+    elif old_channel_id and old_message_id:
+        await delete_discord_message(guild.id, old_channel_id, old_message_id)
+
+    message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+    with SessionLocal.begin() as session:
+        state = session.get(GuildServerState, (guild.id, gs.server_guid))
+        if state is None:
+            state = GuildServerState(
+                guild_id=guild.id,
+                guild_name=guild.name,
+                server_guid=gs.server_guid,
+            )
+            session.add(state)
+        state.guild_name = guild.name
+        state.player_eta_channel_id = channel.id
+        state.player_eta_channel_name = channel.name
+        state.player_eta_message_id = message.id
+    log.debug(
+        "Player ETA posted guild=%s server=%s channel=%s message=%s next=%s",
+        guild.id, gs.server_guid, channel.id, message.id, next_update_unix,
+    )
+    return "posted"
+
+
 async def update_persistent_player_display(
     guild: discord.Guild,
     gs: GuildServer,
     bf: BF4Server,
     snapshot: dict,
     bflist_server: dict | None,
+    next_update_unix: int,
 ) -> dict:
-    channel = (
-        guild.get_channel(int(gs.announcement_channel_id))
-        if gs.announcement_channel_id
-        else None
-    )
+    channel = guild.get_channel(int(gs.announcement_channel_id)) if gs.announcement_channel_id else None
     if not isinstance(channel, discord.TextChannel):
         old_rows = player_message_rows(guild.id, gs.server_guid)
         if old_rows:
-            await clear_persistent_player_display(guild, gs.server_guid)
+            await clear_persistent_player_stack(guild, gs.server_guid)
         log.warning(
-            "Player display skipped unresolved announcement channel guild=%s "
-            "server=%s channel=%s",
-            guild.id,
-            gs.server_guid,
-            gs.announcement_channel_id,
+            "Player display skipped unresolved announcement channel guild=%s server=%s channel=%s",
+            guild.id, gs.server_guid, gs.announcement_channel_id,
         )
-        return {"result": "no_channel", "posted": 0, "deleted": 0}
+        return {"result": "no_channel", "posted": 0, "deleted": 0, "edited": 0}
 
-    chunks = persistent_roster_chunks(gs, bf, snapshot, bflist_server)
-    content_hash = rendered_roster_hash(chunks)
+    base_chunks = persistent_roster_chunks(gs, bf, snapshot, bflist_server)
+    content_hash = rendered_roster_hash(base_chunks)
     old_rows = player_message_rows(guild.id, gs.server_guid)
     key = (guild.id, gs.server_guid)
 
+    # ETA is always refreshed. If it had to be newly posted while an old roster
+    # already existed (for example the first v2.7.0 run), rebuild the roster so
+    # Discord ordering remains announcement -> ETA -> roster.
+    eta_result = await upsert_player_eta(guild, gs, channel, next_update_unix)
+    if eta_result == "posted" and old_rows:
+        deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        old_rows = []
+        PLAYER_DISPLAY_VALIDATED.discard(key)
+    else:
+        deleted = 0
+
     same_hash = bool(
         old_rows
-        and len(old_rows) == len(chunks)
+        and len(old_rows) == len(base_chunks)
         and all(row["content_hash"] == content_hash for row in old_rows)
         and all(row["channel_id"] == channel.id for row in old_rows)
     )
-
     if same_hash:
         if key not in PLAYER_DISPLAY_VALIDATED:
-            exists = await player_display_messages_exist(guild, old_rows)
-            if not exists:
-                same_hash = False
-            else:
+            same_hash = await player_display_messages_exist(guild, old_rows)
+            if same_hash:
                 PLAYER_DISPLAY_VALIDATED.add(key)
         if same_hash:
-            return {
-                "result": "unchanged",
-                "posted": 0,
-                "deleted": 0,
-                "chunks": len(chunks),
-            }
+            return {"result": "unchanged", "posted": 0, "deleted": deleted, "edited": 0, "chunks": len(base_chunks)}
 
-    created = []
+    updated_unix = int(utcnow().timestamp())
+    rendered_chunks = roster_chunks_with_last_updated(base_chunks, updated_unix)
+
+    # Reuse/edit existing chunks when they are valid in the target channel.
+    existing_by_index = {int(row["chunk_index"]): row for row in old_rows if row["channel_id"] == channel.id}
+    if old_rows and not await player_display_messages_exist(guild, old_rows):
+        extra_deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        deleted += extra_deleted
+        old_rows = []
+        existing_by_index = {}
+
+    authoritative = []
+    posted = edited = 0
     try:
-        for chunk_index, content in enumerate(chunks):
-            message = await channel.send(
-                content,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            created.append((chunk_index, message))
-            log.debug(
-                "Player display message posted guild=%s server=%s channel=%s "
-                "message=%s chunk=%s/%s",
-                guild.id,
-                gs.server_guid,
-                channel.id,
-                message.id,
-                chunk_index + 1,
-                len(chunks),
-            )
+        for chunk_index, content in enumerate(rendered_chunks):
+            row = existing_by_index.get(chunk_index)
+            if row is not None:
+                message = await channel.fetch_message(int(row["message_id"]))
+                await message.edit(content=content)
+                edited += 1
+            else:
+                message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+                posted += 1
+            authoritative.append((chunk_index, message))
+
+        # Remove only excess old chunks when the roster shrinks.
+        excess = [row for idx, row in existing_by_index.items() if idx >= len(rendered_chunks)]
+        extra_deleted, _ = await delete_player_message_rows(guild, excess)
+        deleted += extra_deleted
     except Exception as exc:
         log.error(
-            "Player display post failed guild=%s server=%s channel=%s "
-            "posted=%s/%s error=%s message=%r",
-            guild.id,
-            gs.server_guid,
-            channel.id,
-            len(created),
-            len(chunks),
-            type(exc).__name__,
-            str(exc),
+            "Player display in-place update failed guild=%s server=%s posted=%s edited=%s error=%s message=%r",
+            guild.id, gs.server_guid, posted, edited, type(exc).__name__, str(exc),
         )
-        for _, message in created:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-        return {"result": "post_failed", "posted": 0, "deleted": 0}
+        return {"result": "update_failed", "posted": posted, "deleted": deleted, "edited": edited}
 
-    # Persist the new authoritative set before removing the old set. A crash
-    # after this point can leave an orphaned old message, but never loses the
-    # newly displayed roster or its persisted IDs.
     with SessionLocal.begin() as session:
         session.execute(
             delete(GuildServerPlayerMessage).where(
@@ -3439,7 +3546,7 @@ async def update_persistent_player_display(
                 GuildServerPlayerMessage.server_guid == gs.server_guid,
             )
         )
-        for chunk_index, message in created:
+        for chunk_index, message in authoritative:
             session.add(
                 GuildServerPlayerMessage(
                     guild_id=guild.id,
@@ -3454,24 +3561,17 @@ async def update_persistent_player_display(
                 )
             )
 
-    deleted, delete_failed = await delete_player_message_rows(guild, old_rows)
     PLAYER_DISPLAY_VALIDATED.add(key)
     log.debug(
-        "Player display replaced guild=%s server=%s chunks=%s old_rows=%s "
-        "old_deleted=%s old_delete_failed=%s hash=%s",
-        guild.id,
-        gs.server_guid,
-        len(chunks),
-        len(old_rows),
-        deleted,
-        delete_failed,
-        content_hash[:12],
+        "Player display refreshed guild=%s server=%s chunks=%s edited=%s posted=%s deleted=%s hash=%s",
+        guild.id, gs.server_guid, len(rendered_chunks), edited, posted, deleted, content_hash[:12],
     )
     return {
-        "result": "replaced",
-        "posted": len(created),
+        "result": "refreshed",
+        "posted": posted,
         "deleted": deleted,
-        "chunks": len(chunks),
+        "edited": edited,
+        "chunks": len(rendered_chunks),
     }
 
 
@@ -3564,7 +3664,8 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
                 str(exc),
             )
 
-    unchanged = replaced = failed = posted = deleted = 0
+    unchanged = refreshed = failed = posted = deleted = edited = 0
+    next_update_unix = next_player_display_eta_unix(current_unique_server_count())
     for row in requested:
         guid = row["server_guid"]
         snapshot = fresh.get(guid)
@@ -3606,13 +3707,15 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
                 bf,
                 snapshot,
                 bflist_by_guid.get(guid),
+                next_update_unix,
             )
             posted += int(result.get("posted", 0))
             deleted += int(result.get("deleted", 0))
+            edited += int(result.get("edited", 0))
             if result["result"] == "unchanged":
                 unchanged += 1
-            elif result["result"] == "replaced":
-                replaced += 1
+            elif result["result"] == "refreshed":
+                refreshed += 1
             else:
                 failed += 1
         except Exception as exc:
@@ -3629,17 +3732,19 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
     log.info(
         "Player display cycle complete requested=%s unique_servers=%s "
         "duplicate_roster_lookups_avoided=%s roster_lookups=%s "
-        "unchanged=%s replaced=%s failed=%s chunks_posted=%s "
-        "old_chunks_deleted=%s",
+        "unchanged=%s refreshed=%s failed=%s chunks_edited=%s chunks_posted=%s "
+        "old_chunks_deleted=%s next_eta=%s",
         len(requested),
         len(unique_guids),
         duplicate_avoided,
         lookup_count,
         unchanged,
-        replaced,
+        refreshed,
         failed,
+        edited,
         posted,
         deleted,
+        next_update_unix,
     )
     return {
         "requested": len(requested),
@@ -3647,8 +3752,10 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
         "duplicates": duplicate_avoided,
         "lookups": lookup_count,
         "unchanged": unchanged,
-        "replaced": replaced,
+        "refreshed": refreshed,
+        "replaced": refreshed,
         "failed": failed,
+        "edited": edited,
         "posted": posted,
         "deleted": deleted,
     }
@@ -3918,13 +4025,14 @@ async def monitor_cycle():
                 r.guild_id,
                 r.server_guid,
                 r.display_name,
+                r.include_users,
                 r.announcement_channel_id,
                 r.announcement_channel_name,
             )
             for r in default_rows
         ]
 
-    for guild_id, guid, display_name, announcement_channel_id, announcement_channel_name in detached:
+    for guild_id, guid, display_name, include_users, announcement_channel_id, announcement_channel_name in detached:
         snapshot = fresh.get(guid)
         if snapshot is None:
             continue
@@ -3970,6 +4078,7 @@ async def monitor_cycle():
                 server_guid=guid,
                 display_name=display_name,
                 is_default=True,
+                include_users=include_users,
                 announcement_channel_id=announcement_channel_id,
                 announcement_channel_name=announcement_channel_name,
             )
@@ -4004,8 +4113,10 @@ async def monitor_cycle():
         "duplicates": 0,
         "lookups": 0,
         "unchanged": 0,
+        "refreshed": 0,
         "replaced": 0,
         "failed": 0,
+        "edited": 0,
         "posted": 0,
         "deleted": 0,
     }
@@ -4027,6 +4138,9 @@ async def monitor_cycle():
         1.0 if unique_count == 0
         else len(fresh) / unique_count
     )
+    # Isolated per-server failures (especially Keeper 404s for offline console
+    # servers) must not freeze rich presence. Retain the previous aggregate only
+    # for genuine service/network trouble, skipped work, or an opened circuit.
     presence_healthy = (
         unique_count == 0
         or (
@@ -4034,7 +4148,6 @@ async def monitor_cycle():
             and skipped == 0
             and service_failures == 0
             and not circuit_opened
-            and success_ratio >= KEEPER_PRESENCE_MIN_SUCCESS_RATIO
         )
     )
     if presence_healthy:
@@ -4063,8 +4176,9 @@ async def monitor_cycle():
         "duplicate_lookups_avoided=%s attempted=%s skipped=%s "
         "succeeded=%s failed=%s service_failures=%s "
         "isolated_failures=%s circuit_opened=%s players=%s "
-        "player_displays=%s player_displays_replaced=%s "
-        "player_displays_unchanged=%s player_sessions_created=%s "
+        "player_displays=%s player_displays_refreshed=%s "
+        "player_displays_unchanged=%s player_display_chunks_edited=%s "
+        "player_sessions_created=%s "
         "player_sessions_closed=%s watched_alerts=%s",
         references,
         unique_count,
@@ -4078,8 +4192,9 @@ async def monitor_cycle():
         circuit_opened,
         player_total,
         player_display_summary["requested"],
-        player_display_summary["replaced"],
+        player_display_summary.get("refreshed", player_display_summary.get("replaced", 0)),
         player_display_summary["unchanged"],
+        player_display_summary.get("edited", 0),
         player_history_summary["created"],
         player_history_summary["closed"],
         player_history_summary["alerts"],
@@ -5289,7 +5404,7 @@ async def default_add(
             tick_rate_hz = bf.tick_rate_hz
 
         if previous_include_users and not include_users:
-            await clear_persistent_player_display(interaction.guild, server)
+            await clear_persistent_player_stack(interaction.guild, server)
 
         snapshot = (
             FRESH_SERVER_CACHE.get(server)
@@ -5331,6 +5446,7 @@ async def default_add(
                     ),
                     snapshot,
                     bflist,
+                    next_player_display_eta_unix(current_unique_server_count()),
                 )
                 player_note = f" Persistent player list: **{result['result']}**."
             except Exception as exc:
@@ -5475,114 +5591,34 @@ async def default_modify(
             announcement_channel_name=selected_channel.name,
         )
 
-        # Establish the new destination before removing old persistent content.
-        new_announcement = await selected_channel.send(
-            build_map_announcement(
-                display_name,
-                get_server_status(snapshot),
-                role_line=active_map_role_line(
-                    interaction.guild.id,
-                    get_server_status(snapshot).get("map_key"),
-                )[0],
-                tick_rate_hz=tick_rate_hz,
-            ),
-            allowed_mentions=discord.AllowedMentions(
-                roles=True,
-                users=False,
-                everyone=False,
-            ),
-        )
-
-        old_player_rows = player_message_rows(interaction.guild.id, server)
-        player_created = []
-        new_player_hash = None
+        # Move the persistent stack using the same v2.7.0 ordering rules.
         if include_users:
-            bflist = None
-            if normalize_platform_label(platform) == "PC":
-                bflist = await asyncio.to_thread(
-                    get_bflist_server_cached,
-                    server,
-                    snapshot,
-                )
-            chunks = persistent_roster_chunks(
-                temp_gs,
-                BF4Server(
-                    server_guid=server,
-                    server_name=server_name,
-                    platform=platform,
-                ),
-                snapshot,
-                bflist,
-            )
-            new_player_hash = rendered_roster_hash(chunks)
-            try:
-                for chunk_index, content in enumerate(chunks):
-                    message = await selected_channel.send(
-                        content,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    player_created.append((chunk_index, message))
-            except Exception:
-                for _, message in player_created:
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-                await new_announcement.delete()
-                raise
+            await clear_persistent_player_stack(interaction.guild, server)
 
         with SessionLocal.begin() as session:
             live = session.get(GuildServer, (interaction.guild.id, server))
             live.announcement_channel_id = selected_channel.id
             live.announcement_channel_name = selected_channel.name
 
-            state = session.get(GuildServerState, (interaction.guild.id, server))
-            old_map_channel = state.announcement_channel_id if state else None
-            old_map_message = state.announcement_message_id if state else None
-            status = get_server_status(snapshot)
-            if state is None:
-                state = GuildServerState(
-                    guild_id=interaction.guild.id,
-                    guild_name=interaction.guild.name,
-                    server_guid=server,
-                )
-                session.add(state)
-            state.last_map_key = status["map_key"]
-            state.last_map_name = status["map_name"]
-            state.announcement_channel_id = selected_channel.id
-            state.announcement_channel_name = selected_channel.name
-            state.announcement_message_id = new_announcement.id
+        await post_automatic_announcement(
+            interaction.guild.id,
+            temp_gs,
+            get_server_status(snapshot),
+            map_change=False,
+        )
 
-            if include_users:
-                session.execute(
-                    delete(GuildServerPlayerMessage).where(
-                        GuildServerPlayerMessage.guild_id == interaction.guild.id,
-                        GuildServerPlayerMessage.server_guid == server,
-                    )
-                )
-                for chunk_index, message in player_created:
-                    session.add(
-                        GuildServerPlayerMessage(
-                            guild_id=interaction.guild.id,
-                            guild_name=interaction.guild.name,
-                            server_guid=server,
-                            server_name=display_name,
-                            chunk_index=chunk_index,
-                            channel_id=selected_channel.id,
-                            channel_name=selected_channel.name,
-                            message_id=message.id,
-                            content_hash=new_player_hash,
-                        )
-                    )
-
-        if old_map_channel and old_map_message and int(old_map_message) != new_announcement.id:
-            await delete_discord_message(
-                interaction.guild.id,
-                old_map_channel,
-                old_map_message,
+        if include_users:
+            bflist = None
+            if normalize_platform_label(platform) == "PC":
+                bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
+            await update_persistent_player_display(
+                interaction.guild,
+                temp_gs,
+                BF4Server(server_guid=server, server_name=server_name, platform=platform),
+                snapshot,
+                bflist,
+                next_player_display_eta_unix(current_unique_server_count()),
             )
-        if include_users and old_player_rows:
-            await delete_player_message_rows(interaction.guild, old_player_rows)
         PLAYER_DISPLAY_VALIDATED.discard((interaction.guild.id, server))
 
         log.info(
@@ -5661,6 +5697,7 @@ async def default_remove(interaction, server: str):
     if not await prepare_management(interaction):
         return
     try:
+        await clear_persistent_player_stack(interaction.guild, server)
         old_channel = old_message = assigned_channel_id = None
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
@@ -5684,8 +5721,6 @@ async def default_remove(interaction, server: str):
                 old_channel,
                 old_message,
             )
-        await clear_persistent_player_display(interaction.guild, server)
-
         if not get_default_guild_servers(interaction.guild.id) and assigned_channel_id:
             channel = interaction.guild.get_channel(int(assigned_channel_id))
             if channel:
@@ -5920,6 +5955,17 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
     started = time.perf_counter()
     if not await prepare_management(interaction):
         return
+    if server == "__all_tick_rates_known__":
+        await interaction.followup.send(
+            "✅ All tracked servers already have a discovered tick rate.",
+            ephemeral=True,
+        )
+        audit_command(
+            guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+            command_name="refreshserverhz", command_type="slash", success=True,
+            started=started, result_code="all_resolved",
+        )
+        return
     try:
         with SessionLocal() as session:
             row = session.execute(
@@ -5952,6 +5998,19 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
             battlelog_url = bf.battlelog_url
             display_name = gs.display_name
             old_tick_rate = bf.tick_rate_hz
+
+        if old_tick_rate is not None:
+            await interaction.followup.send(
+                f"ℹ️ **{display_name}** already has a discovered tick rate of **{old_tick_rate} Hz**.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+                command_name="refreshserverhz", command_type="slash", success=True,
+                started=started, result_code="already_resolved", target_type="server",
+                target_id=server, target_name=display_name,
+            )
+            return
 
         if not battlelog_url:
             await interaction.followup.send(
@@ -6056,7 +6115,33 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
 
 @refreshserverhz.autocomplete("server")
 async def refreshserverhz_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+    if not interaction.guild:
+        return []
+    needle = (current or "").casefold().strip()
+    choices = []
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildServer, BF4Server)
+            .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+            .where(
+                GuildServer.guild_id == interaction.guild.id,
+                BF4Server.tick_rate_hz.is_(None),
+            )
+            .order_by(GuildServer.display_name)
+        ).all()
+    if not rows:
+        return [app_commands.Choice(
+            name="All tracked servers already have a discovered tick rate",
+            value="__all_tick_rates_known__",
+        )]
+    for gs, bf in rows:
+        label = f"({normalize_platform_label(bf.platform)}) {gs.display_name}"
+        if needle and needle not in f"{label} {bf.server_guid}".casefold():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=bf.server_guid))
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 @tree.command(name="delserver", description="Delete one server or all non-default servers on a platform")
@@ -6758,10 +6843,10 @@ async def delwatchedplayerchannel(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="watchplayer", description="Alert admins when a player joins a default BF4 server")
+@tree.command(name="watchplayer", description="Alert admins when a player joins any same-platform default server")
 @app_commands.describe(
     player="Player name; autocomplete is optional and manual names are allowed",
-    server="Default BF4 server to watch",
+    server="Choose a default server to select the platform family",
 )
 async def watchplayer(
     interaction: discord.Interaction,
@@ -6827,7 +6912,7 @@ async def watchplayer(
         duplicate = session.scalar(
             select(GuildPlayerWatch).where(
                 GuildPlayerWatch.guild_id == interaction.guild.id,
-                GuildPlayerWatch.server_guid == server,
+                GuildPlayerWatch.platform == platform,
                 or_(
                     GuildPlayerWatch.normalized_name == normalized,
                     (
@@ -6840,7 +6925,7 @@ async def watchplayer(
         )
         if duplicate is not None:
             await interaction.followup.send(
-                f"ℹ️ **{duplicate.watched_name}** is already watched on **{gs.display_name}**.",
+                f"ℹ️ **{duplicate.watched_name}** is already watched across all current **{platform}** default servers.",
                 ephemeral=True,
             )
             audit_command(
@@ -6854,13 +6939,13 @@ async def watchplayer(
                 result_code="already_watched",
                 target_type="player",
                 target_name=duplicate.watched_name,
-                metadata={"server_guid": server},
+                metadata={"platform": platform},
             )
             return
 
         watch = GuildPlayerWatch(
             guild_id=interaction.guild.id,
-            server_guid=server,
+            platform=platform,
             watched_name=watched_name,
             normalized_name=normalized,
             persona_id=persona_id,
@@ -6870,7 +6955,7 @@ async def watchplayer(
         session.add(watch)
 
     await interaction.followup.send(
-        f"✅ Watching **{watched_name}** for joins on **{gs.display_name}**.",
+        f"✅ Watching **{watched_name}** across all current **{platform}** default servers in this Discord server.",
         ephemeral=True,
     )
     audit_command(
@@ -6884,7 +6969,7 @@ async def watchplayer(
         result_code="added",
         target_type="player",
         target_name=watched_name,
-        metadata={"server_guid": server, "persona_resolved": persona_id is not None},
+        metadata={"platform": platform, "persona_resolved": persona_id is not None},
     )
 
 
@@ -6894,58 +6979,42 @@ async def watchplayer_player_autocomplete(interaction, current):
 
 
 def watchplayer_server_choices(guild_id: int, player: str, current: str):
-    """Default servers excluding those where the selected player is already watched."""
+    """Offer one representative current default per not-yet-watched platform family."""
     normalized = normalize_player_name(player)
     needle = current.casefold().strip()
-    choices = []
     with SessionLocal() as session:
         watches = session.scalars(
             select(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id)
         ).all()
-        watches_by_server = {}
-        for watch in watches:
-            watches_by_server.setdefault(watch.server_guid, []).append(watch)
+        existing_platforms = set()
+        if normalized:
+            for watch in watches:
+                target_persona = known_persona_for_name(session, watch.platform, normalized)
+                if watch.normalized_name == normalized or (
+                    target_persona is not None and watch.persona_id is not None
+                    and int(watch.persona_id) == int(target_persona)
+                ):
+                    existing_platforms.add(watch.platform)
 
+        representatives = {}
         for gs, bf in sorted_guild_servers(guild_id):
             if not gs.is_default:
                 continue
-            target_persona = (
-                known_persona_for_name(
-                    session, normalize_platform_label(bf.platform), normalized
-                )
-                if normalized else None
-            )
-            already_watched = False
-            if normalized:
-                for watch in watches_by_server.get(bf.server_guid, []):
-                    if watch.normalized_name == normalized:
-                        already_watched = True
-                        break
-                    if (
-                        target_persona is not None
-                        and watch.persona_id is not None
-                        and int(watch.persona_id) == int(target_persona)
-                    ):
-                        already_watched = True
-                        break
-            if already_watched:
-                continue
+            platform = normalize_platform_label(bf.platform)
+            representatives.setdefault(platform, (gs, bf))
 
-            label = f"({normalize_platform_label(bf.platform)}) {gs.display_name}"
-            if needle and needle not in f"{label} {bf.server_guid}".casefold():
-                continue
-            choices.append(app_commands.Choice(name=label[:100], value=bf.server_guid))
-            if len(choices) >= 25:
-                break
-
+    choices = []
+    for platform in ("PC", "PS4/5", "XBox", "Unknown"):
+        if platform not in representatives or platform in existing_platforms:
+            continue
+        gs, bf = representatives[platform]
+        label = f"({platform}) All current {platform} default servers"
+        if needle and needle not in f"{label} {gs.display_name}".casefold():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=bf.server_guid))
     if normalized and not choices:
-        return [
-            app_commands.Choice(
-                name="No additional default servers available",
-                value="__no_additional_default_servers__",
-            )
-        ]
-    return choices
+        return [app_commands.Choice(name="No additional default-server platforms available", value="__no_additional_default_servers__")]
+    return choices[:25]
 
 
 @watchplayer.autocomplete("server")
@@ -6957,7 +7026,7 @@ async def watchplayer_server_autocomplete(interaction, current):
 
 
 @tree.command(name="unwatchplayer", description="Remove one watched-player rule")
-@app_commands.describe(watch="Watched player/server rule to remove")
+@app_commands.describe(watch="Watched player/platform rule to remove")
 async def unwatchplayer(interaction: discord.Interaction, watch: str):
     started = time.perf_counter()
     if not await prepare_management(interaction):
@@ -6971,12 +7040,11 @@ async def unwatchplayer(interaction: discord.Interaction, watch: str):
         if row is None or row.guild_id != interaction.guild.id:
             await interaction.followup.send("⛔ That watched-player rule was not found.", ephemeral=True)
             return
-        gs = session.get(GuildServer, (interaction.guild.id, row.server_guid))
         name = row.watched_name
-        server_name = gs.display_name if gs else row.server_guid
+        platform = row.platform
         session.delete(row)
     await interaction.followup.send(
-        f"✅ Stopped watching **{name}** on **{server_name}**.",
+        f"✅ Stopped watching **{name}** across **{platform}** default servers.",
         ephemeral=True,
     )
     audit_command(
@@ -6991,7 +7059,7 @@ async def unwatchplayer(interaction: discord.Interaction, watch: str):
         target_type="player_watch",
         target_id=watch_id,
         target_name=name,
-        metadata={"server_name": server_name},
+        metadata={"platform": platform},
     )
 
 
@@ -7007,16 +7075,10 @@ async def watchedplayers(interaction: discord.Interaction):
         return
     with SessionLocal() as session:
         settings = session.get(GuildSettings, interaction.guild.id)
-        rows = session.execute(
-            select(GuildPlayerWatch, GuildServer, BF4Server)
-            .join(
-                GuildServer,
-                (GuildServer.guild_id == GuildPlayerWatch.guild_id)
-                & (GuildServer.server_guid == GuildPlayerWatch.server_guid),
-            )
-            .join(BF4Server, BF4Server.server_guid == GuildPlayerWatch.server_guid)
+        rows = session.scalars(
+            select(GuildPlayerWatch)
             .where(GuildPlayerWatch.guild_id == interaction.guild.id)
-            .order_by(GuildServer.display_name, GuildPlayerWatch.watched_name)
+            .order_by(GuildPlayerWatch.platform, GuildPlayerWatch.watched_name)
         ).all()
         channel_id = int(settings.watched_player_channel_id or 0) if settings else 0
     channel = interaction.guild.get_channel(channel_id) if channel_id else None
@@ -7028,9 +7090,9 @@ async def watchedplayers(interaction: discord.Interaction):
     if not rows:
         lines.append("No watched players configured.")
     else:
-        for watch, gs, bf in rows:
+        for watch in rows:
             current_name = current_alias_for_persona(
-                normalize_platform_label(bf.platform),
+                watch.platform,
                 watch.persona_id,
             )
             alias_text = (
@@ -7039,8 +7101,9 @@ async def watchedplayers(interaction: discord.Interaction):
                 and normalize_player_name(current_name) != watch.normalized_name
                 else ""
             )
-            default_text = "" if gs.is_default else " [server is no longer default]"
-            lines.append(f"• {watch.watched_name}{alias_text} — {gs.display_name}{default_text}")
+            lines.append(
+                f"• {watch.watched_name}{alias_text} — all current {watch.platform} default servers"
+            )
     text = "\n".join(lines)
     for index in range(0, len(text), 1900):
         await interaction.followup.send(text[index:index + 1900], ephemeral=True)
@@ -7750,6 +7813,7 @@ async def announce(interaction: discord.Interaction):
                     gs.display_name,
                     get_server_status(snapshot),
                     tick_rate_hz=bf.tick_rate_hz,
+                    add_separator=len(defaults) > 1,
                 )
             )
             asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))
@@ -7998,6 +8062,7 @@ async def on_message(message: discord.Message):
                             gs.display_name,
                             get_server_status(snapshot),
                             tick_rate_hz=bf.tick_rate_hz,
+                            add_separator=len(defaults) > 1,
                         )
                     )
                     asyncio.create_task(delete_later(msg, MANUAL_ANNOUNCEMENT_TTL_SECONDS))

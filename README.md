@@ -1,8 +1,17 @@
-# BF4 Server Watcher v2.6.6-pr2
+# BF4 Server Watcher v2.7.0
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
 v2.0.0 is a major architecture release. Guild configuration and BF4 server relationships are stored in SQL instead of runtime JSON files. PostgreSQL is the primary database target; MySQL/MariaDB are also supported.
+
+## v2.7.0 highlights
+
+- Persistent player-list ETA and in-place edits with native Last updated timestamps.
+- Watched players apply across all current same-platform default servers and use clickable Battlelog identities when resolved.
+- Multi-default announcement separators, unresolved-only `/refreshserverhz`, and obsolete guild-settings announcement-column cleanup.
+- Rich presence now tolerates isolated per-server Keeper 404s while retaining safeguards for genuine upstream/network failures.
+- Keeps the validated `0.33 / 40 / 120 / 120` Keeper pacing.
+
 
 ## Major v2 changes
 
@@ -426,7 +435,7 @@ PR2 promotes the controlled Keeper testing results and adds the operational chan
 
 - Uses a conservative default Keeper request rate of `0.33` requests/second.
 - Adds a configurable 300-second total inter-sweep recovery window after each completed Keeper sweep, preventing the next large sweep from restarting after only the normal 120-second check interval.
-- Rich presence may now establish/update from a near-complete healthy sweep (default 99% successful) when there are no Keeper service failures, skipped servers, or circuit-breaker event. This prevents one isolated 404 among hundreds of servers from blocking the player aggregate indefinitely.
+- Rich presence now updates from successfully fetched snapshots when the cycle has no Keeper service failures, skipped work, or circuit-breaker event. Isolated per-server failures such as Keeper 404s do not freeze the aggregate.
 - Adds a persistent 24-hour GitHub latest-release cache. `/version` and the background checker reuse the cache; installing a new local ServerWatcher version invalidates the old cache and forces a fresh lookup.
 - Preserves v2.6.3 per-server 403 isolation/backoff, v2.6.2 `!list` chunking, Battlelog pacing, and no-catch-up scheduling.
 - No database migration is required.
@@ -503,12 +512,12 @@ Use an admin/moderator-only notification channel:
 Manage watches with:
 
 ```text
-/watchplayer player:<name> server:<default server>
+/watchplayer player:<name> server:<default server used to select platform>
 /unwatchplayer watch:<selection>
 /watchedplayers
 ```
 
-Player names autocomplete case-insensitively from accumulated history, while `/watchplayer` also accepts a manually typed unseen name. Watches are scoped to one guild + one default BF4 server. Alerts ping the configured management role, or the guild owner when no management role is set.
+Player names autocomplete case-insensitively from accumulated history, while `/watchplayer` also accepts a manually typed unseen name. In v2.7.0 a watch is stored once per guild + platform family and dynamically applies to all current same-platform default servers. Alerts ping the configured management role, or the guild owner when no management role is set. Resolved watched-player identities are rendered as clickable Battlelog profile links.
 
 Search history with:
 
