@@ -1,4 +1,6 @@
-# BF4 Server Watcher v2.7.0
+# BF4 Server Watcher
+
+> Development baseline: **v3.0.0-pr1** control-plane foundation. Distributed Keeper work and Discord leader election remain disabled in PR1.
 
 A self-hosted Dockerized Discord bot for monitoring Battlefield 4 servers, announcing map changes, and providing BF4 server status across multiple Discord guilds from one bot instance.
 
@@ -20,7 +22,7 @@ v2.0.0 is a major architecture release. Guild configuration and BF4 server relat
 - MySQL/MariaDB compatibility through SQLAlchemy/PyMySQL.
 - Alembic schema migrations run before the bot starts.
 - No runtime `config.json`, `servers.json`, or `maps.json`.
-- Existing v1.x `config.json` / `servers.json` installations can be imported automatically.
+- Direct v1.x JSON import is retired in v3; upgrade v1.x to a v2.x SQL release first, or use a fresh Alembic-built database.
 - Keeper/API polling is globally deduplicated by BF4 server GUID.
 - Automatic announcement message IDs/state are persisted in the database across restarts.
 - Command-audit history is stored permanently and independently of normal Docker logs.
@@ -88,7 +90,7 @@ before starting the bot. If migrations fail, ServerWatcher does not start.
 
 BF4 Server Watcher v2.0.0 changes configuration storage from JSON files to a database and adds multi-guild support.
 
-Existing v1.x installations should read **`MIGRATION.md` before upgrading**. It covers database preparation, the automatic `config.json` / `servers.json` import, the temporary `LEGACY_IMPORT_GUILD_ID` setting for multi-guild migrations, verification, and rollback considerations.
+BF4 Server Watcher v3 no longer performs direct v1.x JSON imports. Upgrade an existing v1.x deployment to a v2.x SQL release first, or start v3 with a fresh database and the preserved Alembic migration chain. See **`MIGRATION.md`** for the v3 upgrade boundary and database backup guidance.
 
 The old JSON files are preserved after import but are no longer authoritative runtime configuration.
 
@@ -786,4 +788,4 @@ The live `.env` file is intentionally excluded from release bundles and Git.
 
 Never commit Discord tokens or database credentials.
 
-Legacy `config.json` / `servers.json` files may remain on upgraded installations for rollback/reference, but are ignored by normal v2 runtime after the migration is marked complete.
+Legacy `config.json` / `servers.json` files are not read by v3. They may be retained only as operator reference/backup material.

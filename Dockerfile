@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY serverwatcher.py db.py models.py alembic.ini entrypoint.sh ./
+COPY serverwatcher.py worker_agent.py control_plane.py db.py models.py alembic.ini entrypoint.sh ./
 COPY alembic ./alembic
 
 RUN chmod +x /app/entrypoint.sh

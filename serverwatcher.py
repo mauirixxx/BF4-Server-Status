@@ -24,6 +24,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
+from control_plane import WORKER_ID, heartbeat_loop, load_effective_settings, register_worker, validate_worker_id
 from models import (
     BF4Map,
     BF4PlayerAlias,
@@ -41,17 +42,15 @@ from models import (
     GuildServerPlayerMessage,
     GuildServerState,
     GuildSettings,
-    MigrationState,
 )
 
-BOT_VERSION = "v2.7.0"
+BOT_VERSION = "v3.0.0-pr1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
 AAA_NAME = "AAA"
 LOCKER_KEY = "MP_Prison"
 LOCKER_MESSAGE = "Operation Locker is now live!"
-LEGACY_IMPORT_KEY = "legacy_v1_import"
 MANUAL_ANNOUNCEMENT_TTL_SECONDS = 600
 ROLE_PANEL_BUTTONS_PER_MESSAGE = 15
 ROLE_PANEL_RECONCILE_DELAY_SECONDS = 3.0
@@ -68,7 +67,6 @@ if not TOKEN:
 
 CHECK_INTERVAL_SECONDS = max(10, int(os.environ.get("CHECK_INTERVAL_SECONDS", "69")))
 PRESENCE_UPDATE_SECONDS = max(10, min(60, int(os.environ.get("PRESENCE_UPDATE_SECONDS", "30"))))
-LEGACY_IMPORT_GUILD_ID = os.environ.get("LEGACY_IMPORT_GUILD_ID", "").strip()
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -1989,193 +1987,6 @@ def version_text():
         "Version comparison unavailable."
     )
 
-
-def legacy_paths():
-    return RUNTIME_DIR / "config.json", RUNTIME_DIR / "servers.json"
-
-
-def legacy_import_state():
-    with SessionLocal() as session:
-        return session.get(MigrationState, LEGACY_IMPORT_KEY)
-
-
-def set_legacy_state(status: str, target_guild_id=None):
-    with SessionLocal.begin() as session:
-        row = session.get(MigrationState, LEGACY_IMPORT_KEY)
-        if row is None:
-            row = MigrationState(
-                migration_key=LEGACY_IMPORT_KEY,
-                status=status,
-                target_guild_id=target_guild_id,
-                updated_at=utcnow(),
-            )
-            session.add(row)
-        else:
-            row.status = status
-            row.target_guild_id = target_guild_id
-            row.updated_at = utcnow()
-
-
-def run_legacy_import(connected_guilds: list[discord.Guild]) -> bool:
-    config_path, servers_path = legacy_paths()
-    state = legacy_import_state()
-    if state and state.status == "completed":
-        if LEGACY_IMPORT_GUILD_ID:
-            log.info("Legacy import already complete; LEGACY_IMPORT_GUILD_ID can be removed from .env")
-        return True
-
-    if not config_path.exists() and not servers_path.exists():
-        set_legacy_state("completed", None)
-        log.info("Legacy import complete discovered=0 reason='no legacy JSON files'")
-        return True
-
-    if LEGACY_IMPORT_GUILD_ID:
-        try:
-            target_id = int(LEGACY_IMPORT_GUILD_ID)
-        except ValueError:
-            log.error("Legacy import blocked reason='invalid LEGACY_IMPORT_GUILD_ID'")
-            return False
-        target = discord.utils.get(connected_guilds, id=target_id)
-        if target is None:
-            log.error(
-                "Legacy import blocked target_guild=%s connected_guilds=%s reason='target not connected'",
-                target_id, len(connected_guilds)
-            )
-            return False
-    elif len(connected_guilds) == 1:
-        target = connected_guilds[0]
-        target_id = target.id
-    else:
-        log.error(
-            "Legacy import blocked connected_guilds=%s reason='LEGACY_IMPORT_GUILD_ID required'",
-            len(connected_guilds)
-        )
-        return False
-
-    log.info("Legacy import started guild=%s name=%r", target.id, target.name)
-    set_legacy_state("in_progress", target.id)
-    imported_servers = listen_count = map_count = 0
-    try:
-        config = json.loads(config_path.read_text()) if config_path.exists() else {}
-        servers = json.loads(servers_path.read_text()) if servers_path.exists() else {}
-        default_keys = set(servers.get("default_servers", []))
-        if "default_server" in servers and not default_keys:
-            default_keys.add(servers["default_server"])
-
-        with SessionLocal.begin() as session:
-            # Legacy import replaces the bootstrap guild-scoped defaults so the
-            # migrated guild exactly reflects its v1.x files. Global BF4 server
-            # catalog rows are intentionally retained.
-            session.execute(delete(GuildServerState).where(GuildServerState.guild_id == target.id))
-            session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == target.id))
-            session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == target.id))
-            session.execute(delete(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == target.id))
-            session.execute(delete(GuildServer).where(GuildServer.guild_id == target.id))
-
-            settings = session.get(GuildSettings, target.id)
-            if settings is None:
-                settings = GuildSettings(guild_id=target.id)
-                session.add(settings)
-            legacy_announcement_channel_id = int(config.get("announcement_channel_id", 0) or 0)
-            settings.management_min_role_id = int(config.get("management_min_role_id", 0) or 0)
-            settings.status_min_role_id = int(config.get("status_min_role_id", 0) or 0)
-
-            if legacy_announcement_channel_id:
-                session.add(
-                    GuildAnnouncementChannel(
-                        guild_id=target.id,
-                        guild_name=target.name,
-                        channel_id=legacy_announcement_channel_id,
-                        channel_name=None,
-                    )
-                )
-
-            for channel_id in config.get("listen_channel_id", []):
-                channel_id = int(channel_id or 0)
-                if channel_id and session.get(GuildListenChannel, (target.id, channel_id)) is None:
-                    session.add(GuildListenChannel(guild_id=target.id, channel_id=channel_id))
-                    listen_count += 1
-
-            for key, record in servers.get("servers", {}).items():
-                if not isinstance(record, dict):
-                    continue
-                guid = str(record.get("guid", "")).strip().lower()
-                if not guid:
-                    continue
-                global_server = session.get(BF4Server, guid)
-                if global_server is None:
-                    global_server = BF4Server(
-                        server_guid=guid,
-                        server_name=str(record.get("name", key)),
-                        platform=normalize_platform_label(record.get("platform", "Unknown")),
-                        battlelog_url=record.get("battlelog_url"),
-                        platform_source=record.get("platform_source") or "legacy_import",
-                    )
-                    session.add(global_server)
-                relation = session.get(GuildServer, (target.id, guid))
-                if relation is None:
-                    session.add(GuildServer(
-                        guild_id=target.id,
-                        server_guid=guid,
-                        display_name=str(record.get("name", key)),
-                        is_default=key in default_keys,
-                        announcement_channel_id=(
-                            legacy_announcement_channel_id
-                            if key in default_keys and legacy_announcement_channel_id
-                            else None
-                        ),
-                        announcement_channel_name=None,
-                    ))
-                    imported_servers += 1
-                else:
-                    relation.display_name = str(record.get("name", key))
-                    relation.is_default = key in default_keys
-                    relation.announcement_channel_id = (
-                        legacy_announcement_channel_id
-                        if key in default_keys and legacy_announcement_channel_id
-                        else None
-                    )
-                    relation.announcement_channel_name = None
-
-            for map_name, entry in config.get("map_role_pings", {}).items():
-                if not isinstance(entry, dict):
-                    continue
-                map_row = session.scalar(select(BF4Map).where(func.lower(BF4Map.map_name) == map_name.lower()))
-                if map_row is None:
-                    log.warning("Legacy import map unresolved guild=%s map=%r", target.id, map_name)
-                    continue
-                ping = session.get(GuildMapRolePing, (target.id, map_row.map_key))
-                message = str(entry.get("message") or f"{map_row.map_name} is now live!")
-                role_id = int(entry.get("role_id", 0) or 0)
-                if ping is None:
-                    session.add(GuildMapRolePing(
-                        guild_id=target.id, map_key=map_row.map_key, role_id=role_id, message=message
-                    ))
-                else:
-                    ping.role_id = role_id
-                    ping.message = message
-                map_count += 1
-
-        # Legacy config may replace channel/role IDs after initial guild
-        # reconciliation, so refresh their readable snapshots before marking
-        # the import complete.
-        refresh_guild_readable_snapshots(target)
-
-        set_legacy_state("completed", target.id)
-        log.info(
-            "Legacy import complete guild=%s imported_servers=%s listen_channels=%s map_roles=%s",
-            target.id, imported_servers, listen_count, map_count
-        )
-        if LEGACY_IMPORT_GUILD_ID:
-            log.info("LEGACY_IMPORT_GUILD_ID is no longer required and can be removed from .env")
-        return True
-    except Exception as exc:
-        set_legacy_state("in_progress", target.id)
-        log.error(
-            "Legacy import failed guild=%s error=%s message=%r",
-            target.id, type(exc).__name__, str(exc)
-        )
-        return False
 
 
 intents = discord.Intents.default()
@@ -8224,9 +8035,6 @@ async def on_ready():
         log.critical("Guild reconciliation failed error=%s message=%r", type(exc).__name__, str(exc))
         return
 
-    if not run_legacy_import(list(client.guilds)):
-        log.critical("Legacy import blocked/failed; background watcher not started")
-        return
 
     try:
         for guild in client.guilds:
@@ -8246,6 +8054,15 @@ async def on_ready():
     except Exception as exc:
         log.error("Slash command sync failed error=%s message=%r", type(exc).__name__, str(exc))
 
+    if WORKER_ID:
+        control_settings = load_effective_settings()
+        heartbeat_seconds = int(control_settings.get("worker.heartbeat_seconds", 5))
+        asyncio.create_task(heartbeat_loop(WORKER_ID, heartbeat_seconds))
+        log.info(
+            "Control-plane heartbeat started worker_id=%s heartbeat_seconds=%s",
+            WORKER_ID, heartbeat_seconds,
+        )
+
     asyncio.create_task(monitor_loop())
     asyncio.create_task(version_loop())
     asyncio.create_task(presence_loop())
@@ -8260,6 +8077,13 @@ def main():
     log.info("Startup version=%s runtime_dir=%s", BOT_VERSION, RUNTIME_DIR)
     wait_for_database()
     log.info("Database startup check complete")
+    if WORKER_ID:
+        validate_worker_id(WORKER_ID)
+        register_worker(WORKER_ID, BOT_VERSION, status="starting")
+    else:
+        log.warning(
+            "WORKER_ID is not configured; v3 control-plane registration/heartbeat disabled for this process"
+        )
     client.run(TOKEN, log_handler=None)
 
 

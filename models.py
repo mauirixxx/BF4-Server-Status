@@ -253,9 +253,71 @@ class CommandAudit(Base):
     request_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
-class MigrationState(Base):
-    __tablename__ = "migration_state"
-    migration_key: Mapped[str] = mapped_column(String(100), primary_key=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    target_guild_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+class ClusterWorker(Base):
+    __tablename__ = "cluster_workers"
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    site_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    app_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    draining: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="starting")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_role_change_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterWorkerRole(Base):
+    __tablename__ = "cluster_worker_roles"
+    worker_id: Mapped[str] = mapped_column(
+        String(100),
+        ForeignKey("cluster_workers.worker_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    role_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterRuntimeSetting(Base):
+    __tablename__ = "cluster_runtime_settings"
+    __table_args__ = (
+        UniqueConstraint(
+            "setting_key", "scope_type", "scope_name",
+            name="uq_cluster_runtime_setting_scope",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    setting_key: Mapped[str] = mapped_column(String(150), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    setting_value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterLease(Base):
+    __tablename__ = "cluster_leases"
+    lease_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    lease_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_worker_id: Mapped[str | None] = mapped_column(
+        String(100),
+        ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    renewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

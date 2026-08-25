@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.0.0-pr1 - 2026-08-24
+
+- Added the PostgreSQL-backed v3 control-plane foundation: `cluster_workers`, `cluster_worker_roles`, `cluster_runtime_settings`, and `cluster_leases`.
+- Added stable `WORKER_ID` registration and a 5-second heartbeat foundation with 60-second stale policy seeded in runtime settings.
+- Added multiple-role schema support, global/role runtime setting scope, and atomic lease helper primitives with fencing generations.
+- Added `worker_agent.py` for registry/heartbeat-only testing on non-Discord worker nodes.
+- Retired the legacy v1 JSON runtime importer, `LEGACY_IMPORT_GUILD_ID`, `MigrationState`, and `migration_state`.
+- Preserved historical Alembic revisions and all human-readable companion/snapshot fields.
+- Distributed Keeper polling and Discord leader election remain disabled in PR1; current production ownership behavior is intentionally preserved.
+
 All notable changes to BF4 Server Watcher are recorded here.
 
 ## [v2.7.0] - 2026-08-24

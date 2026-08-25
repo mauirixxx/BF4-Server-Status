@@ -1,19 +1,18 @@
 services:
-  bf4-server-watcher:
+  bf4-worker-agent:
     build: .
     image: bf4-server-watcher:3.0.0-pr1
-    container_name: BF4_ServerWatcher
+    container_name: BF4_ServerWatcher_Agent
     restart: unless-stopped
     env_file:
       - .env
     environment:
       SERVERWATCHER_RUNTIME_DIR: /data
     volumes:
-      # Runtime directory for .env and persistent version-check cache.
       - ./:/data
     extra_hosts:
-      - "host.docker.internal:host-gateway"
       - "rnt-01:192.168.200.47"
       - "hnl-01:192.168.5.70"
       - "mak-01:192.168.10.70"
       - "kah-01:192.168.21.70"
+    command: ["python3", "worker_agent.py"]
