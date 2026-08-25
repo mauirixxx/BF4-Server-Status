@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import socket
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,6 +28,7 @@ KNOWN_ROLES = {"discord", "keeper_bulk", "keeper_fast", "player_persona", "stand
 WORKER_ID = os.environ.get("WORKER_ID", "").strip()
 DEFAULT_HEARTBEAT_SECONDS = 5
 DEFAULT_STALE_AFTER_SECONDS = 60
+DEFAULT_RUNTIME_SETTINGS_REFRESH_SECONDS = 30
 
 SETTING_BOUNDS = {
     "worker.heartbeat_seconds": (1, 60),
@@ -225,6 +227,93 @@ def load_effective_settings(role_name: str | None = None) -> dict[str, Any]:
     return converted
 
 
+class RuntimeSettingsCache:
+    """Thread-safe last-known-good cache for DB-backed runtime settings."""
+
+    def __init__(self, role_name: str | None = None, refresh_seconds: int = DEFAULT_RUNTIME_SETTINGS_REFRESH_SECONDS):
+        self.role_name = role_name
+        self.refresh_seconds = max(1, int(refresh_seconds))
+        self._lock = threading.RLock()
+        self._settings: dict[str, Any] = {}
+        self._loaded = False
+        self._last_refresh_ok = True
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._settings)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self._settings.get(key, default)
+
+    def refresh(self, worker_id: str | None = None) -> bool:
+        """Load one validated snapshot. On failure, preserve the last-known-good snapshot."""
+        try:
+            new_settings = load_effective_settings(role_name=self.role_name)
+        except Exception as exc:
+            with self._lock:
+                self._last_refresh_ok = False
+            log.warning(
+                "Runtime settings refresh failed worker_id=%s role=%s error=%s message=%r keeping_last_known_good=%s",
+                worker_id or "", self.role_name or "global", type(exc).__name__, str(exc), self._loaded,
+            )
+            return False
+
+        with self._lock:
+            old_settings = self._settings
+            changed = {
+                key: (old_settings.get(key), new_settings.get(key))
+                for key in sorted(set(old_settings) | set(new_settings))
+                if old_settings.get(key) != new_settings.get(key)
+            }
+            first_load = not self._loaded
+            recovered = self._loaded and not self._last_refresh_ok
+            self._settings = dict(new_settings)
+            self._loaded = True
+            self._last_refresh_ok = True
+
+        if first_load:
+            log.info(
+                "Runtime settings loaded worker_id=%s role=%s count=%s refresh_seconds=%s",
+                worker_id or "", self.role_name or "global", len(new_settings), self.refresh_seconds,
+            )
+        elif recovered:
+            log.info(
+                "Runtime settings refresh recovered worker_id=%s role=%s changed=%s",
+                worker_id or "", self.role_name or "global", len(changed),
+            )
+            for key, (old_value, new_value) in changed.items():
+                log.info(
+                    "Runtime setting changed worker_id=%s role=%s key=%s old=%r new=%r",
+                    worker_id or "", self.role_name or "global", key, old_value, new_value,
+                )
+        elif changed:
+            log.info(
+                "Runtime settings refreshed worker_id=%s role=%s changed=%s",
+                worker_id or "", self.role_name or "global", len(changed),
+            )
+            for key, (old_value, new_value) in changed.items():
+                log.info(
+                    "Runtime setting changed worker_id=%s role=%s key=%s old=%r new=%r",
+                    worker_id or "", self.role_name or "global", key, old_value, new_value,
+                )
+        return True
+
+    async def refresh_loop(self, worker_id: str | None = None) -> None:
+        while True:
+            await asyncio.sleep(self.refresh_seconds)
+            try:
+                await asyncio.to_thread(self.refresh, worker_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Defensive boundary: refresh() already contains normal DB/validation failures.
+                log.warning(
+                    "Runtime settings refresh loop failed worker_id=%s error=%s message=%r",
+                    worker_id or "", type(exc).__name__, str(exc),
+                )
+
+
 @dataclass(frozen=True)
 class LeaseResult:
     acquired: bool
@@ -320,8 +409,12 @@ def release_lease(lease_key: str, worker_id: str, generation: int) -> bool:
         return True
 
 
-async def heartbeat_loop(worker_id: str, interval_seconds: int = DEFAULT_HEARTBEAT_SECONDS):
-    interval_seconds = max(1, int(interval_seconds))
+async def heartbeat_loop(
+    worker_id: str,
+    interval_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
+    settings_cache: RuntimeSettingsCache | None = None,
+):
+    default_interval = max(1, int(interval_seconds))
     while True:
         try:
             await asyncio.to_thread(heartbeat_worker, worker_id, "online")
@@ -332,4 +425,7 @@ async def heartbeat_loop(worker_id: str, interval_seconds: int = DEFAULT_HEARTBE
                 "Worker heartbeat failed worker_id=%s error=%s message=%r",
                 worker_id, type(exc).__name__, str(exc),
             )
-        await asyncio.sleep(interval_seconds)
+        current_interval = default_interval
+        if settings_cache is not None:
+            current_interval = max(1, int(settings_cache.get("worker.heartbeat_seconds", default_interval)))
+        await asyncio.sleep(current_interval)

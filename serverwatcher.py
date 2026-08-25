@@ -24,7 +24,9 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
-from control_plane import WORKER_ID, heartbeat_loop, load_effective_settings, register_worker, validate_worker_id
+from control_plane import (
+    WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker, validate_worker_id,
+)
 from models import (
     BF4Map,
     BF4PlayerAlias,
@@ -8055,9 +8057,12 @@ async def on_ready():
         log.error("Slash command sync failed error=%s message=%r", type(exc).__name__, str(exc))
 
     if WORKER_ID:
-        control_settings = load_effective_settings()
+        control_settings = RuntimeSettingsCache()
+        if not control_settings.refresh(WORKER_ID):
+            raise RuntimeError("Initial runtime settings load failed; refusing to start control-plane heartbeat")
         heartbeat_seconds = int(control_settings.get("worker.heartbeat_seconds", 5))
-        asyncio.create_task(heartbeat_loop(WORKER_ID, heartbeat_seconds))
+        asyncio.create_task(control_settings.refresh_loop(WORKER_ID))
+        asyncio.create_task(heartbeat_loop(WORKER_ID, heartbeat_seconds, settings_cache=control_settings))
         log.info(
             "Control-plane heartbeat started worker_id=%s heartbeat_seconds=%s",
             WORKER_ID, heartbeat_seconds,

@@ -991,3 +991,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 - Spectator reporting after Keeper team-0 data proved unreliable.
+
+## v3.0.0-pr1 — PR1-001 runtime refresh correction
+
+- Added a thread-safe in-memory cache for validated DB-backed runtime settings.
+- Added 30-second periodic refresh with last-known-good fallback on DB/validation failure.
+- Added change logging when an effective runtime value changes.
+- Updated worker-agent and production control-plane heartbeat loops so `worker.heartbeat_seconds` can change live without a container restart.
+- Preserved the existing `load_effective_settings(role_name=...)` API and lease behavior.
