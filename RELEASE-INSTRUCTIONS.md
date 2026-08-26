@@ -59,3 +59,11 @@ Recommended functional checks after upgrade:
 - Verify a map change recreates ETA/player-list messages below the new map announcement.
 - Verify `/refreshserverhz` only offers unresolved tick-rate servers.
 - Verify rich presence continues updating when one or more servers return isolated Keeper 404s.
+
+## v3.0.0-pr2 deployment checkpoint
+
+Before deployment, copy the Discord token to each host intended to be Discord-capable. A host without it will still run but will report `token_missing` and cannot lead Discord.
+
+After the first PR2 startup/migration and once all four workers are registered, apply `PR2_BOOTSTRAP.sql` as an operator policy step. Configure the private operator guild/channel IDs in `cluster_runtime_settings`, verify them, then enable operator notifications.
+
+All nodes run migrations through the same image/entrypoint. Do not designate rnt-01 as Alembic authority.

@@ -15,6 +15,9 @@ from sqlalchemy.exc import IntegrityError
 
 from db import SessionLocal
 from models import (
+    ClusterHandoffRequest,
+    ClusterOperatorEvent,
+    ClusterWorkerCapability,
     ClusterLease,
     ClusterRuntimeSetting,
     ClusterWorker,
@@ -43,6 +46,11 @@ SETTING_BOUNDS = {
     "keeper.403_flood_threshold": (2, 100),
     "presence.update_seconds": (10, 3600),
     "persona.base_retry_seconds": (30, 86400),
+    "discord.lease_ttl_seconds": (10, 300),
+    "discord.lease_renew_seconds": (1, 60),
+    "worker.failure_reminder_seconds": (60, 86400),
+    "operator.discord_guild_id": (0, 2**63 - 1),
+    "operator.discord_channel_id": (0, 2**63 - 1),
 }
 
 
@@ -224,6 +232,14 @@ def load_effective_settings(role_name: str | None = None) -> dict[str, Any]:
     stale = converted.get("worker.stale_after_seconds")
     if heartbeat is not None and stale is not None and stale <= heartbeat:
         raise ValueError("worker.stale_after_seconds must be greater than worker.heartbeat_seconds")
+
+    discord_ttl = converted.get("discord.lease_ttl_seconds")
+    discord_renew = converted.get("discord.lease_renew_seconds")
+    if discord_ttl is not None and discord_renew is not None and discord_renew >= discord_ttl:
+        raise ValueError(
+            "discord.lease_renew_seconds must be less than discord.lease_ttl_seconds"
+        )
+
     return converted
 
 
@@ -315,10 +331,363 @@ class RuntimeSettingsCache:
 
 
 @dataclass(frozen=True)
+class RoleCandidate:
+    worker_id: str
+    role_name: str
+    priority: int
+    worker_enabled: bool
+    worker_draining: bool
+    role_enabled: bool
+    last_heartbeat_at: datetime | None
+    stale: bool
+    capability_available: bool = False
+    capability_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class LeaseResult:
     acquired: bool
     generation: int
     expires_at: datetime | None
+
+
+@dataclass(frozen=True)
+class HandoffRequestSnapshot:
+    request_id: int
+    lease_key: str
+    lease_type: str
+    source_worker_id: str | None
+    target_worker_id: str | None
+    expected_generation: int
+    status: str
+    requested_by: str | None
+    requested_at: datetime
+    expires_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+def list_role_candidates(
+    role_name: str,
+    stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
+) -> list[RoleCandidate]:
+    role_name = str(role_name or "").strip()
+    if not role_name:
+        raise ValueError("role_name is required")
+
+    stale_after_seconds = max(1, int(stale_after_seconds))
+
+    with SessionLocal() as session:
+        db_now = session.scalar(select(func.now()))
+        rows = session.execute(
+            select(ClusterWorker, ClusterWorkerRole)
+            .join(
+                ClusterWorkerRole,
+                ClusterWorkerRole.worker_id == ClusterWorker.worker_id,
+            )
+            .where(ClusterWorkerRole.role_name == role_name)
+            .order_by(
+                ClusterWorkerRole.priority.asc(),
+                ClusterWorker.worker_id.asc(),
+            )
+        ).all()
+        capability_rows = list(session.scalars(
+            select(ClusterWorkerCapability).where(
+                ClusterWorkerCapability.capability_name == role_name
+            )
+        ))
+        capabilities = {row.worker_id: row for row in capability_rows}
+
+        candidates: list[RoleCandidate] = []
+        for worker, role in rows:
+            capability = capabilities.get(worker.worker_id)
+            last_heartbeat = worker.last_heartbeat_at
+            stale = (
+                last_heartbeat is None
+                or last_heartbeat <= db_now - timedelta(seconds=stale_after_seconds)
+            )
+            candidates.append(
+                RoleCandidate(
+                    worker_id=worker.worker_id,
+                    role_name=role.role_name,
+                    priority=int(role.priority if role.priority is not None else 100),
+                    worker_enabled=bool(worker.enabled),
+                    worker_draining=bool(worker.draining),
+                    role_enabled=bool(role.enabled),
+                    last_heartbeat_at=last_heartbeat,
+                    stale=stale,
+                    capability_available=bool(capability and capability.available),
+                    capability_reason=(capability.reason if capability else "capability_missing"),
+                )
+            )
+
+    return candidates
+
+
+def _handoff_snapshot(row: ClusterHandoffRequest) -> HandoffRequestSnapshot:
+    return HandoffRequestSnapshot(
+        request_id=int(row.id),
+        lease_key=row.lease_key,
+        lease_type=row.lease_type,
+        source_worker_id=row.source_worker_id,
+        target_worker_id=row.target_worker_id,
+        expected_generation=int(row.expected_generation),
+        status=row.status,
+        requested_by=row.requested_by,
+        requested_at=row.requested_at,
+        expires_at=row.expires_at,
+        started_at=row.started_at,
+        completed_at=row.completed_at,
+        failure_reason=row.failure_reason,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def create_handoff_request(
+    lease_key: str,
+    lease_type: str,
+    source_worker_id: str,
+    target_worker_id: str,
+    expected_generation: int,
+    requested_by: str | None = None,
+    ttl_seconds: int = 300,
+) -> HandoffRequestSnapshot:
+    lease_key = str(lease_key or "").strip()
+    lease_type = str(lease_type or "").strip()
+    if not lease_key:
+        raise ValueError("lease_key is required")
+    if not lease_type:
+        raise ValueError("lease_type is required")
+
+    source_worker_id = validate_worker_id(source_worker_id)
+    target_worker_id = validate_worker_id(target_worker_id)
+    if source_worker_id == target_worker_id:
+        raise ValueError("source_worker_id and target_worker_id must differ")
+
+    expected_generation = int(expected_generation)
+    if expected_generation < 1:
+        raise ValueError("expected_generation must be at least 1")
+
+    ttl_seconds = max(1, int(ttl_seconds))
+    requested_by = str(requested_by).strip()[:255] if requested_by else None
+
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+
+        source_worker = session.get(ClusterWorker, source_worker_id)
+        target_worker = session.get(ClusterWorker, target_worker_id)
+        if source_worker is None:
+            raise ValueError(f"source worker {source_worker_id!r} is not registered")
+        if target_worker is None:
+            raise ValueError(f"target worker {target_worker_id!r} is not registered")
+
+        existing = session.execute(
+            select(ClusterHandoffRequest)
+            .where(
+                ClusterHandoffRequest.lease_key == lease_key,
+                ClusterHandoffRequest.status.in_(("pending", "in_progress")),
+            )
+            .order_by(ClusterHandoffRequest.id.asc())
+            .with_for_update()
+        ).scalars().all()
+
+        for row in existing:
+            if row.expires_at <= db_now:
+                row.status = "expired"
+                row.completed_at = db_now
+                row.failure_reason = "request_expired"
+                row.updated_at = db_now
+            else:
+                raise RuntimeError(
+                    f"active handoff request already exists for lease {lease_key!r}"
+                )
+
+        row = ClusterHandoffRequest(
+            lease_key=lease_key,
+            lease_type=lease_type,
+            source_worker_id=source_worker_id,
+            target_worker_id=target_worker_id,
+            expected_generation=expected_generation,
+            status="pending",
+            requested_by=requested_by,
+            requested_at=db_now,
+            expires_at=db_now + timedelta(seconds=ttl_seconds),
+            started_at=None,
+            completed_at=None,
+            failure_reason=None,
+            created_at=db_now,
+            updated_at=db_now,
+        )
+        session.add(row)
+        session.flush()
+        return _handoff_snapshot(row)
+
+
+def get_active_handoff_request(
+    lease_key: str,
+    lease_type: str | None = None,
+) -> HandoffRequestSnapshot | None:
+    lease_key = str(lease_key or "").strip()
+    if not lease_key:
+        raise ValueError("lease_key is required")
+
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        query = (
+            select(ClusterHandoffRequest)
+            .where(
+                ClusterHandoffRequest.lease_key == lease_key,
+                ClusterHandoffRequest.status.in_(("pending", "in_progress")),
+            )
+            .order_by(ClusterHandoffRequest.id.asc())
+            .with_for_update()
+        )
+        if lease_type is not None:
+            query = query.where(
+                ClusterHandoffRequest.lease_type == str(lease_type).strip()
+            )
+
+        rows = session.execute(query).scalars().all()
+        for row in rows:
+            if row.expires_at <= db_now:
+                row.status = "expired"
+                row.completed_at = db_now
+                row.failure_reason = "request_expired"
+                row.updated_at = db_now
+                continue
+            return _handoff_snapshot(row)
+
+    return None
+
+
+def mark_handoff_started(
+    request_id: int,
+    expected_generation: int,
+) -> HandoffRequestSnapshot | None:
+    request_id = int(request_id)
+    expected_generation = int(expected_generation)
+
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        row = session.execute(
+            select(ClusterHandoffRequest)
+            .where(ClusterHandoffRequest.id == request_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if row is None:
+            return None
+        if row.status != "pending":
+            return _handoff_snapshot(row)
+        if row.expires_at <= db_now:
+            row.status = "expired"
+            row.completed_at = db_now
+            row.failure_reason = "request_expired"
+            row.updated_at = db_now
+            session.flush()
+            return _handoff_snapshot(row)
+        if int(row.expected_generation) != expected_generation:
+            row.status = "failed"
+            row.completed_at = db_now
+            row.failure_reason = "generation_changed"
+            row.updated_at = db_now
+            session.flush()
+            return _handoff_snapshot(row)
+
+        row.status = "in_progress"
+        row.started_at = db_now
+        row.updated_at = db_now
+        session.flush()
+        return _handoff_snapshot(row)
+
+
+def complete_handoff_request(request_id: int) -> HandoffRequestSnapshot | None:
+    request_id = int(request_id)
+
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        row = session.execute(
+            select(ClusterHandoffRequest)
+            .where(ClusterHandoffRequest.id == request_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if row is None:
+            return None
+        if row.status in {"completed", "failed", "cancelled", "expired"}:
+            return _handoff_snapshot(row)
+
+        row.status = "completed"
+        row.completed_at = db_now
+        row.failure_reason = None
+        row.updated_at = db_now
+        session.flush()
+        return _handoff_snapshot(row)
+
+
+def fail_handoff_request(
+    request_id: int,
+    failure_reason: str,
+    status: str = "failed",
+) -> HandoffRequestSnapshot | None:
+    request_id = int(request_id)
+    status = str(status or "").strip().lower()
+    if status not in {"failed", "cancelled", "expired"}:
+        raise ValueError("handoff failure status must be failed, cancelled, or expired")
+
+    reason = str(failure_reason or "").strip()
+    if not reason:
+        raise ValueError("failure_reason is required")
+
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        row = session.execute(
+            select(ClusterHandoffRequest)
+            .where(ClusterHandoffRequest.id == request_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if row is None:
+            return None
+        if row.status == "completed":
+            return _handoff_snapshot(row)
+
+        row.status = status
+        row.completed_at = db_now
+        row.failure_reason = reason
+        row.updated_at = db_now
+        session.flush()
+        return _handoff_snapshot(row)
+
+
+def expire_handoff_requests(lease_key: str | None = None) -> int:
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        query = (
+            select(ClusterHandoffRequest)
+            .where(
+                ClusterHandoffRequest.status.in_(("pending", "in_progress")),
+                ClusterHandoffRequest.expires_at <= db_now,
+            )
+            .with_for_update()
+        )
+        if lease_key is not None:
+            query = query.where(
+                ClusterHandoffRequest.lease_key == str(lease_key).strip()
+            )
+
+        rows = session.execute(query).scalars().all()
+        for row in rows:
+            row.status = "expired"
+            row.completed_at = db_now
+            row.failure_reason = "request_expired"
+            row.updated_at = db_now
+
+        return len(rows)
 
 
 def acquire_lease(lease_key: str, lease_type: str, worker_id: str, ttl_seconds: int, metadata: dict | None = None) -> LeaseResult:
@@ -429,3 +798,105 @@ async def heartbeat_loop(
         if settings_cache is not None:
             current_interval = max(1, int(settings_cache.get("worker.heartbeat_seconds", default_interval)))
         await asyncio.sleep(current_interval)
+
+
+
+def record_operator_event(event_key: str, event_type: str, severity: str, message: str, *, worker_id: str | None = None, reason: str | None = None, active: bool = True) -> int:
+    """Persist a deduplicated operator condition transition."""
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        current = session.execute(
+            select(ClusterOperatorEvent).where(
+                ClusterOperatorEvent.event_key == event_key,
+                ClusterOperatorEvent.active.is_(True),
+            ).order_by(ClusterOperatorEvent.id.desc()).with_for_update()
+        ).scalars().first()
+        if active and current is not None:
+            current.last_seen_at = now
+            current.updated_at = now
+            if reason is not None:
+                current.reason = reason
+            return int(current.id)
+        if not active and current is not None:
+            current.active = False
+            current.last_seen_at = now
+            current.resolved_at = now
+            current.updated_at = now
+        row = ClusterOperatorEvent(
+            event_key=event_key, event_type=event_type, severity=severity,
+            active=active, worker_id=worker_id, reason=reason, message=message,
+            first_seen_at=now, last_seen_at=now,
+            resolved_at=(None if active else now), notified_at=None,
+            created_at=now, updated_at=now,
+        )
+        session.add(row); session.flush()
+        return int(row.id)
+
+
+def report_worker_capability(worker_id: str, capability_name: str, available: bool, reason: str) -> None:
+    worker_id = validate_worker_id(worker_id)
+    capability_name = str(capability_name).strip().lower()
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        row = session.get(ClusterWorkerCapability, (worker_id, capability_name))
+        previous = None if row is None else bool(row.available)
+        previous_reason = None if row is None else row.reason
+        if row is None:
+            row = ClusterWorkerCapability(worker_id=worker_id, capability_name=capability_name, available=bool(available), reason=reason, checked_at=now, created_at=now, updated_at=now)
+            session.add(row)
+        else:
+            row.available=bool(available); row.reason=reason; row.checked_at=now; row.updated_at=now
+    if previous is None and available:
+        return
+    if previous is None or previous != bool(available) or previous_reason != reason:
+        if available:
+            record_operator_event(
+                f"capability:{capability_name}:{worker_id}", "capability_recovered", "info",
+                f"Worker `{worker_id}` {capability_name} capability is available again. It is eligible when its assigned role and health permit.",
+                worker_id=worker_id, reason=reason, active=False,
+            )
+        else:
+            record_operator_event(
+                f"capability:{capability_name}:{worker_id}", "capability_unavailable", "warning",
+                f"Worker `{worker_id}` is online, but {capability_name} capability is unavailable (`{reason}`). This worker cannot assume that role until its configuration is corrected.",
+                worker_id=worker_id, reason=reason, active=True,
+            )
+
+
+def ensure_new_worker_standby(worker_id: str) -> None:
+    """Give a newly registered worker only the non-privileged standby role."""
+    worker_id = validate_worker_id(worker_id)
+    with SessionLocal.begin() as session:
+        count = session.scalar(select(func.count()).select_from(ClusterWorkerRole).where(ClusterWorkerRole.worker_id == worker_id))
+        if int(count or 0) != 0:
+            return
+        now = session.scalar(select(func.now()))
+        session.add(ClusterWorkerRole(worker_id=worker_id, role_name="standby", enabled=True, priority=100, created_at=now, updated_at=now))
+
+
+def scan_worker_stale_transitions(stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS) -> None:
+    """Persist stale/recovered transitions; delivery is performed by Discord leader."""
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        workers = list(session.scalars(select(ClusterWorker)))
+        active = set(session.scalars(select(ClusterOperatorEvent.event_key).where(ClusterOperatorEvent.active.is_(True), ClusterOperatorEvent.event_type == "worker_stale")))
+    for worker in workers:
+        key=f"worker_stale:{worker.worker_id}"
+        stale = worker.last_heartbeat_at is None or worker.last_heartbeat_at <= now - timedelta(seconds=max(1,int(stale_after_seconds)))
+        if stale and key not in active:
+            record_operator_event(key,"worker_stale","warning",f"Worker `{worker.worker_id}` is stale and no longer eligible for cluster roles. Last heartbeat exceeded the {int(stale_after_seconds)}-second health threshold.",worker_id=worker.worker_id,reason="heartbeat_stale",active=True)
+        elif not stale and key in active:
+            record_operator_event(key,"worker_recovered","info",f"Worker `{worker.worker_id}` has recovered and is healthy again. It is eligible for its assigned cluster roles.",worker_id=worker.worker_id,reason="heartbeat_recovered",active=False)
+
+
+def pending_operator_events(limit: int = 25) -> list[tuple[int, str, str]]:
+    with SessionLocal() as session:
+        rows=list(session.scalars(select(ClusterOperatorEvent).where(ClusterOperatorEvent.notified_at.is_(None)).order_by(ClusterOperatorEvent.id.asc()).limit(max(1,int(limit)))))
+        return [(int(r.id),r.severity,r.message) for r in rows]
+
+
+def mark_operator_event_notified(event_id: int) -> None:
+    with SessionLocal.begin() as session:
+        row=session.get(ClusterOperatorEvent,int(event_id))
+        if row is not None and row.notified_at is None:
+            row.notified_at=func.now(); row.updated_at=func.now()

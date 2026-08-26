@@ -321,3 +321,51 @@ class ClusterLease(Base):
     lease_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterHandoffRequest(Base):
+    __tablename__ = "cluster_handoff_requests"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lease_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    lease_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_worker_id: Mapped[str | None] = mapped_column(String(100), ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"), nullable=True)
+    target_worker_id: Mapped[str | None] = mapped_column(String(100), ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"), nullable=True)
+    expected_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    requested_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterWorkerCapability(Base):
+    __tablename__ = "cluster_worker_capabilities"
+    worker_id: Mapped[str] = mapped_column(String(100), ForeignKey("cluster_workers.worker_id", ondelete="CASCADE"), primary_key=True)
+    capability_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterOperatorEvent(Base):
+    __tablename__ = "cluster_operator_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    worker_id: Mapped[str | None] = mapped_column(String(100), ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -772,9 +772,9 @@ deliberately enable those paths.
 
 # 2026-08-25 v3.0.0-pr1 Completion Record
 
-> **PR1 status:** COMPLETE
-> **Completion date:** 2026-08-25
-> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction
+> **PR1 status:** COMPLETE  
+> **Completion date:** 2026-08-25  
+> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction  
 > **Safety boundary:** Distributed Keeper work and movable Discord leadership remain disabled and belong to subsequent workload-specific PRs.
 
 ## Final four-site rollout
@@ -911,3 +911,10 @@ One non-blocking implementation note remains for future work: automated worker-h
 PR1 is now a closed implementation and validation checkpoint.
 
 Do not expand PR1 by activating distributed workloads retroactively. Subsequent PRs should build on this validated control-plane foundation and deliberately introduce workload ownership, leadership, and distribution one subsystem at a time.
+
+---
+## 2026-08-26 PR2 implementation refinement
+
+Discord leadership is now defined as a generation-scoped runtime with a fresh Discord client/tree per acquired lease generation. Control-plane heartbeat/settings remain process-scoped. Administrative roles, locally discovered capabilities, and liveness jointly determine eligibility. Priorities are non-preemptive: rnt-01 10, mak-01 20, kah-01 30, hnl-01 40.
+
+Database migration execution is no longer associated with a named application host. All common-image nodes serialize Alembic through a PostgreSQL advisory lock and verify the expected head before service startup.

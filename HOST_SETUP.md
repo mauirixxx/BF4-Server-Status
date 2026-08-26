@@ -808,9 +808,9 @@ deliberately enable those paths.
 
 # 2026-08-25 v3.0.0-pr1 Completion Record
 
-> **PR1 status:** COMPLETE
-> **Completion date:** 2026-08-25
-> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction
+> **PR1 status:** COMPLETE  
+> **Completion date:** 2026-08-25  
+> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction  
 > **Safety boundary:** Distributed Keeper work and movable Discord leadership remain disabled and belong to subsequent workload-specific PRs.
 
 ## Final four-site rollout

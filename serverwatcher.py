@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import copy
 import hashlib
 import html as html_lib
 import io
@@ -9,6 +10,7 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 import zipfile
 from collections import deque
@@ -25,8 +27,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
 from control_plane import (
-    WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker, validate_worker_id,
+    WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker,
+    set_worker_status, validate_worker_id, ensure_new_worker_standby,
+    report_worker_capability, scan_worker_stale_transitions,
+    pending_operator_events, mark_operator_event_notified,
 )
+from discord_leader import DiscordLeadershipSupervisor
 from models import (
     BF4Map,
     BF4PlayerAlias,
@@ -46,7 +52,7 @@ from models import (
     GuildSettings,
 )
 
-BOT_VERSION = "v3.0.0-pr1"
+BOT_VERSION = "v3.0.0-pr2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -64,8 +70,6 @@ load_dotenv(RUNTIME_DIR / ".env")
 load_dotenv(BASE_DIR / ".env")
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing. Add it to .env or the environment.")
 
 CHECK_INTERVAL_SECONDS = max(10, int(os.environ.get("CHECK_INTERVAL_SECONDS", "69")))
 PRESENCE_UPDATE_SECONDS = max(10, min(60, int(os.environ.get("PRESENCE_UPDATE_SECONDS", "30"))))
@@ -156,7 +160,14 @@ KEEPER_403_FLOOD_THRESHOLD = max(
 )
 VERSION_CACHE_SECONDS = 24 * 60 * 60
 VERSION_CACHE_PATH = RUNTIME_DIR / "version-check-cache.json"
-watcher_started = False
+DISCORD_SESSION_GENERATION: int | None = None
+DISCORD_READY_GENERATION: int | None = None
+DISCORD_SESSION_INIT_EVENT: asyncio.Event | None = None
+DISCORD_SESSION_INIT_ERROR: Exception | None = None
+DISCORD_CLIENT_TASK: asyncio.Task | None = None
+DISCORD_LEADER_TASKS: set[asyncio.Task] = set()
+PROCESS_SHUTDOWN_EVENT: asyncio.Event | None = None
+CONTROL_SETTINGS: RuntimeSettingsCache | None = None
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
 PLAYER_ROSTER_BASELINED: set[str] = set()
 PLAYER_ROSTER_RECOVERY_REQUIRED: set[str] = set()
@@ -1995,6 +2006,180 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+_TEMPLATE_CLIENT = client
+_TEMPLATE_TREE = tree
+
+
+def _fresh_discord_client_and_tree():
+    """Create a new Discord client/tree for each leadership generation."""
+    fresh_intents = discord.Intents.default()
+    fresh_intents.message_content = True
+    fresh_client = discord.Client(intents=fresh_intents)
+    fresh_tree = app_commands.CommandTree(fresh_client)
+    for command in _TEMPLATE_TREE.get_commands():
+        fresh_tree.add_command(copy.copy(command))
+    # Event handlers are ordinary module-level coroutine functions. Bind a
+    # fresh copy of those callbacks to this generation's client.
+    for name, value in list(globals().items()):
+        if name.startswith("on_") and name != "on_app_command_error" and asyncio.iscoroutinefunction(value):
+            fresh_client.event(value)
+    error_handler = globals().get("on_app_command_error")
+    if error_handler is not None:
+        fresh_tree.error(error_handler)
+    return fresh_client, fresh_tree
+
+
+def _track_discord_leader_task(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    DISCORD_LEADER_TASKS.add(task)
+
+    def _done(completed: asyncio.Task) -> None:
+        DISCORD_LEADER_TASKS.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            exc = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            log.error(
+                "Discord leader task failed task=%s error=%s message=%r",
+                name,
+                type(exc).__name__,
+                str(exc),
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _stop_discord_leader_tasks() -> None:
+    tasks = list(DISCORD_LEADER_TASKS)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    DISCORD_LEADER_TASKS.clear()
+
+
+async def start_discord_leader_session(generation: int) -> None:
+    """Start Discord and return only after leader-session initialization."""
+    global DISCORD_SESSION_GENERATION
+    global DISCORD_READY_GENERATION
+    global DISCORD_SESSION_INIT_EVENT
+    global DISCORD_SESSION_INIT_ERROR
+    global DISCORD_CLIENT_TASK
+    global client
+    global tree
+
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is unavailable on this worker")
+    if DISCORD_CLIENT_TASK is not None and not DISCORD_CLIENT_TASK.done():
+        raise RuntimeError("Discord client task is already running")
+
+    client, tree = _fresh_discord_client_and_tree()
+
+    DISCORD_SESSION_GENERATION = int(generation)
+    DISCORD_READY_GENERATION = None
+    DISCORD_SESSION_INIT_ERROR = None
+    DISCORD_SESSION_INIT_EVENT = asyncio.Event()
+
+    DISCORD_CLIENT_TASK = asyncio.create_task(
+        client.start(TOKEN, reconnect=True),
+        name=f"discord-client-g{generation}",
+    )
+    init_wait = asyncio.create_task(
+        DISCORD_SESSION_INIT_EVENT.wait(),
+        name=f"discord-init-wait-g{generation}",
+    )
+
+    try:
+        done, _ = await asyncio.wait(
+            {DISCORD_CLIENT_TASK, init_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if DISCORD_CLIENT_TASK in done and not DISCORD_SESSION_INIT_EVENT.is_set():
+            if DISCORD_CLIENT_TASK.cancelled():
+                raise RuntimeError("Discord client stopped before READY initialization")
+            exc = DISCORD_CLIENT_TASK.exception()
+            if exc is not None:
+                raise exc
+            raise RuntimeError("Discord client exited before READY initialization")
+
+        if DISCORD_SESSION_INIT_ERROR is not None:
+            raise DISCORD_SESSION_INIT_ERROR
+    finally:
+        init_wait.cancel()
+        await asyncio.gather(init_wait, return_exceptions=True)
+
+
+async def stop_discord_leader_session(reason: str) -> None:
+    """Stop leader-scoped tasks, then close the Discord client."""
+    global DISCORD_SESSION_GENERATION
+    global DISCORD_READY_GENERATION
+    global DISCORD_SESSION_INIT_EVENT
+    global DISCORD_SESSION_INIT_ERROR
+    global DISCORD_CLIENT_TASK
+
+    log.info(
+        "Discord session stopping worker_id=%s generation=%s reason=%s",
+        WORKER_ID,
+        DISCORD_SESSION_GENERATION,
+        reason,
+    )
+
+    await _stop_discord_leader_tasks()
+
+    if not client.is_closed():
+        await client.close()
+
+    client_task = DISCORD_CLIENT_TASK
+    if client_task is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(client_task),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            client_task.cancel()
+            await asyncio.gather(client_task, return_exceptions=True)
+        except Exception as exc:
+            log.warning(
+                "Discord client task ended with error during stop worker_id=%s "
+                "error=%s message=%r",
+                WORKER_ID,
+                type(exc).__name__,
+                str(exc),
+            )
+
+    DISCORD_CLIENT_TASK = None
+    DISCORD_SESSION_GENERATION = None
+    DISCORD_READY_GENERATION = None
+    DISCORD_SESSION_INIT_EVENT = None
+    DISCORD_SESSION_INIT_ERROR = None
+
+
+def discord_connection_healthy() -> bool:
+    return bool(
+        DISCORD_CLIENT_TASK is not None
+        and not DISCORD_CLIENT_TASK.done()
+        and not client.is_closed()
+        and client.is_ready()
+    )
+
+
+def create_discord_leadership_supervisor(
+    settings_cache: RuntimeSettingsCache,
+) -> DiscordLeadershipSupervisor:
+    return DiscordLeadershipSupervisor(
+        worker_id=WORKER_ID,
+        settings_cache=settings_cache,
+        discord_config_available=bool(TOKEN),
+        connect_callback=start_discord_leader_session,
+        disconnect_callback=stop_discord_leader_session,
+        is_connected_callback=discord_connection_healthy,
+    )
 
 
 def _tick_rate_label(value: int | None) -> str:
@@ -4015,7 +4200,7 @@ async def monitor_cycle():
 
 
 async def monitor_loop():
-    while not client.is_closed():
+    while True:
         try:
             await monitor_cycle()
         except Exception as exc:
@@ -4031,7 +4216,7 @@ async def monitor_loop():
 
 async def presence_loop():
     index = 0
-    while not client.is_closed():
+    while True:
         try:
             with SessionLocal() as session:
                 unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
@@ -4048,14 +4233,30 @@ async def presence_loop():
             index += 1
         except Exception as exc:
             log.warning("Presence update failed error=%s message=%r", type(exc).__name__, str(exc))
-        await asyncio.sleep(PRESENCE_UPDATE_SECONDS)
+        interval = PRESENCE_UPDATE_SECONDS
+        if CONTROL_SETTINGS is not None:
+            interval = max(10, int(CONTROL_SETTINGS.get("presence.update_seconds", interval)))
+        await asyncio.sleep(interval)
+
+
+async def _sleep_until_process_shutdown(seconds: float) -> bool:
+    event = PROCESS_SHUTDOWN_EVENT
+    if event is None:
+        await asyncio.sleep(seconds)
+        return False
+    try:
+        await asyncio.wait_for(event.wait(), timeout=max(0.0, float(seconds)))
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 async def version_loop():
     """Refresh version metadata for logs/!version only; never post Discord notices."""
-    while not client.is_closed():
+    while True:
         await asyncio.to_thread(refresh_latest_version)
-        await asyncio.sleep(VERSION_CHECK_INTERVAL_SECONDS)
+        if await _sleep_until_process_shutdown(VERSION_CHECK_INTERVAL_SECONDS):
+            return
 
 
 async def guild_cleanup_once():
@@ -4108,8 +4309,9 @@ def seconds_until_midnight_utc():
 
 
 async def guild_cleanup_loop():
-    while not client.is_closed():
-        await asyncio.sleep(seconds_until_midnight_utc())
+    while True:
+        if await _sleep_until_process_shutdown(seconds_until_midnight_utc()):
+            return
         await guild_cleanup_once()
 
 
@@ -8021,22 +8223,68 @@ async def on_app_command_error(
         pass
 
 
+async def operator_event_loop():
+    """Leader-only stale scan and private operator-event delivery."""
+    while not client.is_closed():
+        try:
+            stale_after = int(CONTROL_SETTINGS.get("worker.stale_after_seconds", 60)) if CONTROL_SETTINGS else 60
+            await asyncio.to_thread(scan_worker_stale_transitions, stale_after)
+            enabled = bool(CONTROL_SETTINGS.get("operator.notifications_enabled", False)) if CONTROL_SETTINGS else False
+            guild_id = int(CONTROL_SETTINGS.get("operator.discord_guild_id", 0)) if CONTROL_SETTINGS else 0
+            channel_id = int(CONTROL_SETTINGS.get("operator.discord_channel_id", 0)) if CONTROL_SETTINGS else 0
+            if enabled and guild_id and channel_id:
+                guild = client.get_guild(guild_id)
+                channel = guild.get_channel(channel_id) if guild is not None else None
+                if channel is not None:
+                    for event_id, severity, message in await asyncio.to_thread(pending_operator_events, 25):
+                        prefix = "⚠️ BF4 Server Watcher cluster warning" if severity != "info" else "✅ BF4 Server Watcher cluster recovery"
+                        await channel.send(f"{prefix}\n{message}")
+                        await asyncio.to_thread(mark_operator_event_notified, event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Operator event loop failed error=%s message=%r", type(exc).__name__, str(exc))
+        await asyncio.sleep(10)
+
+
 @client.event
 async def on_ready():
-    global watcher_started
-    log.info("READY bot=%s version=%s guilds=%s", client.user, BOT_VERSION, len(client.guilds))
-    if watcher_started:
+    global DISCORD_READY_GENERATION
+    global DISCORD_SESSION_INIT_ERROR
+
+    generation = DISCORD_SESSION_GENERATION
+    log.info(
+        "READY bot=%s version=%s guilds=%s worker_id=%s generation=%s",
+        client.user,
+        BOT_VERSION,
+        len(client.guilds),
+        WORKER_ID,
+        generation,
+    )
+
+    if generation is None:
+        log.error("Discord READY received without leadership generation")
         return
-    watcher_started = True
+
+    if DISCORD_READY_GENERATION == generation:
+        return
 
     try:
         for guild in client.guilds:
             ensure_guild_record(guild)
         log.info("Guild reconciliation complete guilds=%s", len(client.guilds))
     except Exception as exc:
-        log.critical("Guild reconciliation failed error=%s message=%r", type(exc).__name__, str(exc))
+        DISCORD_SESSION_INIT_ERROR = RuntimeError(
+            f"Guild reconciliation failed: {type(exc).__name__}: {exc}"
+        )
+        log.critical(
+            "Guild reconciliation failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
+        )
+        if DISCORD_SESSION_INIT_EVENT is not None:
+            DISCORD_SESSION_INIT_EVENT.set()
         return
-
 
     try:
         for guild in client.guilds:
@@ -8052,44 +8300,196 @@ async def on_ready():
 
     try:
         synced = await tree.sync()
-        log.info("Slash commands synced count=%s names=%s", len(synced), ",".join(f"/{c.name}" for c in synced))
-    except Exception as exc:
-        log.error("Slash command sync failed error=%s message=%r", type(exc).__name__, str(exc))
-
-    if WORKER_ID:
-        control_settings = RuntimeSettingsCache()
-        if not control_settings.refresh(WORKER_ID):
-            raise RuntimeError("Initial runtime settings load failed; refusing to start control-plane heartbeat")
-        heartbeat_seconds = int(control_settings.get("worker.heartbeat_seconds", 5))
-        asyncio.create_task(control_settings.refresh_loop(WORKER_ID))
-        asyncio.create_task(heartbeat_loop(WORKER_ID, heartbeat_seconds, settings_cache=control_settings))
         log.info(
-            "Control-plane heartbeat started worker_id=%s heartbeat_seconds=%s",
-            WORKER_ID, heartbeat_seconds,
+            "Slash commands synced count=%s names=%s",
+            len(synced),
+            ",".join(f"/{command.name}" for command in synced),
+        )
+    except Exception as exc:
+        log.error(
+            "Slash command sync failed error=%s message=%r",
+            type(exc).__name__,
+            str(exc),
         )
 
-    asyncio.create_task(monitor_loop())
-    asyncio.create_task(version_loop())
-    asyncio.create_task(presence_loop())
-    asyncio.create_task(guild_cleanup_loop())
+    DISCORD_READY_GENERATION = generation
+
+    # Presence follows Discord leadership on every eligible worker.
+    _track_discord_leader_task(
+        presence_loop(),
+        f"presence-g{generation}",
+    )
+    _track_discord_leader_task(version_loop(), f"version-g{generation}")
+    _track_discord_leader_task(guild_cleanup_loop(), f"guild-cleanup-g{generation}")
+    _track_discord_leader_task(operator_event_loop(), f"operator-events-g{generation}")
+
+    # PR2 deliberately does not distribute Keeper.  The existing production
+    # monitor remains on rnt-01 and runs only while rnt-01 also owns Discord,
+    # because the monitor currently performs Discord delivery directly.
+    if WORKER_ID == "rnt-01":
+        _track_discord_leader_task(
+            monitor_loop(),
+            f"monitor-g{generation}",
+        )
+        log.info(
+            "Keeper monitor active worker_id=%s generation=%s "
+            "distributed_work=disabled",
+            WORKER_ID,
+            generation,
+        )
+    else:
+        log.info(
+            "Keeper monitor not started worker_id=%s generation=%s "
+            "reason=pr2_single_owner_rnt_only distributed_work=disabled",
+            WORKER_ID,
+            generation,
+        )
+
     log.info(
-        "Background jobs started poll_seconds=%s presence_seconds=%s guild_cleanup='00:00 UTC'",
-        CHECK_INTERVAL_SECONDS, PRESENCE_UPDATE_SECONDS
+        "Discord leader session initialized worker_id=%s generation=%s "
+        "presence_seconds=%s",
+        WORKER_ID,
+        generation,
+        (
+            CONTROL_SETTINGS.get("presence.update_seconds", PRESENCE_UPDATE_SECONDS)
+            if CONTROL_SETTINGS is not None
+            else PRESENCE_UPDATE_SECONDS
+        ),
     )
 
+    if DISCORD_SESSION_INIT_EVENT is not None:
+        DISCORD_SESSION_INIT_EVENT.set()
 
-def main():
+
+def _install_shutdown_signal_handlers(shutdown_event: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown(sig_name: str) -> None:
+        log.info("Shutdown requested signal=%s", sig_name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig.name)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(
+                sig,
+                lambda _signum, _frame, name=sig.name: request_shutdown(name),
+            )
+
+
+async def _cancel_process_task(task: asyncio.Task | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def main_async():
+    global PROCESS_SHUTDOWN_EVENT
+    global CONTROL_SETTINGS
+
     log.info("Startup version=%s runtime_dir=%s", BOT_VERSION, RUNTIME_DIR)
     wait_for_database()
     log.info("Database startup check complete")
-    if WORKER_ID:
-        validate_worker_id(WORKER_ID)
-        register_worker(WORKER_ID, BOT_VERSION, status="starting")
-    else:
-        log.warning(
-            "WORKER_ID is not configured; v3 control-plane registration/heartbeat disabled for this process"
+
+    worker_id = validate_worker_id(WORKER_ID)
+    register_worker(worker_id, BOT_VERSION, status="starting")
+    ensure_new_worker_standby(worker_id)
+    await asyncio.to_thread(
+        report_worker_capability, worker_id, "discord", bool(TOKEN),
+        "ready" if TOKEN else "token_missing",
+    )
+
+    settings = RuntimeSettingsCache()
+    if not settings.refresh(worker_id):
+        raise RuntimeError(
+            "Initial runtime settings load failed; refusing to start without "
+            "a known-good control-plane configuration"
         )
-    client.run(TOKEN, log_handler=None)
+    CONTROL_SETTINGS = settings
+
+    required_pr2_settings = (
+        "discord.lease_ttl_seconds",
+        "discord.lease_renew_seconds",
+    )
+    missing_pr2_settings = [
+        key for key in required_pr2_settings
+        if settings.get(key) is None
+    ]
+    if missing_pr2_settings:
+        raise RuntimeError(
+            "Required PR2 runtime settings are missing: "
+            + ", ".join(missing_pr2_settings)
+            + ". Apply Alembic migration 0011 before starting v3.0.0-pr2."
+        )
+
+    heartbeat_seconds = int(settings.get("worker.heartbeat_seconds", 5))
+    PROCESS_SHUTDOWN_EVENT = asyncio.Event()
+    _install_shutdown_signal_handlers(PROCESS_SHUTDOWN_EVENT)
+
+    refresh_task = asyncio.create_task(
+        settings.refresh_loop(worker_id),
+        name="runtime-settings-refresh",
+    )
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(
+            worker_id,
+            heartbeat_seconds,
+            settings_cache=settings,
+        ),
+        name="control-plane-heartbeat",
+    )
+    supervisor = create_discord_leadership_supervisor(settings)
+    leadership_task = asyncio.create_task(
+        supervisor.run(),
+        name="discord-leadership-supervisor",
+    )
+
+    log.info(
+        "Control-plane process ready worker_id=%s heartbeat_seconds=%s "
+        "discord_candidate=%s keeper_owner=%s",
+        worker_id,
+        heartbeat_seconds,
+        bool(TOKEN),
+        worker_id == "rnt-01",
+    )
+
+    try:
+        await PROCESS_SHUTDOWN_EVENT.wait()
+    finally:
+        # Keep heartbeat/runtime settings alive while Discord closes and the
+        # generation-fenced lease is released.
+        supervisor.stop()
+        try:
+            await leadership_task
+        except Exception as exc:
+            log.warning(
+                "Discord leadership supervisor ended during shutdown "
+                "error=%s message=%r",
+                type(exc).__name__,
+                str(exc),
+            )
+
+        await _cancel_process_task(heartbeat_task)
+        await _cancel_process_task(refresh_task)
+
+        try:
+            set_worker_status(worker_id, "stopping")
+        except Exception as exc:
+            log.warning(
+                "Worker stopping status update failed worker_id=%s "
+                "error=%s message=%r",
+                worker_id,
+                type(exc).__name__,
+                str(exc),
+            )
+
+        log.info("Shutdown complete worker_id=%s", worker_id)
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

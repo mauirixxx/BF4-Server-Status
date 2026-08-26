@@ -5,7 +5,7 @@
 > **Project:** BF4 Server Watcher / BF4 Server Status / MapWatcher
 > lineage\
 > **Current stable release:** `v2.7.0`\
-> **Current v3 development build under validation:** `v3.0.0-pr1`\
+> **Current v3 development build under validation:** `v3.0.0-pr2`\
 > **Current deployed/tested milestone:** `v2.7.0` startup and primary UX
 > features validated on 2026-08-24\
 > **Next queued patch:** `v2.7.1`\
@@ -3118,9 +3118,9 @@ deliberately enable those paths.
 
 # 2026-08-25 v3.0.0-pr1 Completion Record
 
-> **PR1 status:** COMPLETE
-> **Completion date:** 2026-08-25
-> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction
+> **PR1 status:** COMPLETE  
+> **Completion date:** 2026-08-25  
+> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction  
 > **Safety boundary:** Distributed Keeper work and movable Discord leadership remain disabled and belong to subsequent workload-specific PRs.
 
 ## Final four-site rollout
@@ -3257,3 +3257,18 @@ One non-blocking implementation note remains for future work: automated worker-h
 PR1 is now a closed implementation and validation checkpoint.
 
 Do not expand PR1 by activating distributed workloads retroactively. Subsequent PRs should build on this validated control-plane foundation and deliberately introduce workload ownership, leadership, and distribution one subsystem at a time.
+
+---
+# 2026-08-26 v3.0.0-pr2 Discord Leadership Checkpoint
+
+PR2 activates movable singleton Discord leadership on the validated PR1 control plane. PostgreSQL remains authoritative. The lease is `discord:leader` / `discord_leader`, TTL 30 seconds, renewal 10 seconds, with generation fencing and fail-closed behavior at authority expiry.
+
+Normal non-preemptive acquisition preference is `rnt-01=10`, `mak-01=20`, `kah-01=30`, `hnl-01=40`. Targeted manual handoff temporarily overrides that preference. A failed target after incumbent release immediately ends exclusivity and resumes normal election.
+
+Discord capability and administrative role are separate. A missing token reports `token_missing`, leaves the worker healthy for other duties, and makes only Discord leadership unavailable. Unknown workers bootstrap with `standby` only.
+
+Operator cluster events are persisted and deduplicated. The private global operator guild/channel receives capability transitions, 60-second stale/recovered transitions, leadership/handoff failures and recoveries when delivery is possible. Customer guild channels are never a fallback.
+
+Every node is migration-capable. Alembic startup is serialized with a PostgreSQL advisory lock and schema-head verification; rnt-01 is not migration authority.
+
+PR2 intentionally leaves Keeper undistributed: it runs only on rnt-01 while rnt-01 owns Discord. Whole-rnt-01 loss remains unsurvivable while the sole PostgreSQL primary resides there. Those are explicit PR2 limitations, not claims of completed HA.

@@ -1299,9 +1299,9 @@ deliberately enable those paths.
 
 # 2026-08-25 v3.0.0-pr1 Completion Record
 
-> **PR1 status:** COMPLETE
-> **Completion date:** 2026-08-25
-> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction
+> **PR1 status:** COMPLETE  
+> **Completion date:** 2026-08-25  
+> **Validated build:** `v3.0.0-pr1` with PR1-001 runtime-settings refresh/recovery correction  
 > **Safety boundary:** Distributed Keeper work and movable Discord leadership remain disabled and belong to subsequent workload-specific PRs.
 
 ## Final four-site rollout
@@ -1438,3 +1438,10 @@ One non-blocking implementation note remains for future work: automated worker-h
 PR1 is now a closed implementation and validation checkpoint.
 
 Do not expand PR1 by activating distributed workloads retroactively. Subsequent PRs should build on this validated control-plane foundation and deliberately introduce workload ownership, leadership, and distribution one subsystem at a time.
+
+---
+## PR2 additions — 2026-08-26
+
+PR2 adds `cluster_handoff_requests`, `cluster_worker_capabilities`, and `cluster_operator_events`. Capabilities describe current technical availability; `cluster_worker_roles` remains administrative authorization. Operator events persist transition state so warnings/recoveries can be delivered after Discord leadership returns.
+
+All nodes are Alembic-capable. Startup migration is serialized by a PostgreSQL advisory lock and followed by exact head verification. No worker ID is the permanent migration authority.

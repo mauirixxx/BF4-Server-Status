@@ -1,8 +1,5 @@
 #!/bin/sh
 set -eu
-
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) INFO Running database migrations"
-alembic upgrade head
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) INFO Database migrations complete"
-
-exec python3 serverwatcher.py
+python3 /app/migrate_with_lock.py
+if [ "$#" -gt 0 ]; then exec "$@"; fi
+exec python3 /app/serverwatcher.py

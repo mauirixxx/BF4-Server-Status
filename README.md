@@ -789,3 +789,7 @@ The live `.env` file is intentionally excluded from release bundles and Git.
 Never commit Discord tokens or database credentials.
 
 Legacy `config.json` / `servers.json` files are not read by v3. They may be retained only as operator reference/backup material.
+
+## v3.0.0-pr2 distributed Discord leadership
+
+PR2 introduces PostgreSQL-fenced movable Discord leadership across registered workers. See `V3_PR2_DISCORD_LEADERSHIP.md`, `V3_PR2_TESTING.md`, and `V3_PR2_RELEASE_NOTES.md` before deployment. Keeper is intentionally not distributed in this pre-release.
