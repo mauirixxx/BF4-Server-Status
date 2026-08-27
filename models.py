@@ -369,3 +369,38 @@ class ClusterOperatorEvent(Base):
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class ClusterOperatorDestination(Base):
+    __tablename__ = "cluster_operator_destinations"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    destination_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    discord_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    discord_guild_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    discord_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    user_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_failure_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClusterOperatorEventDelivery(Base):
+    __tablename__ = "cluster_operator_event_deliveries"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("cluster_operator_events.id", ondelete="CASCADE"), nullable=False)
+    destination_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("cluster_operator_destinations.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (UniqueConstraint("event_id", "destination_id", name="uq_cluster_operator_event_delivery"),)

@@ -51,6 +51,9 @@ SETTING_BOUNDS = {
     "worker.failure_reminder_seconds": (60, 86400),
     "operator.discord_guild_id": (0, 2**63 - 1),
     "operator.discord_channel_id": (0, 2**63 - 1),
+    "operator.delivery_retry_initial_seconds": (1, 86400),
+    "operator.delivery_retry_max_seconds": (1, 604800),
+    "operator.delivery_permanent_retry_seconds": (60, 604800),
 }
 
 

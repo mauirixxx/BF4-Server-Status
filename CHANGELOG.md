@@ -1,16 +1,37 @@
 # Changelog
 
-## v3.0.0-pr1 - 2026-08-24
-
-- Added the PostgreSQL-backed v3 control-plane foundation: `cluster_workers`, `cluster_worker_roles`, `cluster_runtime_settings`, and `cluster_leases`.
-- Added stable `WORKER_ID` registration and a 5-second heartbeat foundation with 60-second stale policy seeded in runtime settings.
-- Added multiple-role schema support, global/role runtime setting scope, and atomic lease helper primitives with fencing generations.
-- Added `worker_agent.py` for registry/heartbeat-only testing on non-Discord worker nodes.
-- Retired the legacy v1 JSON runtime importer, `LEGACY_IMPORT_GUILD_ID`, `MigrationState`, and `migration_state`.
-- Preserved historical Alembic revisions and all human-readable companion/snapshot fields.
-- Distributed Keeper polling and Discord leader election remain disabled in PR1; current production ownership behavior is intentionally preserved.
-
 All notable changes to BF4 Server Watcher are recorded here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
+
+## [v3.0.0-pr3] - 2026-08-26
+
+### Added
+- Added database-backed operator channel and DM destinations with a protected primary operator bootstrapped from `PRIMARY_OPERATOR_DISCORD_USER_ID`.
+- Added durable per-event, per-destination delivery state with independent retries that survive leader failover and process restarts.
+- Added `/operator status` with live PostgreSQL-backed Discord leadership, worker health, Discord capability, configured destination, delivery queue, and active-problem status.
+- Added operator-only destination management and test commands plus a database-backed notification master switch.
+- Added event routing classes so warnings and recoveries reach channels and DM operators while informational events remain channel-only.
+
+### Changed
+- Replaced PR2's single operator channel delivery path with multi-destination fan-out.
+- Operator retry intervals are database-backed and hot-reloadable; failed deliveries retry indefinitely.
+- `!help` shows cluster operator commands only to authorized operators.
+
+### Security
+- The primary operator cannot be disabled or removed through Discord, and the final enabled DM operator cannot be disabled or removed.
+- Discord-capable PR3 workers require `PRIMARY_OPERATOR_DISCORD_USER_ID`; a mismatch with the canonical database primary operator fails startup rather than silently changing authority.
+
+## [v3.0.0-pr2] - 2026-08-26
+- Added generation-fenced `discord:leader` lease supervision (30s TTL / 10s renew).
+- Added targeted manual-handoff persistence and failure recovery.
+- Added generic worker capability reporting and Discord `token_missing` eligibility handling.
+- Added persisted/deduplicated private operator events, including 60-second worker stale/recovered transitions.
+- Added deterministic non-preemptive Discord priorities: rnt-01 10, mak-01 20, kah-01 30, hnl-01 40 (operator bootstrap SQL).
+- Added fresh Discord client/tree construction per leadership generation and generation-scoped task cancellation.
+- Added 30-second Docker stop grace period and graceful disconnect-before-release shutdown.
+- Added cluster-wide PostgreSQL advisory lock around Alembic startup and schema-head verification on every node.
+- Preserved PR2 limitation: Keeper remains undistributed and runs only on rnt-01 while it owns Discord leadership.
 
 ## [v2.7.0] - 2026-08-24
 
@@ -991,14 +1012,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 - Spectator reporting after Keeper team-0 data proved unreliable.
-
-## v3.0.0-pr2 — Discord leadership/failover pre-release
-- Added generation-fenced `discord:leader` lease supervision (30s TTL / 10s renew).
-- Added targeted manual-handoff persistence and failure recovery.
-- Added generic worker capability reporting and Discord `token_missing` eligibility handling.
-- Added persisted/deduplicated private operator events, including 60-second worker stale/recovered transitions.
-- Added deterministic non-preemptive Discord priorities: rnt-01 10, mak-01 20, kah-01 30, hnl-01 40 (operator bootstrap SQL).
-- Added fresh Discord client/tree construction per leadership generation and generation-scoped task cancellation.
-- Added 30-second Docker stop grace period and graceful disconnect-before-release shutdown.
-- Added cluster-wide PostgreSQL advisory lock around Alembic startup and schema-head verification on every node.
-- Preserved PR2 limitation: Keeper remains undistributed and runs only on rnt-01 while it owns Discord leadership.

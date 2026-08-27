@@ -793,3 +793,12 @@ Legacy `config.json` / `servers.json` files are not read by v3. They may be reta
 ## v3.0.0-pr2 distributed Discord leadership
 
 PR2 introduces PostgreSQL-fenced movable Discord leadership across registered workers. See `V3_PR2_DISCORD_LEADERSHIP.md`, `V3_PR2_TESTING.md`, and `V3_PR2_RELEASE_NOTES.md` before deployment. Keeper is intentionally not distributed in this pre-release.
+
+
+## v3.0.0-pr3 operator notifications
+
+PR3 adds database-backed cluster operator notification destinations and durable per-destination delivery state. Set `PRIMARY_OPERATOR_DISCORD_USER_ID` to the same immutable Discord user ID on every Discord-capable worker. The primary operator is bootstrapped automatically and cannot be disabled or removed through Discord.
+
+Warnings and recoveries are delivered to every enabled operator channel and enabled DM operator. Informational control-plane events are channel-only. Delivery failures are isolated per destination and retry indefinitely with DB-backed hot-reloadable backoff settings.
+
+Cluster operators can use `/operator status`, `/operator destinations list|add-user|add-channel|enable|disable|remove|test`, and `/operator notifications enable|disable|status`. Operator command responses are ephemeral and authorization is read directly from PostgreSQL.

@@ -32,6 +32,7 @@ from control_plane import (
     report_worker_capability, scan_worker_stale_transitions,
     pending_operator_events, mark_operator_event_notified,
 )
+from operator_notifications import (bootstrap_primary_operator, is_operator, list_destinations, add_dm, add_channel, set_destination_enabled, remove_destination, ensure_delivery_rows, due_deliveries, mark_delivery_success, mark_delivery_failure, cluster_status_snapshot, delivery_class, set_notifications_enabled)
 from discord_leader import DiscordLeadershipSupervisor
 from models import (
     BF4Map,
@@ -52,13 +53,14 @@ from models import (
     GuildSettings,
 )
 
-BOT_VERSION = "v3.0.0-pr2"
+BOT_VERSION = "v3.0.0-pr3"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
 AAA_NAME = "AAA"
 LOCKER_KEY = "MP_Prison"
 LOCKER_MESSAGE = "Operation Locker is now live!"
+PRIMARY_OPERATOR_DISCORD_USER_ID = int(os.environ.get("PRIMARY_OPERATOR_DISCORD_USER_ID", "0") or 0)
 MANUAL_ANNOUNCEMENT_TTL_SECONDS = 600
 ROLE_PANEL_BUTTONS_PER_MESSAGE = 15
 ROLE_PANEL_RECONCILE_DELAY_SECONDS = 3.0
@@ -7860,6 +7862,136 @@ async def announce(interaction: discord.Interaction):
     )
 
 
+
+async def prepare_operator(interaction: discord.Interaction) -> bool:
+    if not await asyncio.to_thread(is_operator, interaction.user.id):
+        if interaction.response.is_done():
+            await interaction.followup.send("⛔ Cluster operator authorization required.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⛔ Cluster operator authorization required.", ephemeral=True)
+        return False
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    return True
+
+operator_group=app_commands.Group(name="operator",description="Cluster operator controls")
+operator_destinations=app_commands.Group(name="destinations",description="Operator notification destinations",parent=operator_group)
+operator_notifications=app_commands.Group(name="notifications",description="Operator notification controls",parent=operator_group)
+
+def _destination_label(d):
+    if d.destination_type=="dm": return f"DM {d.user_name or d.discord_user_id}" + (" — Primary" if d.is_primary else "")
+    return f"#{d.channel_name or d.discord_channel_id} — {d.guild_name or d.discord_guild_id}"
+
+@operator_group.command(name="status",description="Show live cluster and operator notification status")
+async def operator_status(interaction:discord.Interaction):
+    if not await prepare_operator(interaction): return
+    lease,workers,caps,dests,pending,retrying,problems=await asyncio.to_thread(cluster_status_snapshot)
+    lines=["**BF4 Server Watcher — Cluster Status**","","**Discord Leader**",f"{lease.owner_worker_id if lease else 'None'} — generation {lease.generation if lease else 0}","","**Workers**"]
+    now=datetime.now(timezone.utc)
+    stale_after=int(CONTROL_SETTINGS.get("worker.stale_after_seconds",60)) if CONTROL_SETTINGS else 60
+    for w in workers:
+        age=(now-w.last_heartbeat_at).total_seconds() if w.last_heartbeat_at else 999999
+        online=age<=stale_after
+        cap=caps.get(w.worker_id); captext="Ready" if cap and cap.available else (cap.reason if cap else "Unknown")
+        lines.append(f"{'🟢' if online else '🔴'} `{w.worker_id}` — {'Online' if online else 'Stale'} — Discord: {captext}")
+    channels=[d for d in dests if d.destination_type=='channel']; dms=[d for d in dests if d.destination_type=='dm']
+    lines += ["","**Operator Notifications**", "🟢 Enabled" if bool(CONTROL_SETTINGS.get('operator.notifications_enabled',False)) else "⚫ Disabled", "",f"**Channels: {sum(d.enabled for d in channels)} enabled, {sum(not d.enabled for d in channels)} disabled**"]
+    lines += [f"  {'🟢' if d.enabled and not d.last_failure_reason else '🔴' if d.enabled else '⚫'} {_destination_label(d)}" + (f" — `{d.last_failure_reason}`" if d.last_failure_reason else "") for d in channels] or ["  None configured"]
+    lines += ["",f"**DM Operators: {sum(d.enabled for d in dms)} enabled, {sum(not d.enabled for d in dms)} disabled**"]
+    lines += [f"  {'🟢' if d.enabled and not d.last_failure_reason else '🔴' if d.enabled else '⚫'} {_destination_label(d)}" + (f" — `{d.last_failure_reason}`" if d.last_failure_reason else "") for d in dms] or ["  None configured"]
+    lines += ["",f"Pending deliveries: **{pending}**",f"Retrying deliveries: **{retrying}**","","**Active Problems**"]
+    lines += [f"⚠️ {e.message}" for e in problems] or ["None"]
+    text="\n".join(lines)
+    for i in range(0,len(text),1900): await interaction.followup.send(text[i:i+1900],ephemeral=True)
+
+@operator_destinations.command(name="list",description="List configured operator notification destinations")
+async def operator_dest_list(interaction:discord.Interaction):
+    if not await prepare_operator(interaction): return
+    dests=await asyncio.to_thread(list_destinations)
+    text="**Operator destinations**\n"+"\n".join(f"`{d.id}` — {'enabled' if d.enabled else 'disabled'} — {_destination_label(d)}" for d in dests)
+    await interaction.followup.send(text or "No destinations configured.",ephemeral=True)
+
+@operator_destinations.command(name="add-user",description="Add a Discord user as a DM operator")
+async def operator_add_user(interaction:discord.Interaction,user:discord.User,description:str|None=None):
+    if not await prepare_operator(interaction): return
+    did=await asyncio.to_thread(add_dm,user.id,str(user),description)
+    await interaction.followup.send(f"✅ Added DM operator {user.mention}. Destination ID: `{did}`",ephemeral=True)
+
+@operator_destinations.command(name="add-channel",description="Add an operator notification channel")
+async def operator_add_channel(interaction:discord.Interaction,channel:discord.TextChannel,description:str|None=None):
+    if not await prepare_operator(interaction): return
+    did=await asyncio.to_thread(add_channel,channel.guild.id,channel.id,channel.guild.name,channel.name,description)
+    await interaction.followup.send(f"✅ Added {channel.mention}. Destination ID: `{did}`",ephemeral=True)
+
+@operator_destinations.command(name="enable",description="Enable an operator destination")
+async def operator_dest_enable(interaction:discord.Interaction,destination_id:int):
+    if not await prepare_operator(interaction): return
+    try: await asyncio.to_thread(set_destination_enabled,destination_id,True); msg="✅ Destination enabled."
+    except ValueError as e: msg=f"⚠️ {e}"
+    await interaction.followup.send(msg,ephemeral=True)
+
+@operator_destinations.command(name="disable",description="Disable an operator destination")
+async def operator_dest_disable(interaction:discord.Interaction,destination_id:int):
+    if not await prepare_operator(interaction): return
+    try: await asyncio.to_thread(set_destination_enabled,destination_id,False); msg="✅ Destination disabled."
+    except ValueError as e: msg=f"⚠️ {e}"
+    await interaction.followup.send(msg,ephemeral=True)
+
+@operator_destinations.command(name="remove",description="Remove an operator destination")
+async def operator_dest_remove(interaction:discord.Interaction,destination_id:int):
+    if not await prepare_operator(interaction): return
+    try: await asyncio.to_thread(remove_destination,destination_id); msg="✅ Destination removed."
+    except ValueError as e: msg=f"⚠️ {e}"
+    await interaction.followup.send(msg,ephemeral=True)
+
+async def _send_operator_test(d):
+    payload=f"🧪 BF4 Server Watcher operator notification test\n\nThis is a test of the configured operator notification path.\n\nSent: <t:{int(time.time())}:F>"
+    if d.destination_type=='channel':
+        guild=client.get_guild(int(d.discord_guild_id)); target=guild.get_channel(int(d.discord_channel_id)) if guild else None
+        if target is None: raise LookupError('channel_unavailable')
+    else: target=client.get_user(int(d.discord_user_id)) or await client.fetch_user(int(d.discord_user_id))
+    await target.send(payload,suppress_embeds=True)
+
+@operator_destinations.command(name="test",description="Test one destination, or all enabled destinations")
+async def operator_dest_test(interaction:discord.Interaction,destination_id:int|None=None):
+    if not await prepare_operator(interaction): return
+    dests=await asyncio.to_thread(list_destinations); dests=[d for d in dests if d.id==destination_id] if destination_id is not None else [d for d in dests if d.enabled]
+    results=[]
+    for d in dests:
+        try: await _send_operator_test(d); results.append(f"🟢 {_destination_label(d)} — delivered")
+        except Exception as e: results.append(f"🔴 {_destination_label(d)} — {type(e).__name__}")
+    await interaction.followup.send("**Operator destination test complete**\n"+("\n".join(results) if results else "No matching destinations."),ephemeral=True)
+
+async def operator_destination_autocomplete(interaction:discord.Interaction,current:int):
+    try:
+        if not await asyncio.to_thread(is_operator,interaction.user.id): return []
+        dests=await asyncio.to_thread(list_destinations)
+        return [app_commands.Choice(name=f"{d.id} — {_destination_label(d)}"[:100],value=int(d.id)) for d in dests[:25]]
+    except Exception:
+        return []
+
+operator_dest_enable.autocomplete("destination_id")(operator_destination_autocomplete)
+operator_dest_disable.autocomplete("destination_id")(operator_destination_autocomplete)
+operator_dest_remove.autocomplete("destination_id")(operator_destination_autocomplete)
+operator_dest_test.autocomplete("destination_id")(operator_destination_autocomplete)
+
+@operator_notifications.command(name="enable",description="Enable operator event delivery")
+async def operator_notify_enable(interaction:discord.Interaction):
+    if not await prepare_operator(interaction): return
+    await asyncio.to_thread(set_notifications_enabled,True,f"discord:{interaction.user.id}"); CONTROL_SETTINGS.refresh(WORKER_ID); await interaction.followup.send("✅ Operator notifications enabled.",ephemeral=True)
+
+@operator_notifications.command(name="disable",description="Disable operator event delivery")
+async def operator_notify_disable(interaction:discord.Interaction):
+    if not await prepare_operator(interaction): return
+    await asyncio.to_thread(set_notifications_enabled,False,f"discord:{interaction.user.id}"); CONTROL_SETTINGS.refresh(WORKER_ID); await interaction.followup.send("✅ Operator notifications disabled.",ephemeral=True)
+
+@operator_notifications.command(name="status",description="Show operator notification master state")
+async def operator_notify_status(interaction:discord.Interaction):
+    if not await prepare_operator(interaction): return
+    await interaction.followup.send(f"Operator notifications are **{'enabled' if bool(CONTROL_SETTINGS.get('operator.notifications_enabled',False)) else 'disabled'}**.",ephemeral=True)
+
+tree.add_command(operator_group)
+
 def help_messages(member: discord.Member):
     basic = "\n".join([
         f"🤖 **BF4 Server Watcher Help — {BOT_VERSION}**",
@@ -7871,8 +8003,14 @@ def help_messages(member: discord.Member):
         "`!status <server-name> players` — show a team player roster.",
         "`!version` — show installed/latest version.",
     ])
+    operator_help = ""
+    try:
+        if is_operator(member.id):
+            operator_help = "\n\n**Cluster operator commands**\n`/operator status` — live DB-backed cluster status.\n`/operator destinations ...` — manage and test channel/DM destinations.\n`/operator notifications ...` — control operator delivery."
+    except Exception:
+        pass
     if not can_manage(member):
-        return [basic]
+        return [basic + operator_help]
 
     settings = get_settings(member.guild.id)
     mgmt = "\n".join([
@@ -7895,6 +8033,9 @@ def help_messages(member: discord.Member):
         f"Global polling interval: **{CHECK_INTERVAL_SECONDS} seconds** (.env)",
         f"Global presence interval: **{PRESENCE_UPDATE_SECONDS} seconds** (.env)",
     ])
+
+    if operator_help:
+        mgmt += operator_help
 
     server_lines = platform_server_list(
         member.guild.id,
@@ -8224,22 +8365,34 @@ async def on_app_command_error(
 
 
 async def operator_event_loop():
-    """Leader-only stale scan and private operator-event delivery."""
+    """Leader-only stale scan and durable multi-destination operator delivery."""
     while not client.is_closed():
         try:
             stale_after = int(CONTROL_SETTINGS.get("worker.stale_after_seconds", 60)) if CONTROL_SETTINGS else 60
             await asyncio.to_thread(scan_worker_stale_transitions, stale_after)
             enabled = bool(CONTROL_SETTINGS.get("operator.notifications_enabled", False)) if CONTROL_SETTINGS else False
-            guild_id = int(CONTROL_SETTINGS.get("operator.discord_guild_id", 0)) if CONTROL_SETTINGS else 0
-            channel_id = int(CONTROL_SETTINGS.get("operator.discord_channel_id", 0)) if CONTROL_SETTINGS else 0
-            if enabled and guild_id and channel_id:
-                guild = client.get_guild(guild_id)
-                channel = guild.get_channel(channel_id) if guild is not None else None
-                if channel is not None:
-                    for event_id, severity, message in await asyncio.to_thread(pending_operator_events, 25):
-                        prefix = "⚠️ BF4 Server Watcher cluster warning" if severity != "info" else "✅ BF4 Server Watcher cluster recovery"
-                        await channel.send(f"{prefix}\n{message}")
-                        await asyncio.to_thread(mark_operator_event_notified, event_id)
+            if enabled:
+                await asyncio.to_thread(ensure_delivery_rows)
+                initial=int(CONTROL_SETTINGS.get("operator.delivery_retry_initial_seconds",60))
+                maximum=int(CONTROL_SETTINGS.get("operator.delivery_retry_max_seconds",86400))
+                permanent_delay=int(CONTROL_SETTINGS.get("operator.delivery_permanent_retry_seconds",86400))
+                for row in await asyncio.to_thread(due_deliveries,25):
+                    delivery_id,event_id,event_type,severity,message,seen_at,destination_id,dtype,user_id,guild_id,channel_id=row
+                    cls="recovery" if event_type in {"worker_recovered","capability_recovered"} else ("alert" if severity != "info" else "info")
+                    title={"alert":"⚠️ BF4 Server Watcher cluster warning","recovery":"✅ BF4 Server Watcher cluster recovery","info":"ℹ️ BF4 Server Watcher cluster event"}[cls]
+                    stamp=int(seen_at.timestamp()) if seen_at else int(time.time())
+                    payload=f"{title}\n\n{message}\n\nOccurred: <t:{stamp}:F>"
+                    try:
+                        if dtype=="channel":
+                            guild=client.get_guild(int(guild_id)); target=guild.get_channel(int(channel_id)) if guild else None
+                            if target is None: raise LookupError("channel_unavailable")
+                        else:
+                            target=client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
+                        await target.send(payload, suppress_embeds=True)
+                        await asyncio.to_thread(mark_delivery_success,delivery_id)
+                    except Exception as exc:
+                        permanent=isinstance(exc,(discord.Forbidden,discord.NotFound,LookupError))
+                        await asyncio.to_thread(mark_delivery_failure,delivery_id,f"{type(exc).__name__}: {exc}",permanent,initial,maximum,permanent_delay)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8395,6 +8548,10 @@ async def main_async():
 
     worker_id = validate_worker_id(WORKER_ID)
     register_worker(worker_id, BOT_VERSION, status="starting")
+    if TOKEN and not PRIMARY_OPERATOR_DISCORD_USER_ID:
+        raise RuntimeError("PRIMARY_OPERATOR_DISCORD_USER_ID is required on Discord-capable PR3 workers")
+    if PRIMARY_OPERATOR_DISCORD_USER_ID:
+        await asyncio.to_thread(bootstrap_primary_operator, PRIMARY_OPERATOR_DISCORD_USER_ID)
     ensure_new_worker_standby(worker_id)
     await asyncio.to_thread(
         report_worker_capability, worker_id, "discord", bool(TOKEN),
@@ -8421,7 +8578,7 @@ async def main_async():
         raise RuntimeError(
             "Required PR2 runtime settings are missing: "
             + ", ".join(missing_pr2_settings)
-            + ". Apply Alembic migration 0011 before starting v3.0.0-pr2."
+            + ". Apply Alembic migrations through 0012 before starting v3.0.0-pr3."
         )
 
     heartbeat_seconds = int(settings.get("worker.heartbeat_seconds", 5))
