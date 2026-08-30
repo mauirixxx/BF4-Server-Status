@@ -4,6 +4,53 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning.
 
+## [v3.0.0] - 2026-08-30
+
+### Added
+- Added the distributed v3 worker control plane with PostgreSQL-backed worker registration, health, capabilities, drain state, runtime configuration, and operator visibility.
+- Added deterministic HRW-based Keeper server assignment across eligible workers so each unique BF4 server GUID is owned by exactly one worker per polling lane while automatically redistributing work when workers drain, fail, or recover.
+- Added distributed Keeper rate gating with database-backed aggregate request budgets shared across workers and egress paths.
+- Added a dedicated fast/default-server Keeper lane alongside the bulk polling lane, preserving a single lookup owner per server while improving responsiveness for announcement-critical default servers.
+- Added distributed automatic persona enrichment for unresolved open player sessions, including deterministic worker assignment, claims, retry state, and failure redistribution.
+- Added database-backed Discord leadership with generation fencing, worker eligibility, graceful handoff, and automatic failover between Discord-capable workers.
+- Added cluster operator controls for worker status, draining, resuming, Discord leadership visibility, notification routing, and distributed subsystem health.
+- Added durable operator notifications with channel/DM destinations, retry state, deduplication, recovery events, and a database-backed notification master switch.
+- Added Alembic migrations through `0017_v3_0_0_persona_dist` for the distributed Keeper, rate-gate, fast-lane, and persona-enrichment architecture.
+- Added a canonical v3.0.0 schema snapshot, final validation record, release notes, and updated project source-of-truth/roadmap documentation.
+
+### Changed
+- Keeper polling is no longer tied to the active Discord leader. Eligible workers participate independently in the distributed Keeper workload while Discord leadership remains a separately leased singleton role.
+- Keeper polling policy moved from host-local environment configuration to PostgreSQL-backed runtime settings for distributed enablement, global/fast/bulk request budgets, and sweep timing.
+- Default-server polling is prioritized through the fast lane without increasing the configured aggregate Keeper request budget.
+- Automatic persona enrichment now distributes live unresolved-session work across eligible workers while preserving the policy that closed unresolved historical sessions do not consume automatic retry traffic.
+- Worker drain state is persistent and removes a worker from Keeper, persona, and Discord-leadership eligibility before maintenance or restart; resuming returns it to deterministic assignment.
+- Discord leadership uses generation-scoped clients/tasks and fencing so stale leaders cannot continue operating after ownership changes.
+- Database-backed command/autocomplete work and player-history processing that could block Discord interaction handling are moved off the asyncio event loop where appropriate.
+- Map-name resolution now uses a process-local cache for static BF4 map reference data, eliminating repeated synchronous PostgreSQL lookups during monitor-cycle aggregation and player-history processing.
+- `/status all` now contains individual Keeper lookup failures instead of allowing one failed server request to abort the entire command.
+- Final v3.0.0 runtime and deployment metadata replace the release-candidate/hotfix identifiers after production validation.
+
+### Fixed
+- Fixed intermittent Discord `10062 Unknown interaction` failures caused by synchronous PostgreSQL work delaying interaction responses during busy monitor cycles.
+- Fixed operator and management interaction paths so acknowledgement/defer occurs before potentially slow database-backed authorization work.
+- Fixed DB-backed server-choice autocomplete paths that could synchronously block the Discord event loop.
+- Fixed a post-player-display monitor-cycle stall caused by repeatedly querying PostgreSQL for map names across fresh server snapshots.
+- Fixed player-history processing so its substantial synchronous SQLAlchemy work no longer runs directly on the Discord event loop.
+- Improved `/status all` resilience when individual Keeper requests return HTTP errors.
+
+### Reliability
+- Validated distributed Keeper coverage with 69 unique server GUIDs and no assignment gaps during worker drain, restart, failure, recovery, and Discord-leadership transitions.
+- Validated Discord generation-fenced leadership handoffs across workers without coupling Keeper ownership to the active Discord leader.
+- Validated distributed persona-enrichment redistribution during worker failure and recovery.
+- Validated final production rollout across `hnl-01`, `kah-01`, `mak-01`, and `rnt-01` with all four workers online, Keeper coverage restored to 69 unique servers, persona distribution enabled, and no active operator problems.
+- Reduced the diagnosed post-display aggregate section from approximately six seconds of event-loop blocking to approximately 0.001 seconds in the HF2 production canary.
+
+### Preserved
+- Preserves the conservative aggregate Keeper request budget of `0.33` requests/second, split between the bulk and fast lanes rather than multiplied per worker.
+- Preserves global unique-GUID deduplication and reuses a server snapshot for all guild references to the same physical BF4 server.
+- Preserves existing Discord announcement, persistent player-list, watched-player, session-history, map-role, and multi-guild behavior while changing the infrastructure underneath them.
+- Historical closed unresolved persona sessions remain outside the automatic enrichment loop; any future historical backfill remains an explicit maintenance operation.
+
 ## [v3.0.0-pr3] - 2026-08-26
 
 ### Added
