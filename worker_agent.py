@@ -1,8 +1,9 @@
 """BF4 Server Watcher PR2 remote worker entry point.
 
-PR2 remote workers run the same control-plane/Discord leadership lifecycle as
-serverwatcher.py. Keeper remains explicitly guarded to rnt-01 inside the
-leader session, so remote agents cannot start Keeper polling in PR2.
+PR4-D remote workers run the same control-plane/Discord leadership lifecycle as
+serverwatcher.py. When keeper.distributed_enabled is true, every eligible worker
+acquires only its HRW-owned Keeper snapshots while the fenced Discord leader
+remains the sole processor of Discord/database side effects.
 """
 from serverwatcher import main
 

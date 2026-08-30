@@ -135,6 +135,7 @@ class BF4PlayerSession(Base):
     time_joined: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     time_left: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    persona_alert_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class BF4PlayerAlias(Base):
@@ -185,6 +186,27 @@ class GuildPlayerWatchAlert(Base):
         primary_key=True,
     )
     alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PlayerPersonaEnrichmentState(Base):
+    __tablename__ = "player_persona_enrichment_state"
+    server_guid: Mapped[str] = mapped_column(
+        String(36), ForeignKey("bf4_servers.server_guid", ondelete="CASCADE"), primary_key=True
+    )
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    no_progress_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_result: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claim_worker_id: Mapped[str | None] = mapped_column(
+        String(100), ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"), nullable=True
+    )
+    claim_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class BF4Map(Base):
@@ -319,6 +341,27 @@ class ClusterLease(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     lease_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class KeeperRateGate(Base):
+    __tablename__ = "keeper_rate_gate"
+    gate_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    next_request_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    total_grants: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class KeeperSnapshot(Base):
+    __tablename__ = "keeper_snapshots"
+    server_guid: Mapped[str] = mapped_column(String(36), primary_key=True)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    fetch_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

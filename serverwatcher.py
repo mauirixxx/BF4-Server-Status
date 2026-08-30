@@ -22,15 +22,16 @@ import discord
 import requests
 from discord import app_commands
 from dotenv import load_dotenv
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
 from control_plane import (
     WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker,
-    set_worker_status, validate_worker_id, ensure_new_worker_standby,
+    set_worker_status, set_worker_draining, list_workers, validate_worker_id, ensure_new_worker_standby,
     report_worker_capability, scan_worker_stale_transitions,
-    pending_operator_events, mark_operator_event_notified,
+    pending_operator_events, mark_operator_event_notified, keeper_assignment_snapshot,
+    wait_for_keeper_cluster_slot, persona_assignment_snapshot, wait_for_persona_cluster_slot,
 )
 from operator_notifications import (bootstrap_primary_operator, is_operator, list_destinations, add_dm, add_channel, set_destination_enabled, remove_destination, ensure_delivery_rows, due_deliveries, mark_delivery_success, mark_delivery_failure, cluster_status_snapshot, delivery_class, set_notifications_enabled)
 from discord_leader import DiscordLeadershipSupervisor
@@ -51,9 +52,11 @@ from models import (
     GuildServerPlayerMessage,
     GuildServerState,
     GuildSettings,
+    KeeperSnapshot,
+    PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.0.0-pr3"
+BOT_VERSION = "v3.0.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -168,6 +171,8 @@ DISCORD_SESSION_INIT_EVENT: asyncio.Event | None = None
 DISCORD_SESSION_INIT_ERROR: Exception | None = None
 DISCORD_CLIENT_TASK: asyncio.Task | None = None
 DISCORD_LEADER_TASKS: set[asyncio.Task] = set()
+DISCORD_MONITOR_TASK: asyncio.Task | None = None
+DISCORD_MONITOR_GENERATION: int | None = None
 PROCESS_SHUTDOWN_EVENT: asyncio.Event | None = None
 CONTROL_SETTINGS: RuntimeSettingsCache | None = None
 PENDING_STATUS_SELECTIONS: dict[tuple[int, int], dict] = {}
@@ -661,12 +666,20 @@ def map_key_from_snapshot(snapshot: dict) -> str | None:
     return str(current).split("/")[-1]
 
 
+_MAP_NAME_CACHE: dict[str, str] = {}
+
+
 def map_name_for_key(map_key: str | None) -> str:
     if not map_key:
         return "Unknown"
+    cached = _MAP_NAME_CACHE.get(map_key)
+    if cached is not None:
+        return cached
     with SessionLocal() as session:
         row = session.get(BF4Map, map_key)
-        return row.map_name if row else map_key
+        map_name = row.map_name if row else map_key
+    _MAP_NAME_CACHE[map_key] = map_name
+    return map_name
 
 
 def get_server_status(snapshot: dict) -> dict:
@@ -1666,8 +1679,12 @@ async def prepare_management(interaction: discord.Interaction):
         "qualified_name",
         "unknown",
     )
+    # Acknowledge first. Authorization/channel checks below use PostgreSQL-backed
+    # helpers and should never consume Discord's initial interaction window.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("⛔ Management commands require a Discord server.", ephemeral=True)
+        await interaction.followup.send("⛔ Management commands require a Discord server.", ephemeral=True)
         audit_command(
             guild=interaction.guild,
             channel=interaction.channel,
@@ -1680,7 +1697,7 @@ async def prepare_management(interaction: discord.Interaction):
         )
         return False
     if not can_manage(interaction.user):
-        await interaction.response.send_message("⛔ You do not have permission to use that command.", ephemeral=True)
+        await interaction.followup.send("⛔ You do not have permission to use that command.", ephemeral=True)
         audit_command(
             guild=interaction.guild,
             channel=interaction.channel,
@@ -1693,7 +1710,7 @@ async def prepare_management(interaction: discord.Interaction):
         )
         return False
     if not management_channel_allowed(interaction):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "⛔ Management commands may only be used in the configured announcement/listen/watched-player channels.",
             ephemeral=True,
         )
@@ -1715,7 +1732,6 @@ async def prepare_management(interaction: discord.Interaction):
         interaction.user.id,
         command_name,
     )
-    await interaction.response.defer(ephemeral=True)
     return True
 
 
@@ -2055,7 +2071,109 @@ def _track_discord_leader_task(coro, name: str) -> asyncio.Task:
     return task
 
 
+async def _stop_discord_monitor_task(reason: str) -> None:
+    global DISCORD_MONITOR_TASK
+    global DISCORD_MONITOR_GENERATION
+
+    task = DISCORD_MONITOR_TASK
+    generation = DISCORD_MONITOR_GENERATION
+    DISCORD_MONITOR_TASK = None
+    DISCORD_MONITOR_GENERATION = None
+
+    if task is None:
+        return
+
+    if not task.done():
+        log.info(
+            "Keeper processor stopping worker_id=%s generation=%s reason=%s",
+            WORKER_ID, generation, reason,
+        )
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _ensure_discord_monitor_task(generation: int) -> None:
+    global DISCORD_MONITOR_TASK
+    global DISCORD_MONITOR_GENERATION
+
+    desired = bool(
+        CONTROL_SETTINGS
+        and CONTROL_SETTINGS.get("keeper.distributed_enabled", False)
+    ) or WORKER_ID == "rnt-01"
+
+    current = DISCORD_MONITOR_TASK
+    current_generation = DISCORD_MONITOR_GENERATION
+
+    if not desired:
+        if current is not None:
+            await _stop_discord_monitor_task("distributed_disabled_non_rnt")
+        return
+
+    if (
+        current is not None
+        and not current.done()
+        and current_generation == int(generation)
+    ):
+        return
+
+    if current is not None:
+        await _stop_discord_monitor_task("generation_reconcile")
+
+    distributed_work = bool(
+        CONTROL_SETTINGS
+        and CONTROL_SETTINGS.get("keeper.distributed_enabled", False)
+    )
+    task = asyncio.create_task(
+        monitor_loop(int(generation)),
+        name=f"monitor-g{generation}",
+    )
+    DISCORD_MONITOR_TASK = task
+    DISCORD_MONITOR_GENERATION = int(generation)
+
+    def _done(completed: asyncio.Task) -> None:
+        global DISCORD_MONITOR_TASK
+        global DISCORD_MONITOR_GENERATION
+        if DISCORD_MONITOR_TASK is completed:
+            DISCORD_MONITOR_TASK = None
+            DISCORD_MONITOR_GENERATION = None
+        if completed.cancelled():
+            return
+        try:
+            exc = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            log.error(
+                "Keeper processor task failed worker_id=%s generation=%s error=%s message=%r",
+                WORKER_ID, generation, type(exc).__name__, str(exc),
+            )
+
+    task.add_done_callback(_done)
+    log.info(
+        "Keeper processor active worker_id=%s generation=%s distributed_work=%s processor=fenced_discord_leader",
+        WORKER_ID, generation, "enabled" if distributed_work else "disabled",
+    )
+
+
+async def discord_processor_reconcile_loop(generation: int) -> None:
+    last_enabled = None
+    while DISCORD_SESSION_GENERATION == int(generation):
+        distributed_enabled = bool(
+            CONTROL_SETTINGS
+            and CONTROL_SETTINGS.get("keeper.distributed_enabled", False)
+        )
+        if distributed_enabled != last_enabled:
+            log.info(
+                "Keeper processor reconcile worker_id=%s generation=%s distributed_enabled=%s",
+                WORKER_ID, generation, distributed_enabled,
+            )
+            last_enabled = distributed_enabled
+        await _ensure_discord_monitor_task(generation)
+        await asyncio.sleep(2)
+
+
 async def _stop_discord_leader_tasks() -> None:
+    await _stop_discord_monitor_task("leader_session_stop")
     tasks = list(DISCORD_LEADER_TASKS)
     for task in tasks:
         task.cancel()
@@ -2362,14 +2480,34 @@ def queue_player_enrichment(
     alerts_allowed: bool,
     startup_alerts: bool = False,
 ):
+    ids = {int(value) for value in session_ids}
+    if not ids:
+        return
+
+    # PR4-E makes post-enrichment watch re-evaluation durable. This preserves
+    # normal/startup alert semantics even when a different worker performs the
+    # Battlelog request and the Discord leader changes before completion.
+    alert_mode = "startup" if startup_alerts else ("normal" if alerts_allowed else None)
+    if alert_mode is not None:
+        with SessionLocal.begin() as session:
+            rows = session.scalars(
+                select(BF4PlayerSession).where(BF4PlayerSession.id.in_(ids))
+            ).all()
+            for row in rows:
+                if alert_mode == "startup" or row.persona_alert_mode is None:
+                    row.persona_alert_mode = alert_mode
+
+    # While distributed persona mode is active, PostgreSQL open/unresolved
+    # sessions are the queue. Do not build process-local retry debt.
+    if CONTROL_SETTINGS is not None and bool(CONTROL_SETTINGS.get("persona.distributed_enabled", False)):
+        return
+
     pending = PLAYER_ENRICHMENT_PENDING_SESSIONS.setdefault(server_guid, set())
-    pending.update(int(value) for value in session_ids)
+    pending.update(ids)
     if alerts_allowed:
-        PLAYER_ENRICHMENT_ALERT_ELIGIBLE.update(int(value) for value in session_ids)
+        PLAYER_ENRICHMENT_ALERT_ELIGIBLE.update(ids)
     if startup_alerts:
-        PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.update(
-            int(value) for value in session_ids
-        )
+        PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.update(ids)
     if server_guid not in PLAYER_ENRICHMENT_QUEUED:
         PLAYER_ENRICHMENT_QUEUE.append(server_guid)
         PLAYER_ENRICHMENT_QUEUED.add(server_guid)
@@ -2590,8 +2728,391 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
     return sent
 
 
+def _seed_legacy_persona_queue_from_db() -> int:
+    """Rebuild leader-local fallback work from authoritative open sessions.
+
+    Durable PR4-E retry/claim timing is projected into the legacy monotonic
+    retry map so a kill-switch does not create a request burst or overlap a
+    still-live distributed claim.
+    """
+    with SessionLocal() as session:
+        db_now = session.scalar(select(func.now()))
+        rows = session.execute(
+            select(BF4PlayerSession.server_guid, BF4PlayerSession.id).where(
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        ).all()
+        states = {
+            row.server_guid: row
+            for row in session.scalars(
+                select(PlayerPersonaEnrichmentState).where(
+                    PlayerPersonaEnrichmentState.server_guid.in_({str(g) for g, _sid in rows} or {""})
+                )
+            )
+        }
+    seeded = 0
+    monotonic_now = time.monotonic()
+    for guid, session_id in rows:
+        guid = str(guid)
+        pending = PLAYER_ENRICHMENT_PENDING_SESSIONS.setdefault(guid, set())
+        before = len(pending)
+        pending.add(int(session_id))
+        if len(pending) != before:
+            seeded += 1
+        state = states.get(guid)
+        if state is not None:
+            delays = []
+            if state.retry_after is not None and state.retry_after > db_now:
+                delays.append((state.retry_after - db_now).total_seconds())
+            if state.claim_expires_at is not None and state.claim_expires_at > db_now:
+                delays.append((state.claim_expires_at - db_now).total_seconds())
+            if delays:
+                PLAYER_ENRICHMENT_RETRY_AFTER[guid] = max(
+                    PLAYER_ENRICHMENT_RETRY_AFTER.get(guid, 0.0),
+                    monotonic_now + max(delays),
+                )
+            if int(state.no_progress_streak or 0) > 0:
+                PLAYER_ENRICHMENT_NO_PROGRESS_STREAK[guid] = max(
+                    PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.get(guid, 0),
+                    int(state.no_progress_streak),
+                )
+        if guid not in PLAYER_ENRICHMENT_QUEUED:
+            PLAYER_ENRICHMENT_QUEUE.append(guid)
+            PLAYER_ENRICHMENT_QUEUED.add(guid)
+    return seeded
+
+
+def _persona_open_unresolved_count() -> int:
+    with SessionLocal() as session:
+        return int(session.scalar(
+            select(func.count()).select_from(BF4PlayerSession).where(
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        ) or 0)
+
+
+def _claim_persona_server(server_guid: str, worker_id: str, claim_seconds: int) -> tuple[bool, str]:
+    """Acquire one durable server-level persona claim if retry/claim state permits."""
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        session.execute(text("""
+            INSERT INTO player_persona_enrichment_state
+                (server_guid, retry_after, no_progress_streak, last_attempt_at,
+                 last_progress_at, last_result, last_error_type, last_error_message,
+                 claim_worker_id, claim_started_at, claim_expires_at, created_at, updated_at)
+            VALUES (:guid, NULL, 0, NULL, NULL, 'pending', NULL, NULL,
+                    NULL, NULL, NULL, :now, :now)
+            ON CONFLICT (server_guid) DO NOTHING
+        """), {"guid": server_guid, "now": now})
+        row = session.get(PlayerPersonaEnrichmentState, server_guid, with_for_update=True)
+        if row is None:
+            return False, "state_missing"
+        if row.retry_after is not None and row.retry_after > now:
+            return False, "retry_backoff"
+        if (
+            row.claim_worker_id
+            and row.claim_worker_id != worker_id
+            and row.claim_expires_at is not None
+            and row.claim_expires_at > now
+        ):
+            return False, "claimed"
+        row.claim_worker_id = worker_id
+        row.claim_started_at = now
+        row.claim_expires_at = now + timedelta(seconds=max(30, int(claim_seconds)))
+        row.last_attempt_at = now
+        row.last_result = "claimed"
+        row.last_error_type = None
+        row.last_error_message = None
+        row.updated_at = now
+        return True, "claimed"
+
+
+def _finish_persona_attempt(
+    server_guid: str,
+    worker_id: str,
+    *,
+    result: str,
+    retry_seconds: int | None,
+    progress: bool,
+    no_progress: bool,
+    error: Exception | None = None,
+) -> None:
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        row = session.get(PlayerPersonaEnrichmentState, server_guid, with_for_update=True)
+        if row is None:
+            return
+        # Only the claimant may finish a still-live claim. An expired/replaced
+        # claimant cannot overwrite a newer owner's state.
+        if row.claim_worker_id not in {None, worker_id}:
+            return
+        if progress:
+            row.no_progress_streak = 0
+            row.last_progress_at = now
+        elif no_progress:
+            row.no_progress_streak = int(row.no_progress_streak or 0) + 1
+        row.retry_after = None if retry_seconds is None else now + timedelta(seconds=int(retry_seconds))
+        row.last_result = str(result)[:64]
+        row.last_error_type = type(error).__name__[:100] if error is not None else None
+        row.last_error_message = str(error)[:1000] if error is not None else None
+        row.claim_worker_id = None
+        row.claim_started_at = None
+        row.claim_expires_at = None
+        row.updated_at = now
+
+
+def _persona_state_streak(server_guid: str) -> int:
+    with SessionLocal() as session:
+        row = session.get(PlayerPersonaEnrichmentState, server_guid)
+        return int(row.no_progress_streak or 0) if row else 0
+
+
+def _persona_pending_ids(server_guid: str) -> set[int]:
+    with SessionLocal() as session:
+        return {
+            int(value)
+            for value in session.scalars(
+                select(BF4PlayerSession.id).where(
+                    BF4PlayerSession.server_guid == server_guid,
+                    BF4PlayerSession.time_left.is_(None),
+                    BF4PlayerSession.persona_id.is_(None),
+                )
+            ).all()
+        }
+
+
+def _apply_persona_identities(server_guid: str, identities: list[dict]) -> tuple[int, int]:
+    """Apply one Battlelog page to every matching open unresolved session."""
+    identity_by_name = {row["normalized_name"]: row for row in identities}
+    matched_ids: set[int] = set()
+    with SessionLocal.begin() as session:
+        bf = session.get(BF4Server, server_guid)
+        if bf is None:
+            return 0, 0
+        platform = normalize_platform_label(bf.platform)
+        now = utcnow()
+        open_sessions = session.scalars(
+            select(BF4PlayerSession).where(
+                BF4PlayerSession.server_guid == server_guid,
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        ).all()
+        for player_session in open_sessions:
+            identity = identity_by_name.get(player_session.normalized_name)
+            if identity is None:
+                continue
+            persona_id = int(identity["persona_id"])
+            current_name = identity["player_name"]
+            player_session.persona_id = persona_id
+            player_session.player_name = current_name
+            player_session.normalized_name = normalize_player_name(current_name)
+            upsert_player_alias(
+                session,
+                platform=platform,
+                persona_id=persona_id,
+                player_name=current_name,
+                seen_at=now,
+            )
+            matched_ids.add(int(player_session.id))
+            watches = session.scalars(
+                select(GuildPlayerWatch).where(
+                    GuildPlayerWatch.platform == platform,
+                    GuildPlayerWatch.persona_id.is_(None),
+                    GuildPlayerWatch.normalized_name == normalize_player_name(current_name),
+                )
+            ).all()
+            for watch in watches:
+                duplicate = session.scalar(
+                    select(GuildPlayerWatch).where(
+                        GuildPlayerWatch.guild_id == watch.guild_id,
+                        GuildPlayerWatch.platform == watch.platform,
+                        GuildPlayerWatch.persona_id == persona_id,
+                        GuildPlayerWatch.id != watch.id,
+                    )
+                )
+                if duplicate is None:
+                    watch.persona_id = persona_id
+        remaining = int(session.scalar(
+            select(func.count()).select_from(BF4PlayerSession).where(
+                BF4PlayerSession.server_guid == server_guid,
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        ) or 0)
+    return len(matched_ids), remaining
+
+
+async def process_pending_persona_alerts(limit: int = 250) -> int:
+    """Discord-leader-only consumer for durable post-enrichment alert reevaluation."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(BF4PlayerSession.id, BF4PlayerSession.persona_alert_mode)
+            .where(
+                BF4PlayerSession.persona_id.is_not(None),
+                BF4PlayerSession.persona_alert_mode.is_not(None),
+            )
+            .order_by(BF4PlayerSession.id)
+            .limit(max(1, int(limit)))
+        ).all()
+    processed = 0
+    for session_id, mode in rows:
+        await evaluate_player_watch_alerts(
+            int(session_id), startup_current=(str(mode) == "startup")
+        )
+        with SessionLocal.begin() as session:
+            row = session.get(BF4PlayerSession, int(session_id))
+            if row is not None and row.persona_alert_mode == mode:
+                row.persona_alert_mode = None
+        processed += 1
+    return processed
+
+
+async def distributed_persona_enrichment_loop():
+    """PR4-E server-level HRW persona worker with durable claims/backoff."""
+    while True:
+        sweep_started = time.monotonic()
+        try:
+            if not bool(CONTROL_SETTINGS and CONTROL_SETTINGS.get("persona.distributed_enabled", False)):
+                await asyncio.sleep(5)
+                continue
+
+            stale_after = int(CONTROL_SETTINGS.get("worker.stale_after_seconds", 60))
+            counts, owners, eligible, _caps = await asyncio.to_thread(
+                persona_assignment_snapshot, stale_after
+            )
+            assigned = sorted(guid for guid, owner in owners.items() if owner == WORKER_ID)
+            rate = max(0.01, float(CONTROL_SETTINGS.get("persona.external_requests_per_second", 0.10)))
+            sweep_seconds = max(5, int(CONTROL_SETTINGS.get("persona.sweep_seconds", 30)))
+            claim_seconds = max(30, int(CONTROL_SETTINGS.get("persona.claim_seconds", 120)))
+            base_retry = max(30, int(CONTROL_SETTINGS.get("persona.base_retry_seconds", 600)))
+            succeeded = failed = skipped = enriched = 0
+
+            log.info(
+                "Distributed persona sweep started worker_id=%s assigned_servers=%s eligible_workers=%s "
+                "pending_open_sessions=%s requests_per_second=%s rate_gate=postgresql_cluster",
+                WORKER_ID, len(assigned), ",".join(eligible) if eligible else "none",
+                await asyncio.to_thread(_persona_open_unresolved_count), rate,
+            )
+
+            for index, guid in enumerate(assigned, 1):
+                # Re-check ownership immediately before claiming/requesting.
+                _counts, current_owners, _eligible, _caps = await asyncio.to_thread(
+                    persona_assignment_snapshot, stale_after
+                )
+                if current_owners.get(guid) != WORKER_ID:
+                    skipped += 1
+                    continue
+                pending_ids = await asyncio.to_thread(_persona_pending_ids, guid)
+                if not pending_ids:
+                    skipped += 1
+                    continue
+                claimed, reason = await asyncio.to_thread(
+                    _claim_persona_server, guid, WORKER_ID, claim_seconds
+                )
+                if not claimed:
+                    skipped += 1
+                    continue
+
+                try:
+                    with SessionLocal() as session:
+                        bf = session.get(BF4Server, guid)
+                        url = battlelog_server_url_for(bf) if bf is not None else None
+                    if not url:
+                        raise ValueError("battlelog_url_unavailable")
+
+                    await wait_for_persona_cluster_slot(WORKER_ID, rate)
+                    identities = await asyncio.to_thread(get_battlelog_player_identities, url)
+                    if not identities:
+                        streak = await asyncio.to_thread(_persona_state_streak, guid)
+                        retry_seconds = PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS[
+                            min(streak + 1, len(PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS)) - 1
+                        ]
+                        exc = ValueError("Battlelog page did not contain live player persona identities")
+                        await asyncio.to_thread(
+                            _finish_persona_attempt, guid, WORKER_ID,
+                            result="no_live_persona_identities", retry_seconds=retry_seconds,
+                            progress=False, no_progress=True, error=exc,
+                        )
+                        skipped += 1
+                        continue
+
+                    matched, remaining = await asyncio.to_thread(
+                        _apply_persona_identities, guid, identities
+                    )
+                    enriched += matched
+                    if remaining <= 0:
+                        retry_seconds = None
+                        result = "complete"
+                    elif matched:
+                        retry_seconds = base_retry
+                        result = "partial_progress"
+                    else:
+                        streak = await asyncio.to_thread(_persona_state_streak, guid)
+                        retry_seconds = PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS[
+                            min(streak + 1, len(PLAYER_ENRICHMENT_NO_PROGRESS_BACKOFF_SECONDS)) - 1
+                        ]
+                        result = "no_progress"
+                    await asyncio.to_thread(
+                        _finish_persona_attempt, guid, WORKER_ID,
+                        result=result, retry_seconds=retry_seconds,
+                        progress=bool(matched), no_progress=(result == "no_progress"), error=None,
+                    )
+                    succeeded += 1
+                    log.info(
+                        "Distributed persona enrichment worker_id=%s server=%s progress=%s/%s "
+                        "identities=%s matched_sessions=%s remaining=%s retry_seconds=%s result=%s",
+                        WORKER_ID, guid, index, len(assigned), len(identities), matched,
+                        remaining, retry_seconds, result,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    await asyncio.to_thread(
+                        _finish_persona_attempt, guid, WORKER_ID,
+                        result="request_failed", retry_seconds=base_retry,
+                        progress=False, no_progress=False, error=exc,
+                    )
+                    response = getattr(exc, "response", None)
+                    status = getattr(response, "status_code", None)
+                    log.warning(
+                        "Distributed persona enrichment failed worker_id=%s server=%s progress=%s/%s "
+                        "status=%s error=%s message=%r retry_seconds=%s",
+                        WORKER_ID, guid, index, len(assigned), status,
+                        type(exc).__name__, str(exc), base_retry,
+                    )
+
+            elapsed = time.monotonic() - sweep_started
+            sleep_for = max(1.0, sweep_seconds - elapsed)
+            log.info(
+                "Distributed persona sweep complete worker_id=%s assigned_servers=%s succeeded=%s "
+                "failed=%s skipped=%s enriched_sessions=%s elapsed_seconds=%.1f next_sweep_in_seconds=%.1f",
+                WORKER_ID, len(assigned), succeeded, failed, skipped, enriched, elapsed, sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(
+                "Distributed persona sweep fatal worker_id=%s error=%s message=%r",
+                WORKER_ID, type(exc).__name__, str(exc),
+            )
+            await asyncio.sleep(10)
+
+
 async def process_player_persona_enrichment():
-    """Drain eligible server-level Battlelog enrichment work with bounded concurrency."""
+    """Drain leader-local fallback work, or consume distributed alert completions."""
+    if CONTROL_SETTINGS is not None and bool(CONTROL_SETTINGS.get("persona.distributed_enabled", False)):
+        alert_rechecks = await process_pending_persona_alerts()
+        return {
+            "processed": 0, "succeeded": 0, "failed": 0,
+            "enriched_sessions": 0,
+            "queued": await asyncio.to_thread(_persona_open_unresolved_count),
+            "alert_rechecks": alert_rechecks,
+        }
+
+    await asyncio.to_thread(_seed_legacy_persona_queue_from_db)
     processed = succeeded = failed = enriched_sessions = 0
 
     scan_budget = len(PLAYER_ENRICHMENT_QUEUE)
@@ -2823,6 +3344,10 @@ async def process_player_persona_enrichment():
                     elif session_id in PLAYER_ENRICHMENT_ALERT_ELIGIBLE:
                         await evaluate_player_watch_alerts(session_id)
                         PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(session_id)
+                    with SessionLocal.begin() as session:
+                        completed = session.get(BF4PlayerSession, int(session_id))
+                        if completed is not None:
+                            completed.persona_alert_mode = None
 
             except Exception as exc:
                 async with counter_lock:
@@ -2898,6 +3423,141 @@ async def process_player_persona_enrichment():
     }
 
 
+def _process_player_history_server_db(
+    guid: str,
+    current: dict[str, str],
+    status: dict,
+    now: datetime,
+    pending_absences: dict[int, datetime],
+):
+    """Run one server's player-history SQLAlchemy work off the asyncio loop.
+
+    Discord I/O and in-memory absence bookkeeping stay on the event-loop
+    thread. This helper returns the minimal state needed by the async caller.
+    """
+    with SessionLocal() as session:
+        bf = session.get(BF4Server, guid)
+        platform = normalize_platform_label(bf.platform if bf else "Unknown")
+
+    new_session_ids: list[int] = []
+    enrichment_ids: list[int] = []
+    absence_clear_ids: set[int] = set()
+    absence_set: dict[int, datetime] = {}
+    sessions_created = 0
+    sessions_closed = 0
+
+    with SessionLocal.begin() as session:
+        open_sessions = session.scalars(
+            select(BF4PlayerSession).where(
+                BF4PlayerSession.server_guid == guid,
+                BF4PlayerSession.time_left.is_(None),
+            )
+        ).all()
+        by_name = {row.normalized_name: row for row in open_sessions}
+        by_persona = {
+            int(row.persona_id): row
+            for row in open_sessions
+            if row.persona_id is not None
+        }
+        alias_rows = session.scalars(
+            select(BF4PlayerAlias).where(
+                BF4PlayerAlias.platform == platform,
+                BF4PlayerAlias.normalized_name.in_(list(current) or [""]),
+            )
+        ).all()
+        alias_ids_by_name: dict[str, set[int]] = {}
+        alias_by_identity_name: dict[tuple[int, str], BF4PlayerAlias] = {}
+        for alias in alias_rows:
+            alias_ids_by_name.setdefault(alias.normalized_name, set()).add(int(alias.persona_id))
+            alias_by_identity_name[(int(alias.persona_id), alias.normalized_name)] = alias
+        persona_by_name = {
+            normalized_name: next(iter(persona_ids))
+            for normalized_name, persona_ids in alias_ids_by_name.items()
+            if len(persona_ids) == 1
+        }
+        matched_ids = set()
+
+        for normalized, player_name in current.items():
+            persona_id = persona_by_name.get(normalized)
+            player_session = by_persona.get(persona_id) if persona_id is not None else None
+            if player_session is None:
+                player_session = by_name.get(normalized)
+
+            if player_session is None:
+                player_session = BF4PlayerSession(
+                    server_guid=guid,
+                    platform=platform,
+                    map_key=status["map_key"],
+                    map_name=status["map_name"],
+                    persona_id=persona_id,
+                    player_name=player_name,
+                    normalized_name=normalized,
+                    time_joined=now,
+                    last_seen=now,
+                    time_left=None,
+                )
+                session.add(player_session)
+                session.flush()
+                open_sessions.append(player_session)
+                by_name[normalized] = player_session
+                if persona_id is not None:
+                    by_persona[int(persona_id)] = player_session
+                new_session_ids.append(int(player_session.id))
+                if persona_id is None:
+                    enrichment_ids.append(int(player_session.id))
+                sessions_created += 1
+            else:
+                player_session.last_seen = now
+                if persona_id is not None and player_session.persona_id is None:
+                    player_session.persona_id = int(persona_id)
+                if player_session.persona_id is not None:
+                    player_session.player_name = player_name
+                    player_session.normalized_name = normalized
+
+            matched_ids.add(int(player_session.id))
+            absence_clear_ids.add(int(player_session.id))
+            if player_session.persona_id is not None:
+                alias = alias_by_identity_name.get(
+                    (int(player_session.persona_id), normalized)
+                )
+                if alias is not None:
+                    alias.player_name = player_name
+                    alias.last_seen = now
+                else:
+                    upsert_player_alias(
+                        session,
+                        platform=platform,
+                        persona_id=int(player_session.persona_id),
+                        player_name=player_name,
+                        seen_at=now,
+                    )
+
+        for player_session in open_sessions:
+            sid = int(player_session.id)
+            if sid in matched_ids:
+                continue
+            first_absent = pending_absences.get(sid)
+            if first_absent is None:
+                absence_set[sid] = now
+            else:
+                player_session.time_left = first_absent
+                # Closed unresolved sessions are never automatic persona debt,
+                # and must never become alert-eligible through a later manual
+                # historical backfill.
+                player_session.persona_alert_mode = None
+                absence_clear_ids.add(sid)
+                sessions_closed += 1
+
+    return {
+        "new_session_ids": new_session_ids,
+        "enrichment_ids": enrichment_ids,
+        "absence_clear_ids": absence_clear_ids,
+        "absence_set": absence_set,
+        "sessions_created": sessions_created,
+        "sessions_closed": sessions_closed,
+    }
+
+
 async def process_player_history(
     fresh: dict[str, dict],
     tracked_guids: list[str],
@@ -2922,110 +3582,30 @@ async def process_player_history(
         }
         status = get_server_status(snapshot)
 
-        with SessionLocal() as session:
-            bf = session.get(BF4Server, guid)
-            platform = normalize_platform_label(bf.platform if bf else "Unknown")
+        pending_absences = {
+            sid: first_absent
+            for (server_guid, sid), first_absent in PENDING_PLAYER_ABSENCES.items()
+            if server_guid == guid
+        }
+        history = await asyncio.to_thread(
+            _process_player_history_server_db,
+            guid,
+            current,
+            status,
+            now,
+            pending_absences,
+        )
+        new_session_ids = history["new_session_ids"]
+        enrichment_ids = history["enrichment_ids"]
+        sessions_created += int(history["sessions_created"])
+        sessions_closed += int(history["sessions_closed"])
 
-        new_session_ids = []
-        enrichment_ids = []
-        with SessionLocal.begin() as session:
-            open_sessions = session.scalars(
-                select(BF4PlayerSession).where(
-                    BF4PlayerSession.server_guid == guid,
-                    BF4PlayerSession.time_left.is_(None),
-                )
-            ).all()
-            by_name = {row.normalized_name: row for row in open_sessions}
-            by_persona = {
-                int(row.persona_id): row
-                for row in open_sessions
-                if row.persona_id is not None
-            }
-            alias_rows = session.scalars(
-                select(BF4PlayerAlias).where(
-                    BF4PlayerAlias.platform == platform,
-                    BF4PlayerAlias.normalized_name.in_(list(current) or [""]),
-                )
-            ).all()
-            alias_ids_by_name: dict[str, set[int]] = {}
-            alias_by_identity_name: dict[tuple[int, str], BF4PlayerAlias] = {}
-            for alias in alias_rows:
-                alias_ids_by_name.setdefault(alias.normalized_name, set()).add(int(alias.persona_id))
-                alias_by_identity_name[(int(alias.persona_id), alias.normalized_name)] = alias
-            persona_by_name = {
-                normalized_name: next(iter(persona_ids))
-                for normalized_name, persona_ids in alias_ids_by_name.items()
-                if len(persona_ids) == 1
-            }
-            matched_ids = set()
-
-            for normalized, player_name in current.items():
-                persona_id = persona_by_name.get(normalized)
-                player_session = by_persona.get(persona_id) if persona_id is not None else None
-                if player_session is None:
-                    player_session = by_name.get(normalized)
-
-                if player_session is None:
-                    player_session = BF4PlayerSession(
-                        server_guid=guid,
-                        platform=platform,
-                        map_key=status["map_key"],
-                        map_name=status["map_name"],
-                        persona_id=persona_id,
-                        player_name=player_name,
-                        normalized_name=normalized,
-                        time_joined=now,
-                        last_seen=now,
-                        time_left=None,
-                    )
-                    session.add(player_session)
-                    session.flush()
-                    open_sessions.append(player_session)
-                    by_name[normalized] = player_session
-                    if persona_id is not None:
-                        by_persona[int(persona_id)] = player_session
-                    new_session_ids.append(int(player_session.id))
-                    if persona_id is None:
-                        enrichment_ids.append(int(player_session.id))
-                    sessions_created += 1
-                else:
-                    player_session.last_seen = now
-                    if persona_id is not None and player_session.persona_id is None:
-                        player_session.persona_id = int(persona_id)
-                    if player_session.persona_id is not None:
-                        player_session.player_name = player_name
-                        player_session.normalized_name = normalized
-
-                matched_ids.add(int(player_session.id))
-                PENDING_PLAYER_ABSENCES.pop((guid, int(player_session.id)), None)
-                if player_session.persona_id is not None:
-                    alias = alias_by_identity_name.get(
-                        (int(player_session.persona_id), normalized)
-                    )
-                    if alias is not None:
-                        alias.player_name = player_name
-                        alias.last_seen = now
-                    else:
-                        upsert_player_alias(
-                            session,
-                            platform=platform,
-                            persona_id=int(player_session.persona_id),
-                            player_name=player_name,
-                            seen_at=now,
-                        )
-
-            for player_session in open_sessions:
-                sid = int(player_session.id)
-                if sid in matched_ids:
-                    continue
-                absence_key = (guid, sid)
-                first_absent = PENDING_PLAYER_ABSENCES.get(absence_key)
-                if first_absent is None:
-                    PENDING_PLAYER_ABSENCES[absence_key] = now
-                else:
-                    player_session.time_left = first_absent
-                    PENDING_PLAYER_ABSENCES.pop(absence_key, None)
-                    sessions_closed += 1
+        # Apply in-memory absence state on the event-loop thread so commands
+        # that inspect pending departures never race a worker thread mutation.
+        for sid in history["absence_clear_ids"]:
+            PENDING_PLAYER_ABSENCES.pop((guid, int(sid)), None)
+        for sid, first_absent in history["absence_set"].items():
+            PENDING_PLAYER_ABSENCES[(guid, int(sid))] = first_absent
 
         if enrichment_ids:
             queue_player_enrichment(
@@ -3055,6 +3635,10 @@ async def process_player_history(
 
         PLAYER_ROSTER_BASELINED.add(guid)
         PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
+
+        # Keep an explicit cooperative yield between servers even though the
+        # SQLAlchemy transaction itself now runs in asyncio.to_thread().
+        await asyncio.sleep(0)
 
     enrichment = await process_player_persona_enrichment()
     log.info(
@@ -3761,6 +4345,185 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
     }
 
 
+def _store_keeper_snapshot(guid: str, snapshot: dict, worker_id: str) -> None:
+    """Upsert one worker-fetched snapshot for fenced Discord-leader processing."""
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        row = session.get(KeeperSnapshot, guid)
+        if row is None:
+            row = KeeperSnapshot(
+                server_guid=guid,
+                snapshot=snapshot,
+                fetched_at=now,
+                worker_id=worker_id,
+                fetch_generation=1,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+        else:
+            row.snapshot = snapshot
+            row.fetched_at = now
+            row.worker_id = worker_id
+            row.fetch_generation = int(row.fetch_generation or 0) + 1
+            row.updated_at = now
+
+
+def _load_distributed_keeper_snapshots(guids: list[str], max_age_seconds: int):
+    if not guids:
+        return {}, {}, 0
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
+        rows = session.scalars(
+            select(KeeperSnapshot).where(
+                KeeperSnapshot.server_guid.in_(guids),
+                KeeperSnapshot.fetched_at >= cutoff,
+            )
+        ).all()
+    fresh = {row.server_guid: row.snapshot for row in rows}
+    workers = {row.server_guid: row.worker_id for row in rows}
+    return fresh, workers, len(guids) - len(fresh)
+
+
+def _keeper_lane_guid_sets() -> tuple[set[str], set[str]]:
+    """Return globally deduplicated (all GUIDs, default/high-priority GUIDs)."""
+    with SessionLocal() as session:
+        relations = list(session.scalars(select(GuildServer)))
+    all_guids = {str(row.server_guid) for row in relations}
+    default_guids = {str(row.server_guid) for row in relations if row.is_default}
+    return all_guids, default_guids
+
+
+def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
+    """Return one PR4-D lane assignment with fail-safe bulk fallback.
+
+    Defaults leave the bulk lane only when fast mode is enabled *and* at least
+    one healthy keeper_fast worker is eligible. If the fast lane has no owner,
+    bulk immediately retains the defaults so a role/configuration failure cannot
+    silently stop monitoring important servers.
+    """
+    all_guids, default_guids = _keeper_lane_guid_sets()
+    fast_enabled = bool(CONTROL_SETTINGS and CONTROL_SETTINGS.get("keeper.fast_enabled", False))
+
+    fast_counts, fast_owners, fast_eligible, fast_caps = keeper_assignment_snapshot(
+        stale_after_seconds, role_name="keeper_fast", guids=default_guids
+    )
+    fast_active = fast_enabled and bool(default_guids) and bool(fast_eligible)
+
+    if lane_name == "fast":
+        scope = default_guids if fast_active else set()
+        if not fast_active:
+            # Preserve the real eligibility list for diagnostics, but no owners.
+            return ({wid: 0 for wid in fast_counts}, {}, fast_eligible, fast_caps, fast_active, len(default_guids))
+        return fast_counts, fast_owners, fast_eligible, fast_caps, fast_active, len(default_guids)
+
+    if lane_name != "bulk":
+        raise ValueError(f"unsupported Keeper lane {lane_name!r}")
+    scope = all_guids - default_guids if fast_active else all_guids
+    counts, owners, eligible, caps = keeper_assignment_snapshot(
+        stale_after_seconds, role_name="keeper_bulk", guids=scope
+    )
+    return counts, owners, eligible, caps, fast_active, len(default_guids)
+
+
+async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
+    """Fetch this worker's HRW-owned servers for one Keeper scheduling lane."""
+    if lane_name not in {"bulk", "fast"}:
+        raise ValueError(f"unsupported Keeper lane {lane_name!r}")
+    role_name = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
+    gate_key = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
+    local_retry_after: dict[str, float] = {}
+
+    while True:
+        sweep_started = time.monotonic()
+        try:
+            distributed = bool(CONTROL_SETTINGS and CONTROL_SETTINGS.get("keeper.distributed_enabled", False))
+            if not distributed:
+                await asyncio.sleep(5)
+                continue
+            if lane_name == "fast" and not bool(CONTROL_SETTINGS.get("keeper.fast_enabled", False)):
+                await asyncio.sleep(5)
+                continue
+
+            stale_after = int(CONTROL_SETTINGS.get("worker.stale_after_seconds", 60))
+            counts, owners, eligible, _caps, fast_active, default_count = await asyncio.to_thread(
+                _keeper_lane_assignment, lane_name, stale_after
+            )
+            assigned = sorted(guid for guid, owner in owners.items() if owner == WORKER_ID)
+            global_rate = max(0.01, float(CONTROL_SETTINGS.get(
+                "keeper.external_requests_per_second", EXTERNAL_REQUESTS_PER_SECOND
+            )))
+            if lane_name == "fast":
+                lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.fast_requests_per_second", 0.10)))
+                sweep_seconds = max(30, int(CONTROL_SETTINGS.get("keeper.fast_sweep_seconds", 120)))
+            else:
+                lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.bulk_requests_per_second", 0.23)))
+                sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.distributed_sweep_seconds", 480)))
+
+            succeeded = failed = skipped = 0
+            log.info(
+                "Distributed Keeper %s sweep started worker_id=%s assigned_servers=%s eligible_workers=%s "
+                "default_servers=%s fast_active=%s lane_requests_per_second=%s "
+                "global_requests_per_second=%s rate_gate=postgresql_cluster",
+                lane_name, WORKER_ID, len(assigned), ",".join(eligible) if eligible else "none",
+                default_count, fast_active, lane_rate, global_rate,
+            )
+
+            for index, guid in enumerate(assigned, 1):
+                # Re-check role health, draining, and lane scope before every request.
+                _counts, current_owners, _eligible, _caps, _fast_active, _defaults = await asyncio.to_thread(
+                    _keeper_lane_assignment, lane_name, stale_after
+                )
+                if current_owners.get(guid) != WORKER_ID:
+                    skipped += 1
+                    continue
+                retry_at = local_retry_after.get(guid, 0.0)
+                if retry_at > time.monotonic():
+                    skipped += 1
+                    continue
+                await wait_for_keeper_cluster_slot(
+                    WORKER_ID,
+                    global_rate,
+                    lane_gate_key=gate_key,
+                    lane_requests_per_second=lane_rate,
+                )
+                try:
+                    snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
+                    await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID)
+                    local_retry_after.pop(guid, None)
+                    succeeded += 1
+                except Exception as exc:
+                    failed += 1
+                    response = getattr(exc, "response", None)
+                    status = getattr(response, "status_code", None)
+                    if status == 403:
+                        local_retry_after[guid] = time.monotonic() + KEEPER_SERVER_403_BACKOFF_SECONDS
+                    elif status == 429:
+                        local_retry_after[guid] = time.monotonic() + int(CONTROL_SETTINGS.get("keeper.default_429_backoff_seconds", 30))
+                    log.warning(
+                        "Distributed Keeper %s fetch failed worker_id=%s server=%s progress=%s/%s status=%s error=%s message=%r",
+                        lane_name, WORKER_ID, guid, index, len(assigned), status, type(exc).__name__, str(exc),
+                    )
+
+            elapsed = time.monotonic() - sweep_started
+            sleep_for = max(1.0, sweep_seconds - elapsed)
+            log.info(
+                "Distributed Keeper %s sweep complete worker_id=%s assigned_servers=%s succeeded=%s failed=%s skipped=%s "
+                "elapsed_seconds=%.1f next_sweep_in_seconds=%.1f",
+                lane_name, WORKER_ID, len(assigned), succeeded, failed, skipped, elapsed, sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(
+                "Distributed Keeper %s sweep fatal worker_id=%s error=%s message=%r",
+                lane_name, WORKER_ID, type(exc).__name__, str(exc),
+            )
+            await asyncio.sleep(10)
+
+
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
     global LAST_GOOD_PRESENCE_PLAYERS
@@ -3779,22 +4542,35 @@ async def monitor_cycle():
     references = len(relations)
     unique_count = len(unique_guids)
     duplicate_avoided = max(0, references - unique_count)
+    keeper_rate = max(
+        0.01,
+        float(
+            CONTROL_SETTINGS.get(
+                "keeper.external_requests_per_second",
+                EXTERNAL_REQUESTS_PER_SECOND,
+            )
+            if CONTROL_SETTINGS
+            else EXTERNAL_REQUESTS_PER_SECOND
+        ),
+    )
 
     log.info(
         "Monitor cycle started references=%s unique_servers=%s "
         "duplicate_lookups_avoided=%s default_servers_first=%s lookup_workers=%s "
-        "external_requests_per_second=%s keeper_batch_size=%s "
+        "external_requests_per_second=%s rate_gate=postgresql_cluster distributed_work=%s keeper_batch_size=%s "
         "keeper_batch_pause_seconds=%s",
         references,
         unique_count,
         duplicate_avoided,
         len(default_guids),
         EXTERNAL_LOOKUP_WORKERS,
-        EXTERNAL_REQUESTS_PER_SECOND,
+        keeper_rate,
+        "enabled" if bool(CONTROL_SETTINGS and CONTROL_SETTINGS.get("keeper.distributed_enabled", False)) else "disabled",
         KEEPER_BATCH_SIZE,
         KEEPER_BATCH_PAUSE_SECONDS,
     )
 
+    distributed_work = bool(CONTROL_SETTINGS and CONTROL_SETTINGS.get("keeper.distributed_enabled", False))
     fresh = {}
     attempted = 0
     skipped = 0
@@ -3806,7 +4582,20 @@ async def monitor_cycle():
     circuit_opened = False
 
     now_mono = time.monotonic()
-    if KEEPER_BACKOFF_UNTIL > now_mono:
+    if distributed_work:
+        max_age = int(CONTROL_SETTINGS.get("keeper.snapshot_max_age_seconds", 900))
+        fresh, snapshot_workers, missing = await asyncio.to_thread(
+            _load_distributed_keeper_snapshots, unique_guids, max_age
+        )
+        attempted = len(fresh)
+        skipped = missing
+        FRESH_SERVER_CACHE = fresh
+        log.info(
+            "Distributed Keeper snapshots loaded processor_worker_id=%s fresh=%s missing_or_stale=%s max_age_seconds=%s source_workers=%s",
+            WORKER_ID, len(fresh), missing, max_age,
+            ",".join(sorted(set(snapshot_workers.values()))) if snapshot_workers else "none",
+        )
+    elif KEEPER_BACKOFF_UNTIL > now_mono:
         skipped = unique_count
         remaining = max(0, int(KEEPER_BACKOFF_UNTIL - now_mono))
         FRESH_SERVER_CACHE = {}
@@ -3844,7 +4633,9 @@ async def monitor_cycle():
                     )
                     return
 
-                await wait_for_external_request_slot()
+                await wait_for_keeper_cluster_slot(
+                    WORKER_ID, keeper_rate
+                )
 
                 if circuit_event.is_set():
                     async with state_lock:
@@ -4088,6 +4879,9 @@ async def monitor_cycle():
                 status,
             )
 
+        # Cooperatively yield even when no Discord request was required.
+        await asyncio.sleep(0)
+
     player_history_summary = {
         "baselines": 0,
         "created": 0,
@@ -4129,10 +4923,20 @@ async def monitor_cycle():
             str(exc),
         )
 
-    # Cycle total always reflects only snapshots fetched this cycle.
+    # Cycle total always reflects only snapshots fetched this cycle. Map names
+    # are process-cached so this aggregate cannot fan out into synchronous DB
+    # round trips on the Discord event loop.
+    aggregate_started = time.perf_counter()
     player_total = sum(
         get_server_status(snapshot)["players"]
         for snapshot in fresh.values()
+    )
+    aggregate_elapsed = time.perf_counter() - aggregate_started
+    log.info(
+        "Monitor post-display aggregate complete fresh_servers=%s elapsed_seconds=%.3f map_cache_entries=%s",
+        len(fresh),
+        aggregate_elapsed,
+        len(_MAP_NAME_CACHE),
     )
     success_ratio = (
         1.0 if unique_count == 0
@@ -4201,12 +5005,17 @@ async def monitor_cycle():
     )
 
 
-async def monitor_loop():
-    while True:
+async def monitor_loop(generation: int):
+    generation = int(generation)
+    while DISCORD_SESSION_GENERATION == generation:
         try:
             await monitor_cycle()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             log.error("Monitor cycle fatal error=%s message=%r", type(exc).__name__, str(exc))
+        if DISCORD_SESSION_GENERATION != generation:
+            return
         # Schedule from completion and enforce a recovery window between large
         # Keeper sweeps. This is a total post-cycle idle, not an added delay.
         log.info(
@@ -5221,13 +6030,58 @@ async def status_all(interaction: discord.Interaction):
     try:
         rows = sorted_guild_servers(interaction.guild.id)
         await interaction.followup.send(f"Fetching status for **{len(rows)}** configured server(s)...", ephemeral=True)
+        sent = 0
+        failed = 0
+        failed_names = []
         for gs, bf in rows:
-            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid)
-            if snapshot is None:
-                snapshot = await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
-            marker = " (default)" if gs.is_default else ""
-            await interaction.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name}{marker}", get_server_status(snapshot), bf.server_guid))
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=True, started=started, result_code="ok", metadata={"server_count": len(rows)})
+            try:
+                snapshot = FRESH_SERVER_CACHE.get(bf.server_guid)
+                if snapshot is None:
+                    snapshot = await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                marker = " (default)" if gs.is_default else ""
+                await interaction.channel.send(
+                    build_status_message(
+                        f"BF4 Server Status — {gs.display_name}{marker}",
+                        get_server_status(snapshot),
+                        bf.server_guid,
+                    )
+                )
+                sent += 1
+            except Exception as exc:
+                failed += 1
+                failed_names.append(gs.display_name)
+                log.warning(
+                    "Status all server failed guild=%s server=%s display_name=%r error=%s message=%r",
+                    interaction.guild.id,
+                    bf.server_guid,
+                    gs.display_name,
+                    type(exc).__name__,
+                    str(exc),
+                )
+        if failed:
+            names = ", ".join(failed_names[:8])
+            suffix = f" (+{failed - 8} more)" if failed > 8 else ""
+            await interaction.followup.send(
+                f"✅ Posted **{sent}** server status message(s). "
+                f"⚠️ Skipped **{failed}** server(s): {names}{suffix}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ Posted **{sent}** server status message(s).",
+                ephemeral=True,
+            )
+        audit_command(
+            guild=interaction.guild,
+            channel=interaction.channel,
+            user=interaction.user,
+            command_name="status.all",
+            command_type="slash",
+            success=failed == 0,
+            started=started,
+            result_code="ok" if failed == 0 else "partial",
+            metadata={"server_count": len(rows), "sent": sent, "failed": failed},
+        )
     except Exception as exc:
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.all", command_type="slash", success=False, started=started, result_code="failed", error=exc)
         await interaction.followup.send(f"⚠️ Status failed: `{type(exc).__name__}`", ephemeral=True)
@@ -5277,7 +6131,7 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
 async def status_server_autocomplete(interaction, current):
     if not interaction.guild:
         return []
-    return command_choice_list(interaction.guild.id, current)
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current)
 
 
 tree.add_command(status_group)
@@ -5526,7 +6380,7 @@ async def default_add(
 
 @default_add.autocomplete("server")
 async def default_add_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current, defaults=False) if interaction.guild else []
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current, defaults=False) if interaction.guild else []
 
 
 @default_add.autocomplete("announcement_channel")
@@ -5700,7 +6554,7 @@ async def default_modify(
 
 @default_modify.autocomplete("server")
 async def default_modify_server_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current, defaults=True) if interaction.guild else []
 
 
 @default_modify.autocomplete("announcement_channel")
@@ -5787,7 +6641,7 @@ async def default_remove(interaction, server: str):
 
 @default_remove.autocomplete("server")
 async def default_remove_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current, defaults=True) if interaction.guild else []
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current, defaults=True) if interaction.guild else []
 
 
 tree.add_command(default_group)
@@ -6332,7 +7186,7 @@ async def renameserver(interaction: discord.Interaction, server: str, new_name: 
 
 @renameserver.autocomplete("server")
 async def renameserver_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current) if interaction.guild else []
 
 
 @tree.command(name="addannouncementchannel", description="Add one announcement channel")
@@ -7794,7 +8648,7 @@ async def debug(interaction: discord.Interaction, server: str | None = None):
 
 @debug.autocomplete("server")
 async def debug_autocomplete(interaction, current):
-    return command_choice_list(interaction.guild.id, current) if interaction.guild else []
+    return await asyncio.to_thread(command_choice_list, interaction.guild.id, current) if interaction.guild else []
 
 
 @tree.command(name="announce", description="Temporarily announce all default servers")
@@ -7864,19 +8718,24 @@ async def announce(interaction: discord.Interaction):
 
 
 async def prepare_operator(interaction: discord.Interaction) -> bool:
-    if not await asyncio.to_thread(is_operator, interaction.user.id):
-        if interaction.response.is_done():
-            await interaction.followup.send("⛔ Cluster operator authorization required.", ephemeral=True)
-        else:
-            await interaction.response.send_message("⛔ Cluster operator authorization required.", ephemeral=True)
-        return False
+    # Acknowledge the interaction before any PostgreSQL-backed authorization
+    # work. Discord interaction tokens have a short initial response window;
+    # deferring first prevents a temporarily busy leader event loop or slow DB
+    # lookup from turning a successful operator action into error 10062.
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
+    if not await asyncio.to_thread(is_operator, interaction.user.id):
+        await interaction.followup.send(
+            "⛔ Cluster operator authorization required.",
+            ephemeral=True,
+        )
+        return False
     return True
 
 operator_group=app_commands.Group(name="operator",description="Cluster operator controls")
 operator_destinations=app_commands.Group(name="destinations",description="Operator notification destinations",parent=operator_group)
 operator_notifications=app_commands.Group(name="notifications",description="Operator notification controls",parent=operator_group)
+operator_workers=app_commands.Group(name="workers",description="Worker drain and rolling-upgrade controls",parent=operator_group)
 
 def _destination_label(d):
     if d.destination_type=="dm": return f"DM {d.user_name or d.discord_user_id}" + (" — Primary" if d.is_primary else "")
@@ -7885,15 +8744,31 @@ def _destination_label(d):
 @operator_group.command(name="status",description="Show live cluster and operator notification status")
 async def operator_status(interaction:discord.Interaction):
     if not await prepare_operator(interaction): return
-    lease,workers,caps,dests,pending,retrying,problems=await asyncio.to_thread(cluster_status_snapshot)
+    stale_after=int(CONTROL_SETTINGS.get("worker.stale_after_seconds",60)) if CONTROL_SETTINGS else 60
+    (lease,workers,caps,dests,pending,retrying,problems,keeper_counts,keeper_eligible,keeper_caps,
+     persona_counts,persona_eligible,persona_caps,persona_pending,persona_retrying)=await asyncio.to_thread(cluster_status_snapshot,stale_after)
     lines=["**BF4 Server Watcher — Cluster Status**","","**Discord Leader**",f"{lease.owner_worker_id if lease else 'None'} — generation {lease.generation if lease else 0}","","**Workers**"]
     now=datetime.now(timezone.utc)
-    stale_after=int(CONTROL_SETTINGS.get("worker.stale_after_seconds",60)) if CONTROL_SETTINGS else 60
     for w in workers:
         age=(now-w.last_heartbeat_at).total_seconds() if w.last_heartbeat_at else 999999
         online=age<=stale_after
         cap=caps.get(w.worker_id); captext="Ready" if cap and cap.available else (cap.reason if cap else "Unknown")
-        lines.append(f"{'🟢' if online else '🔴'} `{w.worker_id}` — {'Online' if online else 'Stale'} — Discord: {captext}")
+        version=w.app_version or "unknown"
+        keeper_count=int(keeper_counts.get(w.worker_id,0))
+        persona_count=int(persona_counts.get(w.worker_id,0))
+        if w.draining and online:
+            state="Draining"; marker="🟡"
+        elif online:
+            state="Online"; marker="🟢"
+        else:
+            state="Stale"; marker="🔴"
+        lines.append(f"{marker} `{w.worker_id}` — {state} — Discord: {captext} — {version} — Keeper: {keeper_count} — Persona: {persona_count}")
+    persona_enabled=bool(CONTROL_SETTINGS.get('persona.distributed_enabled',False)) if CONTROL_SETTINGS else False
+    lines += ["", "**Player Persona**",
+              f"Distributed: **{'Enabled' if persona_enabled else 'Fallback / Disabled'}**",
+              f"Eligible workers: **{len(persona_eligible)}**",
+              f"Pending open unresolved sessions: **{persona_pending}**",
+              f"Retrying servers: **{persona_retrying}**"]
     channels=[d for d in dests if d.destination_type=='channel']; dms=[d for d in dests if d.destination_type=='dm']
     lines += ["","**Operator Notifications**", "🟢 Enabled" if bool(CONTROL_SETTINGS.get('operator.notifications_enabled',False)) else "⚫ Disabled", "",f"**Channels: {sum(d.enabled for d in channels)} enabled, {sum(not d.enabled for d in channels)} disabled**"]
     lines += [f"  {'🟢' if d.enabled and not d.last_failure_reason else '🔴' if d.enabled else '⚫'} {_destination_label(d)}" + (f" — `{d.last_failure_reason}`" if d.last_failure_reason else "") for d in channels] or ["  None configured"]
@@ -7903,6 +8778,69 @@ async def operator_status(interaction:discord.Interaction):
     lines += [f"⚠️ {e.message}" for e in problems] or ["None"]
     text="\n".join(lines)
     for i in range(0,len(text),1900): await interaction.followup.send(text[i:i+1900],ephemeral=True)
+
+async def _operator_worker_autocomplete(interaction:discord.Interaction,current:str,*,want_draining:bool):
+    try:
+        if not await asyncio.to_thread(is_operator,interaction.user.id): return []
+        workers=await asyncio.to_thread(list_workers)
+        current=(current or "").strip().lower()
+        choices=[]
+        for w in workers:
+            if bool(w.draining) != bool(want_draining): continue
+            if current and current not in w.worker_id.lower(): continue
+            suffix="draining" if w.draining else "active"
+            choices.append(app_commands.Choice(name=f"{w.worker_id} — {suffix}"[:100],value=w.worker_id))
+        return choices[:25]
+    except Exception:
+        return []
+
+
+async def operator_worker_drain_autocomplete(interaction:discord.Interaction,current:str):
+    return await _operator_worker_autocomplete(interaction,current,want_draining=False)
+
+
+async def operator_worker_resume_autocomplete(interaction:discord.Interaction,current:str):
+    return await _operator_worker_autocomplete(interaction,current,want_draining=True)
+
+
+@operator_workers.command(name="drain",description="Drain a worker for safe operator-controlled maintenance")
+async def operator_worker_drain(interaction:discord.Interaction,worker_id:str):
+    if not await prepare_operator(interaction): return
+    try:
+        workers=await asyncio.to_thread(list_workers)
+        current=next((w for w in workers if w.worker_id == worker_id),None)
+        if current is not None and current.draining:
+            await interaction.followup.send(f"ℹ️ `{worker_id}` is already draining.",ephemeral=True); return
+        row=await asyncio.to_thread(set_worker_draining,worker_id,True,f"discord:{interaction.user.id}")
+    except (ValueError,RuntimeError) as exc:
+        await interaction.followup.send(f"⚠️ {exc}",ephemeral=True); return
+    await interaction.followup.send(
+        f"🟡 `{row.worker_id}` is now **draining**. It remains online/heartbeating but is excluded from new Keeper assignments and Discord leadership. "
+        "Wait for `/operator status` to show **Draining**, **Keeper: 0**, and a different Discord leader (if it was leader) before stopping/rebuilding the host.",
+        ephemeral=True,
+    )
+
+
+@operator_workers.command(name="resume",description="Return a drained worker to the eligible pool")
+async def operator_worker_resume(interaction:discord.Interaction,worker_id:str):
+    if not await prepare_operator(interaction): return
+    try:
+        workers=await asyncio.to_thread(list_workers)
+        current=next((w for w in workers if w.worker_id == worker_id),None)
+        if current is not None and not current.draining:
+            await interaction.followup.send(f"ℹ️ `{worker_id}` is not draining.",ephemeral=True); return
+        row=await asyncio.to_thread(set_worker_draining,worker_id,False,f"discord:{interaction.user.id}")
+    except (ValueError,RuntimeError) as exc:
+        await interaction.followup.send(f"⚠️ {exc}",ephemeral=True); return
+    await interaction.followup.send(
+        f"🟢 `{row.worker_id}` is no longer draining and may rejoin eligible Keeper/Discord roles on the next control-plane cycle.",
+        ephemeral=True,
+    )
+
+
+operator_worker_drain.autocomplete("worker_id")(operator_worker_drain_autocomplete)
+operator_worker_resume.autocomplete("worker_id")(operator_worker_resume_autocomplete)
+
 
 @operator_destinations.command(name="list",description="List configured operator notification destinations")
 async def operator_dest_list(interaction:discord.Interaction):
@@ -8476,27 +9414,14 @@ async def on_ready():
     _track_discord_leader_task(guild_cleanup_loop(), f"guild-cleanup-g{generation}")
     _track_discord_leader_task(operator_event_loop(), f"operator-events-g{generation}")
 
-    # PR2 deliberately does not distribute Keeper.  The existing production
-    # monitor remains on rnt-01 and runs only while rnt-01 also owns Discord,
-    # because the monitor currently performs Discord delivery directly.
-    if WORKER_ID == "rnt-01":
-        _track_discord_leader_task(
-            monitor_loop(),
-            f"monitor-g{generation}",
-        )
-        log.info(
-            "Keeper monitor active worker_id=%s generation=%s "
-            "distributed_work=disabled",
-            WORKER_ID,
-            generation,
-        )
-    else:
-        log.info(
-            "Keeper monitor not started worker_id=%s generation=%s "
-            "reason=pr2_single_owner_rnt_only distributed_work=disabled",
-            WORKER_ID,
-            generation,
-        )
+    # Reconcile processor ownership continuously for this exact Discord lease
+    # generation. This handles hot changes to keeper.distributed_enabled and
+    # guarantees that at most one monitor task belongs to the active generation.
+    _track_discord_leader_task(
+        discord_processor_reconcile_loop(generation),
+        f"processor-reconcile-g{generation}",
+    )
+    await _ensure_discord_monitor_task(generation)
 
     log.info(
         "Discord leader session initialized worker_id=%s generation=%s "
@@ -8549,13 +9474,19 @@ async def main_async():
     worker_id = validate_worker_id(WORKER_ID)
     register_worker(worker_id, BOT_VERSION, status="starting")
     if TOKEN and not PRIMARY_OPERATOR_DISCORD_USER_ID:
-        raise RuntimeError("PRIMARY_OPERATOR_DISCORD_USER_ID is required on Discord-capable PR3 workers")
+        raise RuntimeError("PRIMARY_OPERATOR_DISCORD_USER_ID is required on Discord-capable PR4 workers")
     if PRIMARY_OPERATOR_DISCORD_USER_ID:
         await asyncio.to_thread(bootstrap_primary_operator, PRIMARY_OPERATOR_DISCORD_USER_ID)
     ensure_new_worker_standby(worker_id)
     await asyncio.to_thread(
         report_worker_capability, worker_id, "discord", bool(TOKEN),
         "ready" if TOKEN else "token_missing",
+    )
+    await asyncio.to_thread(
+        report_worker_capability, worker_id, "keeper", True, "ready",
+    )
+    await asyncio.to_thread(
+        report_worker_capability, worker_id, "player_persona", True, "ready",
     )
 
     settings = RuntimeSettingsCache()
@@ -8565,6 +9496,32 @@ async def main_async():
             "a known-good control-plane configuration"
         )
     CONTROL_SETTINGS = settings
+
+    keeper_counts, keeper_owners, keeper_eligible, _keeper_caps = await asyncio.to_thread(
+        keeper_assignment_snapshot, int(settings.get("worker.stale_after_seconds", 60))
+    )
+    log.info(
+        "Keeper assignment plan worker_id=%s eligible_workers=%s assigned_servers=%s "
+        "total_servers=%s distributed_work=%s",
+        worker_id,
+        ",".join(keeper_eligible) if keeper_eligible else "none",
+        int(keeper_counts.get(worker_id, 0)),
+        len(keeper_owners),
+        "enabled" if bool(settings.get("keeper.distributed_enabled", False)) else "assignment_only",
+    )
+
+    persona_counts, persona_owners, persona_eligible, _persona_caps = await asyncio.to_thread(
+        persona_assignment_snapshot, int(settings.get("worker.stale_after_seconds", 60))
+    )
+    log.info(
+        "Persona assignment plan worker_id=%s eligible_workers=%s assigned_servers=%s "
+        "pending_servers=%s distributed_work=%s",
+        worker_id,
+        ",".join(persona_eligible) if persona_eligible else "none",
+        int(persona_counts.get(worker_id, 0)),
+        len(persona_owners),
+        "enabled" if bool(settings.get("persona.distributed_enabled", False)) else "assignment_only",
+    )
 
     required_pr2_settings = (
         "discord.lease_ttl_seconds",
@@ -8578,7 +9535,7 @@ async def main_async():
         raise RuntimeError(
             "Required PR2 runtime settings are missing: "
             + ", ".join(missing_pr2_settings)
-            + ". Apply Alembic migrations through 0012 before starting v3.0.0-pr3."
+            + ". Apply Alembic migrations through 0013 before starting v3.0.0-pr4."
         )
 
     heartbeat_seconds = int(settings.get("worker.heartbeat_seconds", 5))
@@ -8602,6 +9559,18 @@ async def main_async():
         supervisor.run(),
         name="discord-leadership-supervisor",
     )
+    keeper_acquisition_task = asyncio.create_task(
+        distributed_keeper_acquisition_loop("bulk"),
+        name="distributed-keeper-bulk-acquisition",
+    )
+    keeper_fast_acquisition_task = asyncio.create_task(
+        distributed_keeper_acquisition_loop("fast"),
+        name="distributed-keeper-fast-acquisition",
+    )
+    persona_enrichment_task = asyncio.create_task(
+        distributed_persona_enrichment_loop(),
+        name="distributed-player-persona-enrichment",
+    )
 
     log.info(
         "Control-plane process ready worker_id=%s heartbeat_seconds=%s "
@@ -8609,7 +9578,7 @@ async def main_async():
         worker_id,
         heartbeat_seconds,
         bool(TOKEN),
-        worker_id == "rnt-01",
+        bool(settings.get("keeper.distributed_enabled", False)) or worker_id == "rnt-01",
     )
 
     try:
@@ -8628,6 +9597,9 @@ async def main_async():
                 str(exc),
             )
 
+        await _cancel_process_task(persona_enrichment_task)
+        await _cancel_process_task(keeper_fast_acquisition_task)
+        await _cancel_process_task(keeper_acquisition_task)
         await _cancel_process_task(heartbeat_task)
         await _cancel_process_task(refresh_task)
 

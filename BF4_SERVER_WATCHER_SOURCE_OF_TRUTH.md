@@ -2,21 +2,29 @@
 
 > **Document status:** Canonical project reference / living source of
 > truth\
-> **Project:** BF4 Server Watcher / BF4 Server Status / MapWatcher
-> lineage\
-> **Current stable release:** `v2.7.0`\
-> **Current v3 development build under validation:** `v3.0.0-pr2`\
-> **Current deployed/tested milestone:** `v2.7.0` startup and primary UX
-> features validated on 2026-08-24\
-> **Next queued patch:** `v2.7.1`\
-> **Major future milestone:** `v3.0.0` distributed worker architecture\
-> **Last consolidated:** 2026-08-24
+> **Current release:** `v3.0.0`\
+> **Production-soaked parent:** `v3.0.0-pr4-e` — signed off 2026-08-29\
+> **Current database head:** `0017_v3_0_0_persona_dist`\
+> **Current distributed fleet:** `rnt-01`, `hnl-01`, `mak-01`, `kah-01`\
+> **Current milestone:** `v3.0.0` final released after RC1/HF1/HF2 regression and production soak\
+> **Database milestone after v3.0.0:** `v3.1.0` dedicated PostgreSQL / replication / fenced failover foundation\
+> **Last consolidated:** 2026-08-29 (v3.0.0 final)
 >
 > This document is intended to preserve the full project state, the
 > reasoning behind important decisions, the current implementation
 > contract, validated operating parameters, known test results, future
 > architecture, and non-regression requirements. Future project work
 > should update this document rather than depend on chat history.
+
+------------------------------------------------------------------------
+
+# Current validated v3 state — 2026-08-29
+
+The active v3 application architecture is no longer merely planned. PR4-D and PR4-E have completed staged production validation across the four-worker fleet. `v3.0.0` final is the promoted, production-soaked RC1/HF1/HF2 runtime with no additional feature or architecture changes.
+
+Validated production properties include deterministic distributed Keeper ownership with global GUID deduplication, a globally conservative Keeper request budget, a separate fast/default lane, PostgreSQL-coordinated movable Discord leadership with generation fencing, worker drain/resume and rolling upgrades, and distributed open-session-only persona enrichment with durable claims, retry/backoff state, and fenced Discord alert handoff.
+
+The current v3.0.0 database remains on the combined rental host by design. Dedicated PostgreSQL separation and HA work is deferred until after final v3.0.0. The updated database direction is documented in `ROADMAP.md`; future database work uses Makawao as the preferred primary site, a stable `db.statusbot.com` application endpoint, asynchronous replication, and staged strongly fenced failover before eventual automatic HA.
 
 ------------------------------------------------------------------------
 

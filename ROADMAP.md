@@ -1,858 +1,638 @@
-# BF4 Server Watcher --- Roadmap
+# BF4 Server Watcher — Roadmap
 
-> **Status:** Source of truth / active roadmap\
-> **Last updated:** 2026-08-24\
+> **Status:** Source of truth / reconciled for `v3.0.0-rc1`
+> **Last updated:** 2026-08-29
 > **Project:** BF4 Server Watcher / Distributed BF4 Server Watcher
 
-This roadmap describes planned work from the `v2.6.6-pr2` pre-release
-forward. Items beyond the current release are plans, not guarantees;
-implementation details may change after source/schema inspection and testing.
+This roadmap is the reconciled project plan as of the completion and production sign-off of `v3.0.0-pr4-e`.
 
-## Roadmap principles
+Items already delivered are recorded as completed rather than left in historical “planned” language. Remaining `v3.0.0` work is intentionally limited to release-candidate packaging, regression, and release audit. Database separation and HA work begins after `v3.0.0`.
 
--   Preserve global server-GUID deduplication: one physical BF4 server
-    should not be polled repeatedly merely because multiple Discord
-    guilds reference it.
--   Keep external polling conservative. Distribution is intended to
-    improve resilience, workload isolation, and responsiveness---not to
-    multiply Keeper/Battlelog traffic.
--   PostgreSQL remains the source of truth for multi-guild runtime
-    state.
--   Database migrations use Alembic.
--   Discord IDs remain authoritative; stored names are human-readable
-    snapshots.
--   Avoid duplicate Discord leadership, duplicate worker jobs, and
-    unsafe database failover.
--   Prefer incremental, testable releases over changing several major
-    infrastructure variables at once.
+---
 
-------------------------------------------------------------------------
+# Roadmap principles
 
-# v2.6.6-pr2 --- Polling/Operations Pre-release
+- Preserve global server-GUID deduplication: one physical BF4 server should not be polled repeatedly merely because multiple Discord guilds reference it.
+- Keep external polling conservative. Distribution improves resilience, workload isolation, and responsiveness; it is not permission to multiply Keeper/Battlelog traffic.
+- PostgreSQL remains the source of truth for multi-guild runtime and distributed coordination state.
+- Database migrations use Alembic.
+- Discord IDs remain authoritative; stored names are human-readable snapshots.
+- Avoid duplicate Discord leadership, duplicate external jobs, unsafe claim overlap, and unsafe database failover.
+- Prefer incremental, testable releases over changing several major infrastructure variables at once.
+- For database HA, prefer strong fencing and demonstrated recovery behavior over aggressive automatic promotion.
+- Production validation must include failure and recovery testing, not only successful startup.
 
-`v2.6.6-pr2` builds on the Keeper batching experiments from `v2.6.6-pr1`
-and packages the validated pacing plus several operational fixes needed
-before `v2.7.0`.
+---
 
-## Default-server polling priority
+# Completed pre-v3 work
 
-Move all currently configured default servers to the **front of each
-Keeper monitoring sweep**.
+## v2.6.6-pr2 — COMPLETE
 
-Requirements:
+Delivered and validated:
 
--   Default servers are polled before ordinary/non-default tracked
-    servers.
--   Global GUID deduplication remains intact.
--   A default server referenced by multiple guilds still receives only
-    one Keeper lookup per sweep.
--   Default servers remain subject to the same global rate limits,
-    batching, cooldowns, circuit breaker, and failure handling.
--   This is prioritization, not permission to generate additional
-    uncontrolled Keeper traffic.
--   This becomes increasingly important as the monitored server
-    population grows, because watched-player and announcement-critical
-    servers should not sit behind several bulk batches.
+- default-server polling priority
+- global GUID deduplication preserved
+- platform-scoped bulk `/delserver`
+- default-server protection during bulk deletion
+- watched-player startup-baseline notification behavior
+- accepted Keeper pacing:
+  - `EXTERNAL_REQUESTS_PER_SECOND=0.33`
+  - `KEEPER_BATCH_SIZE=40`
+  - `KEEPER_BATCH_PAUSE_SECONDS=120`
+  - `KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=120`
+- circuit-breaker and Keeper failure protections retained
 
-## Bulk `/delserver` by platform
+## v2.7.0 — COMPLETE
 
-Extend `/delserver` with a guild-scoped bulk-delete option.
+Delivered and retained through the distributed v3 branch:
 
-Supported bulk targets:
+- persistent player-list refresh ETA
+- in-place player-list message editing/reuse
+- player-list “Last updated” Discord timestamp behavior
+- clickable watched-player identities when persona identity is known
+- watched-player scope across all current same-platform default servers
+- multi-default-server announcement separators
+- `/refreshserverhz` unresolved-server filtering
+- isolated Keeper failures no longer freeze an otherwise healthy rich-presence aggregate
+- obsolete announcement-schema cleanup completed through migrations/source updates
 
--   all PC servers
--   all PlayStation servers
--   all Xbox servers
+These behaviors are non-regression requirements for `v3.0.0`.
 
-Safety rules:
+---
 
--   The operation affects only the Discord guild in which the command is
-    invoked.
--   **Default servers must never be deleted by the bulk operation.**
--   Matching non-default `guild_servers` relationships may be removed.
--   Shared/global `bf4_servers` data must not be incorrectly removed
-    merely because one guild stops tracking a server.
--   Existing single-server deletion behavior remains available.
+# v3.0.0 — Distributed BF4 Server Watcher
 
-## Watched players discovered during startup baseline
+## Release objective
 
-Keep the existing anti-spam startup baseline behavior for ordinary
-players, but handle explicitly watched players differently.
+`v3.0.0` is the architectural transition from a single application host to a small distributed BF4 Server Watcher service.
 
-Current problem:
+Primary goals:
 
--   A watched player may already be online when Server Watcher starts.
--   Startup baseline suppression correctly avoids claiming that every
-    existing player just joined.
--   However, this can also suppress the watched-player notification
-    entirely for that already-online session.
+- resilience
+- workload isolation
+- deterministic ownership
+- conservative external polling
+- movable Discord leadership
+- operational flexibility
+- rolling-maintenance capability
+- minimal downtime
 
-Planned behavior:
+The release deliberately does **not** include dedicated PostgreSQL HA. PostgreSQL remains on the current combined `rnt-01` host for the final `v3.0.0` release.
 
--   Ordinary startup player alerts remain suppressed.
+## Completed distributed architecture
 
--   If an explicitly watched player is found online during startup
-    baseline, send a one-time informational notification such as:
+### Common worker image — COMPLETE
 
-    `🎯 EddieBlade is currently online on AAA`
+One Docker image supports all runtime roles. Each node has a stable `WORKER_ID`.
 
--   Do **not** falsely claim the player just joined.
+Current production worker inventory:
 
--   Record/deduplicate the notification so the same session does not
-    repeatedly generate startup alerts.
+- `rnt-01`
+- `hnl-01`
+- `mak-01`
+- `kah-01`
 
-## Accepted Keeper pacing for PR2
+Worker capabilities/roles are coordinated through PostgreSQL.
 
-The `v2.6.6-pr1` controlled batching tests are complete for the current
-single-worker deployment. The accepted `v2.6.6-pr2` pacing is:
+### PostgreSQL-backed worker registry — COMPLETE
 
-``` env
-EXTERNAL_REQUESTS_PER_SECOND=0.33
-KEEPER_BATCH_SIZE=40
-KEEPER_BATCH_PAUSE_SECONDS=120
-KEEPER_INTER_SWEEP_COOLDOWN_SECONDS=120
-```
+Implemented and validated:
 
-The `40 / 120 / 120` endurance test completed without recreating the
-Keeper 403/429 rate-limit wall. Real ISP outages during testing were
-identified separately by simultaneous Keeper, Battlelog, and Discord
-connectivity failures and are not treated as Keeper rate-limit failures.
-
-PR2 should keep these values configurable and preserve the existing
-circuit breaker plus robust 403/429/service-failure handling. Do not
-increase request pressure further in `v2.6.6`; additional tuning belongs
-to a separate controlled test.
+- worker identity
+- host/site metadata
+- version
+- startup time
+- heartbeat
+- enabled/draining state
+- role/capability state
+- health/staleness
+- graceful drain/resume semantics
 
-------------------------------------------------------------------------
+### Runtime polling policy in PostgreSQL — COMPLETE
 
-# v2.7.0 --- Watched-player and UX Update
+Distributed runtime settings are stored in PostgreSQL and hot-reloaded. `.env` remains primarily bootstrap/static configuration. Polling-rate controls are not exposed as ordinary Discord administration commands.
 
-## Player-list refresh ETA
+### Database-backed coordination and deduplication — COMPLETE
 
-When a persistent player-list display is enabled, add a separate message
-showing approximately when the next player-list update is expected.
+Implemented and production-tested coordination for distributed work. Global physical-server GUID deduplication is preserved.
 
-Intended presentation:
+### Conservative distributed Keeper budget — COMPLETE
 
-`Next playerlist update at *approximately* <Discord timestamp>`
+Keeper traffic remains globally controlled rather than scaling with worker count or public egress IP count.
 
-Requirements:
+Current validated global budget:
 
--   Use Discord's native timestamp rendering so each user sees local time.
--   Only the word **approximately** is italicized.
--   Position the ETA message between the map-change announcement and the
-    player-list block.
--   During ordinary refreshes, **edit the existing ETA message in place**.
--   During ordinary refreshes, edit/reuse the persistent player-list
-    message(s) in place wherever possible.
--   **On a map change only**, delete/repost the ETA and player-list block
-    after posting/replacing the server/map announcement, preserving:
-
-    ``` text
-    server/map announcement
-    player-list refresh ETA
-    persistent player list
-    ```
+- aggregate: `0.33 req/s`
+- bulk lane: `0.23 req/s`
+- fast/default lane: `0.10 req/s`
 
--   Do not allow older ETA/player-list messages to remain above a newly
-    posted map-change announcement.
--   Do not show an ETA where the player-list display is not enabled.
+### Fast/default-server lane — COMPLETE
 
-## Player-list in-place refresh
+Default/high-priority BF4 servers use a separate deterministic fast lane while remaining globally deduplicated.
 
-Replace the current wholesale delete-and-repost behavior for persistent
-player-list messages with in-place editing wherever possible.
+Normal validated production coverage:
 
-Refresh behavior:
+- 69 unique BF4 server GUIDs
+- 12 fast/default
+- 57 bulk
 
--   If the rendered roster/content is unchanged, do nothing.
--   If the same number of message chunks is still required, edit the
-    existing chunks in place.
--   If more chunks are required, edit/reuse the existing chunks and post
-    only the additional chunks.
--   If fewer chunks are required, edit/reuse the retained chunks and
-    delete only the excess old chunks.
--   Preserve stable Discord message IDs wherever possible.
--   Retain the existing content-hash/no-change optimization.
-
-This should reduce Discord message churn, visible delete/repost flicker,
-and unnecessary API operations during normal refreshes. The deliberate
-exception is a **map change**, where the ETA and player-list block are
-deleted/reposted after the new map announcement so the intended message
-order is preserved.
-
-## Player-list "Last updated" timestamp
-
-Add a Discord-native timestamp to the persistent player-list header.
-
-Intended presentation:
-
-`👥 **BF4 Players — Sloth Alliance Classics** — **Last updated <t:TIMESTAMP:F>**`
-
-Requirements:
-
--   Use Discord native timestamp markup so the date/time renders in each
-    viewer's local timezone.
--   Update the timestamp when the displayed player-list content actually
-    changes.
--   Do not include the timestamp itself in the content-hash comparison;
-    otherwise the changing clock would force a needless edit every scan.
--   If the roster/content is unchanged, leave both the message and its
-    existing "Last updated" timestamp untouched.
--   Apply the timestamp consistently to the primary/header chunk when a
-    player list spans multiple Discord messages.
-
-## Clickable watched-player names
+A representative healthy four-worker allocation is:
 
-In watched-player alerts, make the displayed player name a clickable
-Battlelog profile link when Server Watcher has a trustworthy resolved
-identity.
+- `hnl-01`: Keeper 16
+- `kah-01`: Keeper 12
+- `mak-01`: Keeper 19
+- `rnt-01`: Keeper 22
 
-Requirements:
+Total: 69.
 
--   Use the resolved persona/Battlelog identity already stored by Server
-    Watcher.
--   Do not guess profile URLs from an unresolved player name.
--   If persona enrichment has not resolved the player, fall back to the
-    existing plain player name.
--   Suppress unwanted link previews/embeds.
--   Preserve the existing clickable server-link behavior.
+### Movable Discord leadership — COMPLETE
 
-## Watch a player across all current same-platform default servers
+Exactly one eligible worker owns Discord leadership.
 
-Redesign watched-player scope from a frozen per-server mapping to a
-semantic guild/platform rule:
+Implemented and validated:
 
-> **Watch this player across all current same-platform default servers
-> in this guild.**
+- PostgreSQL-backed leadership state
+- generation fencing
+- graceful handoff
+- automatic failover
+- stale-worker exclusion
+- rolling-upgrade behavior
 
-Instead of persisting one watch row for every individual default server,
-store the guild-scoped watched identity and platform/scope, then
-dynamically resolve the guild's current matching default servers during
-monitoring.
+Multiple production failovers were exercised without duplicate active leaders.
 
-Expected behavior:
+### Worker draining and rolling upgrades — COMPLETE
 
--   PC player → all current PC default servers in that guild.
--   Xbox player → all current matching Xbox default servers.
--   PlayStation player → all current matching PlayStation default
-    servers.
--   Do not cross platform families.
--   Adding a new matching-platform default server automatically expands
-    the player's effective watch scope.
--   Removing/changing a default server automatically changes the
-    effective scope.
--   Administrators should not have to maintain dozens of
-    per-player/per-server association rows.
+Operators can drain workers before maintenance. Draining prevents new distributed work, relinquishes leadership when appropriate, and permits safe rebuild/restart. Rolling PR4-D and PR4-E deployment behavior was validated across all four hosts.
 
-This requires a database migration away from the current
-`guild_player_watches.server_guid`-centric model.
+---
 
-## Multi-default-server announcement separators
+# PR4-D — Distributed Keeper / leadership foundation — SIGNED OFF
 
-Improve readability when several default-server map announcements are
-stacked in the same Discord channel.
+PR4-D production validation completed successfully.
 
-Behavior:
+Validated:
 
--   If a guild has **multiple default servers**, append a dashed
-    separator after the final Tick Rate line of each map-change
-    announcement block.
--   If a guild has only one default server, preserve the current output
-    with no separator.
+- deterministic fast/default and bulk ownership
+- direct GUID coverage audit
+- fast-worker eligibility fallback/recovery
+- Keeper kill switch
+- rolling upgrade behavior
+- Discord generation-fenced failover
+- runtime hot reload
+- drain/resume UX
+- credential rotation and restart recovery
+- no polling coverage gaps
 
-Example:
+Status: **SIGNED OFF**
 
-``` text
-🎮 BF4 Map Change
-@Map Role
-🖥️ Server: AAA
-🗺️ Now Playing: Operation Metro 2014
-👥 Players: 62/64
-⚡ Tick Rate: 60 Hz
---------------------------------------
-```
+---
 
-Separator sizing:
+# PR4-E — Distributed live persona enrichment — SIGNED OFF
 
--   Dynamically size the dashes to approximately the visible character
-    length of the longest rendered line above it in that announcement
-    block.
--   Where practical, calculate against visible/rendered text rather than
-    raw Discord markup.
--   Role IDs, hidden link URLs, Markdown syntax, and similar markup must
-    not create absurdly long separators.
--   Apply a sensible maximum length if needed.
--   This is presentation-only; it must not change map-role ping behavior
-    or monitoring logic.
+PR4-E distributes automatic live player/persona enrichment while preserving Discord-side-effect fencing and existing session semantics.
 
-## `/refreshserverhz` unresolved-server filtering
+## Implemented behavior
 
-Improve `/refreshserverhz` so its server selector/autocomplete only
-offers guild-tracked servers whose tick rate has not yet been
-discovered.
+- unit of ownership: `server_guid`
+- source of work: open unresolved sessions only
+- deterministic HRW/rendezvous ownership using a persona namespace
+- eligible-worker filtering
+- no persistent per-session work queue
+- durable per-server claims with TTL
+- durable retry/no-progress state
+- cluster-wide persona request-start rate gate
+- no-progress backoff: 600 s → 1200 s → 1800 s → 3600 s cap
+- successful progress resets no-progress backoff
+- ordinary request errors retry at base interval
+- closed unresolved sessions do not create recurring enrichment debt
+- per-server batching retained
+- persona workers perform DB enrichment only
+- durable `persona_alert_mode` handoff preserves Discord watch-alert semantics
+- Discord leader consumes resolved alert intent under leadership fencing
+- leader-local fallback remains available when distributed persona is disabled
+- fallback honors durable retry and claim state
+- `/operator status` exposes persona distributed status and ownership counts
 
-Requirements:
+## PR4-E validation
 
--   Treat an unresolved tick rate as `bf4_servers.tick_rate_hz IS NULL`,
-    or the current equivalent unresolved state after source inspection.
+- Stage 0 — static/offline: **PASS**
+- Stage 1 — feature-off deployment: **PASS**
+- Stage 2 — assignment audit: **PASS**
+- Stage 3 — distributed activation: **PASS**
+- Stage 4 — retry/no-progress behavior: **PASS**
+- Stage 5 — graceful drain/failure/recovery: **PASS**
+- Stage 5 edge case — true mid-claim crash + TTL takeover: **NOT DIRECTLY EXERCISED**
+  - multiple attempts to interrupt a live claim were unsuccessful because normal enrichment completed and released claims before interruption
+  - this is recorded as unexercised, not failed
+- Stage 6 — kill switch / leader-local fallback / re-enable: **PASS**
+- Stage 7 — production soak: **PASS**
 
--   Omit servers whose tick rate is already known from the normal
-    selector/autocomplete results.
+Final production soak audit:
 
--   Preserve the existing authorization, command-channel restrictions,
-    and tick-rate discovery logic.
+- no expired claims
+- no closed sessions retaining persona alert intent
+- distributed persona enabled
+- all four workers healthy
+- Keeper coverage intact
+- no active cluster problems
 
--   If every tracked server in the guild already has a discovered tick
-    rate, respond clearly instead of presenting an empty/broken
-    selector:
+Status: **SIGNED OFF**
 
-    `All tracked servers already have a discovered tick rate.`
+---
 
-## Rich-presence isolated-failure health policy
+# v3.0.0-rc1 — NEXT
 
-Refine the player-count presence health rule so isolated per-server Keeper
-failures do not freeze an otherwise healthy aggregate.
+`v3.0.0-rc1` is a feature and architecture freeze. No new architectural features should be added unless required to fix a release-blocking defect.
 
-Requirements:
+## RC1 implementation/release checklist
 
--   Isolated Keeper snapshot failures such as HTTP 404 do **not** prevent
-    publishing the player total from successfully fetched snapshots.
--   Continue retaining the previous known-good presence aggregate when a
-    genuine service/network failure pattern occurs.
--   Circuit-breaker activation or mass skipped work remains unhealthy.
--   This specifically prevents permanently/offline console GUIDs from
-    freezing rich presence while the rest of the tracked fleet is healthy.
+### Version/release packaging
 
-## Remove obsolete legacy announcement columns
+- update application version to `v3.0.0-rc1`
+- update Docker image tag/version metadata
+- reconcile and update release documentation
+- regenerate canonical source-of-truth documentation
+- update CHANGELOG/release notes
+- produce clean runtime archive
+- produce separate documentation archive
+- exclude `__pycache__`, `.pyc`, `.pyo`, obsolete one-off static-check artifacts, and historical test docs not required by runtime
+- retain runtime-required Markdown such as third-party notices
 
-Remove the legacy columns:
+### Schema/migration audit
 
-``` text
-guild_settings.announcement_channel_id
-guild_settings.announcement_channel_name
-```
+- verify Alembic graph has one expected head
+- verify clean upgrade path to current head
+- verify `0017_v3_0_0_persona_dist` is the expected PR4-E schema head before any RC-only migrations
+- export a schema-only PostgreSQL snapshot for release/reference
+- verify ORM/source schema agrees with the live database
+- confirm no stale migration/bootstrap paths are still referenced by normal startup
 
-Normal announcement routing moved in `v2.3.0` to:
+### Four-node startup regression
 
--   `guild_announcement_channels`
--   per-default-server `guild_servers.announcement_channel_id`
--   per-default-server `guild_servers.announcement_channel_name`
+Verify all four nodes:
 
-Before dropping the legacy fields:
+- start normally
+- register correct `WORKER_ID`
+- report `v3.0.0-rc1`
+- reach healthy/online status
+- hot-load cluster runtime settings
+- expose expected capabilities
+- do not create duplicate Discord leadership
 
-1.  Inspect the current source and migration chain.
-2.  Verify no live startup, bootstrap, reconciliation, legacy-import,
-    command, or fallback path still reads/writes them.
-3.  Add an Alembic migration to drop the columns.
-4.  Remove the fields from SQLAlchemy models.
-5.  Update database/operator documentation.
+### Keeper regression
 
-The goal is to remove misleading dead schema while preserving all
-current multi-announcement-channel behavior.
+Verify:
 
-------------------------------------------------------------------------
+- 69 unique GUID coverage
+- global deduplication
+- fast/default lane coverage
+- bulk lane coverage
+- aggregate request budget remains conservative
+- isolated server failures do not suppress healthy presence totals
+- no unexpected 403/429 wall
+- no duplicate Keeper requests caused by worker count
 
-# v3.0.0 --- Distributed BF4 Server Watcher
+### Persona regression
 
-`v3.0.0` is the major architectural transition from one application host
-doing all work to a small distributed service.
+Verify:
 
-The primary goal is **resilience, workload isolation, conservative
-external polling, operational flexibility, and minimal downtime**---not
-maximum request throughput.
+- distributed persona enabled
+- eligible worker count correct
+- deterministic ownership covers all pending server groups
+- open unresolved sessions only
+- retry/no-progress state behaves normally
+- no expired/stuck claims
+- no closed-session automatic retry debt
+- durable alert handoff remains clean
+- no closed session retains `persona_alert_mode`
 
-## One common worker image
+### Discord regression
 
-Use one common Docker image for Server Watcher nodes.
+Verify:
 
-Each node receives a stable:
+- exactly one Discord leader
+- normal slash commands
+- status commands
+- map-change announcements
+- map-role behavior
+- persistent player-list behavior
+- player-list ETA behavior
+- watched-player alerts
+- operator status
+- operator notifications
+- cleanup/replacement behavior
+- native selectors/autocomplete where applicable
 
-``` text
-WORKER_ID
-```
+### Operational regression
 
-Worker capabilities and active roles are coordinated through PostgreSQL
-rather than requiring separate role-specific application builds.
+Verify:
 
-Possible roles include:
+- one graceful worker drain/resume
+- optional single controlled Discord leadership handoff
+- no need to repeat destructive testing already proven by PR4-D/PR4-E unless the RC build materially changes those paths
+- active-problems display remains clean
 
--   `bot`
--   `bulk`
--   `default_fast`
--   `players`
--   `standby`
+### RC1 exit criterion
 
-## PostgreSQL-backed worker registry
+If `v3.0.0-rc1` completes the regression/release audit without a release-blocking defect, promote the same code lineage to final `v3.0.0`.
 
-Track worker state such as:
+Only release-blocking fixes should alter the RC branch.
 
--   worker ID
--   desired role
--   active role
--   enabled/draining state
--   health/status
--   hostname
--   site/network metadata
--   application version
--   startup time
--   last heartbeat
--   last role change
+---
 
-Role changes must be graceful: stop claiming new old-role work, finish
-or safely release leases, initialize the new role, then begin claiming
-new work.
+# v3.0.0 — FINAL RELEASE TARGET
 
-## Runtime polling policy in PostgreSQL
+Final `v3.0.0` should contain the validated distributed application architecture without adding database-HA scope.
 
-Move runtime-adjustable distributed polling policy out of `.env` and
-into PostgreSQL.
+Release requirements:
 
-`.env` should primarily contain bootstrap/static values such as:
+- RC regression complete
+- release artifacts clean
+- migration path verified
+- source-of-truth docs regenerated
+- no known release-blocking defect
+- production deployment plan prepared
+- rollback procedure documented
 
--   `DATABASE_URL`
--   `WORKER_ID`
--   required secrets
+After final release, feature work moves to the database program.
 
-Workers periodically reload runtime settings without requiring a
-container restart.
+---
 
-Do **not** expose polling-rate controls through Discord commands.
+# v3.1.0 — Dedicated PostgreSQL and first HA foundation
 
-## Database-backed leasing and deduplication
+`v3.1.0` is a database-focused infrastructure release. The application layer should remain functionally boring while the PostgreSQL architecture is separated, replicated, fenced, and failure-tested.
 
-Use PostgreSQL-backed leases/locking so multiple workers cannot
-accidentally perform the same external job.
+## Deferred operator permissions / guardrails
 
-Possible mechanisms include:
+The operator `f!player` command guardrails, help/docs work, and database-backed permission profiles are intentionally deferred out of `v3.0.0` and into `v3.1.0`. Keep this work scoped so it does not destabilize the database/HA program.
 
--   row leases
--   `FOR UPDATE SKIP LOCKED`
--   PostgreSQL advisory locks
--   equivalent safe coordination
+## Preferred PostgreSQL site
 
-If several Discord guilds reference the same physical BF4 server GUID,
-it is still one external polling job.
+Makawao is the preferred PostgreSQL primary site because it has the strongest power resiliency.
 
-## Conservative global Keeper budget
+The site has:
 
-Multiple workers and multiple public Internet egress IPs must **not**
-automatically multiply total Keeper traffic.
+- multiple battery-backup systems
+- generator backup
+- two independent physical servers capable of hosting database VMs
+- no shared storage between the two Makawao database hosts
 
-Bulk Keeper polling should use a global aggregate budget distributed
-among eligible workers.
+Preferred topology:
 
-Distribution exists to reduce sustained pressure on an individual
-worker/site and improve resilience, not to race Keeper.
+- `mak-db-01` — preferred PostgreSQL primary
+- `mak-db-02` — local Makawao standby on the second physical server
+- `hnl-db-01` — Honolulu remote standby
+- `kah-db-01` — Kahului remote standby
+- `rnt-db-01` — Rental remote standby
 
-## Fast/default-server lane
-
-Default/high-priority servers should have a separate scheduling lane so
-important servers can be checked earlier/more responsively than the bulk
-population.
-
-Requirements:
-
--   global GUID deduplication
--   independent/conservative rate control
--   normal 403/429/service-failure protections
--   no duplicate work with the bulk lane
-
-Exact production polling targets remain subject to testing.
-
-## Player/persona worker role
-
-Separate Battlelog/player-related work from bulk Keeper polling where
-practical.
-
-Responsibilities may include:
-
--   persona enrichment
--   player identity resolution
--   player-history support
--   future player background jobs
-
-Preserve the established persona-enrichment policy:
-
--   automatically enrich open unresolved sessions only
--   preserve per-server batching
--   600-second base retry
--   progressive no-progress backoff
--   successful enrichment resets backoff
--   closed unresolved historical sessions do not consume automatic
-    recurring retry traffic
--   historical backfill, if ever needed, is an explicit/admin
-    maintenance operation
-
-## Movable Discord leadership
-
-The active Discord bot must not be permanently tied to one worker.
-
-Exactly **one** eligible worker owns Discord leadership at a time.
-
-Use PostgreSQL-backed singleton leadership with a lease/record and an
-exclusivity mechanism such as an advisory lock.
-
-Support:
-
--   preferred worker
--   active worker
--   lease expiration
--   heartbeat
--   handoff request
--   capability restrictions
-
-### Graceful handoff
-
-A planned bot move should:
-
-1.  stop accepting new bot work on the current leader
-2.  disconnect the current leader from Discord
-3.  release leadership
-4.  allow the target worker to acquire leadership
-5.  connect the new leader to Discord
-
-### Automatic bot failover
-
-If the active bot worker dies or loses its lease, another eligible
-bot-capable worker may acquire leadership after the old lease is safely
-expired.
-
-**Never permit two active Discord leaders.**
-
-## Worker draining and rolling upgrades
-
-Allow an operator to mark a worker as draining.
-
-A draining worker should:
-
--   stop claiming new jobs
--   finish or safely release current leases
--   relinquish Discord leadership if held
--   become safe to stop/rebuild
-
-After upgrade, clearing draining state returns the worker to the pool.
-
-Server Watcher itself should not remotely orchestrate Docker hosts.
-Git/Docker deployment remains operator-controlled.
-
-## Initial network topology
-
-The planned deployment spans four continuously interconnected networks:
-
-``` text
-192.168.200.0/24   rental
-192.168.10.0/24    makawao
-192.168.5.0/24     honolulu
-192.168.21.0/24    kahului
-```
-
-All four sites are considered viable for normal distributed-worker
-roles. Role placement should be based on measured reliability, capacity,
-failure-domain independence, and the needs of the final HA design.
-
-The project owns `bf4statusbot.com`. Use it as the planned internal DNS
-namespace for the multi-host deployment. Exact host/FQDN conventions
-remain to be finalized; hostnames should remain stable and should not
-encode temporary worker roles that may move between nodes.
-
-## v3.0.0 database deployment
-
-A dedicated PostgreSQL host is **not** a hard prerequisite for `v3.0.0`.
-
-The initial distributed-worker release may continue using the existing
-PostgreSQL installation on the current combined host while worker
-distribution is introduced and validated.
-
-This intentionally keeps the first distributed release focused on
-application/worker coordination.
-
-------------------------------------------------------------------------
-
-# v3.1.0 --- Dedicated PostgreSQL Host
-
-`v3.1.0` will formalize separation of PostgreSQL from the
-application/worker host.
-
-## Dedicated database VM/server
-
-Support moving the PostgreSQL primary to a dedicated Ubuntu Linux
-VM/server.
-
-The worker hosts then connect remotely to PostgreSQL over the private
-inter-site network/VPN.
-
-Goals:
-
--   remove the database and active worker from the same host failure
-    domain
--   simplify worker maintenance/reboots
--   prepare the database layer for later replication and failover
--   keep database infrastructure deliberately boring and independently
-    maintainable
-
-## Migration/cutover tooling and documentation
-
-Provide a supported migration path from the old combined PostgreSQL +
-Docker host to the dedicated DB host.
-
-Document and/or automate:
-
--   PostgreSQL installation
--   database/user creation
--   configuration
--   private-network listening
--   `pg_hba.conf` access rules
--   firewall requirements
--   backup of the existing database
--   restore/cutover to the new primary
--   worker `DATABASE_URL` changes
--   connectivity verification
--   application migration/startup validation
--   rollback considerations
-
-## Node bootstrap automation
-
-Provide a reusable bootstrap script for fresh Ubuntu Server VMs.
-
-Intended operator experience may resemble:
-
-``` bash
-sudo ./setup-bf4-node.sh worker
-```
-
-and:
-
-``` bash
-sudo ./setup-bf4-node.sh database
-```
-
-Worker bootstrap should install/configure the minimum host dependencies
-needed for the containerized worker, including Docker Engine/Compose and
-PostgreSQL client tools.
-
-Database bootstrap should prepare a dedicated PostgreSQL node without
-unnecessarily turning it into another application host.
-
-The exact package list and security defaults should be documented and
-version-controlled.
-
-Maintain a living `HOST_SETUP.md` alongside the bootstrap script. The
-normal upload/run sequence must explicitly include:
-
-``` bash
-chmod +x setup-bf4-node.sh
-sudo ./setup-bf4-node.sh worker
-```
-
-The bootstrap script supports `worker`, `database`, and `combined` roles.
-Worker-mode bootstrap has been successfully exercised on fresh hosts.
-Supported Ubuntu LTS targets currently include Ubuntu 24.04 LTS and
-Ubuntu 26.04 LTS. Permanent hostname changes remain optional during
-bootstrap while the final `bf4statusbot.com` naming convention is being
-designed.
-
-## Backup/restore validation
-
-Before declaring the dedicated DB migration complete:
-
--   verify automated/manual backups
--   perform a test restore
--   verify Server Watcher can reconnect cleanly
--   document recovery procedures
-
-------------------------------------------------------------------------
-
-# Post-v3.1 --- PostgreSQL Replication and Multi-site HA
-
-The dedicated database split is preparation for a later
-high-availability phase. Exact release numbering remains TBD.
-
-## Asynchronous streaming replicas
-
-Preferred initial topology:
-
-``` text
-rental    (192.168.200.x)   PostgreSQL primary/replica candidate
-makawao   (192.168.10.x)    asynchronous replica / DR candidate
-kahului   (192.168.21.x)    asynchronous replica / DR candidate
-honolulu  (192.168.5.x)     asynchronous replica / DR candidate
-```
-
-Prefer asynchronous streaming replication across VPN/WAN links so
-ordinary commits do not depend on remote-site latency.
-
-A catastrophic primary failure may lose a very small amount of state
-that had not yet reached a replica; this is preferable to forcing every
-normal write to wait on the WAN path.
+Potential total: **five PostgreSQL hosts across four sites**.
 
 ## Stable database endpoint
 
-Workers should eventually use a stable database endpoint instead of
-hard-coding a particular PostgreSQL primary.
+Application workers should use `db.statusbot.com`.
 
-Concept:
+Workers should not need to know which physical PostgreSQL node currently owns the writable primary role. Node-specific names should remain available for administration and HA tooling. Exact endpoint implementation will be selected during v3.1.0 design/testing.
 
-``` text
-workers
-   |
-   v
-stable DB endpoint
-   |
-   v
-HAProxy / HA routing
-   |
-   v
-current PostgreSQL primary
-```
+## Dedicated DB VM sizing
 
-After a safe failover, workers should reconnect without each worker
-requiring a manual primary-host configuration change.
+Initial DB VMs may start near the worker-agent VM sizing, but final sizing should be based on measured production PostgreSQL requirements.
 
-## Safe automatic failover
+Database sizing should prioritize:
 
-Replication by itself is not sufficient for safe automatic failover.
+- sufficient RAM
+- low-latency durable storage
+- storage IOPS
+- WAL behavior
+- backup/restore performance
 
-Use a well-supported HA/consensus design such as:
+CPU is expected to be less important than memory and storage quality for this workload.
 
-``` text
-Patroni
-+
-etcd / Consul
-+
-HAProxy
-```
+## Initial replication model
 
-or an equivalent architecture.
+Use PostgreSQL asynchronous streaming replication so ordinary application commits do not wait on WAN latency.
 
-Do **not** implement naive:
+Initial rollout:
 
-> primary unreachable → promote myself
+1. dedicated `mak-db-01` primary
+2. `mak-db-02` local streaming standby
+3. add one remote standby
+4. validate
+5. add remaining remote standbys one at a time
+6. validate after each topology change
 
-logic.
+## Semi-automatic failover with strong fencing
 
-## Split-brain protection
+Initial v3.1.0 failover should be semi-automatic rather than fully automatic.
 
-The final consensus/quorum topology should be selected from the four
-available sites based on measured reliability, failure-domain
-independence, and the requirements of the selected HA stack.
+Requirements:
 
-`192.168.5.0/24` is a normal candidate for PostgreSQL HA,
-primary-election, and quorum responsibilities and must not be excluded
-based on the former high-latency assumption.
+- no naive “primary unreachable → promote myself” logic
+- only one writable primary
+- strong old-primary fencing
+- verify replication position/health before promotion
+- explicit operator-controlled promotion
+- clear promotion status
+- clear rollback/failback procedure
+- returning old primary must not automatically become writable
+- returning old primary rejoins safely as a replica
 
-The final consensus member count and majority requirements will be
-defined when the PostgreSQL HA design is implemented and failure-tested.
+### Preferred-primary policy
 
-## Failure testing before HA is considered complete
+Makawao should be primary as often as safely practical.
 
-Intentionally test:
+If `mak-db-01` fails while the Makawao site remains healthy, prefer `mak-db-02` as first failover candidate.
 
--   worker crash
--   Discord leader crash
--   VPN partition
--   PostgreSQL primary shutdown
--   complete primary-site loss
--   replica promotion
--   old-primary rejoin
--   rolling Docker upgrades
--   role reassignment under load
--   worker reconnection through the stable DB endpoint
+If Makawao is unavailable, select an eligible remote standby based on health and replication state rather than an arbitrary permanent remote-site order.
 
-High availability is not complete merely because replication starts
-successfully; failure and recovery behavior must be demonstrated.
+When Makawao returns, do **not** immediately auto-snap back. Rejoin/catch up the Makawao node safely and perform a deliberate controlled switchover back to the preferred Makawao primary.
 
-------------------------------------------------------------------------
+## Migration/cutover tooling and documentation
 
-# Longer-term / Unscheduled
+Provide a supported migration path from the current combined `rnt-01` PostgreSQL deployment.
 
-These items are architectural directions rather than committed release
-targets.
+Document/automate:
+
+- PostgreSQL installation
+- database and role creation
+- authentication configuration
+- private-network listening
+- `pg_hba.conf`
+- firewall rules
+- SSL/TLS decision and configuration
+- backup existing production DB
+- restore/seed new primary
+- replication bootstrap
+- stable endpoint configuration
+- worker connection verification
+- Alembic verification
+- application startup validation
+- rollback
+
+## Node bootstrap automation
+
+Maintain `setup-bf4-node.sh` and `HOST_SETUP.md`.
+
+Supported roles:
+
+- `worker`
+- `database`
+- `combined`
+
+Worker setup retains required VM packages including `open-vm-tools`.
+
+Database mode should build a dedicated PostgreSQL host without unnecessarily installing application-worker runtime components.
+
+Supported Ubuntu LTS targets remain documented and tested.
+
+## Backup/restore validation
+
+Before v3.1.0 database work is considered complete:
+
+- define backup schedule/retention
+- perform real backup
+- perform real restore to a clean target
+- validate restored data/schema
+- verify Server Watcher reconnects cleanly
+- verify Alembic state
+- document recovery procedure
+- document RPO/RTO expectations
+
+## Failure-testing program
+
+Database HA is not considered complete merely because streaming replication reports healthy.
+
+Test progressively:
+
+- PostgreSQL process failure
+- primary VM shutdown
+- primary physical-host failure
+- Makawao local-primary failure with `mak-db-02` surviving
+- complete Makawao site loss
+- VPN/site partition
+- replica lag
+- WAL interruption
+- failed promotion attempt
+- safe promotion
+- stale old-primary return
+- old-primary fencing
+- controlled rejoin
+- controlled failback to Makawao
+- worker reconnect through `db.statusbot.com`
+- application behavior during connection loss/recovery
+- backup restore
+- rolling PostgreSQL maintenance where practical
+
+---
+
+# Post-v3.1 — Fully automatic PostgreSQL HA
+
+Fully automatic HA remains the end goal, but only after the semi-automatic topology has accumulated extensive production and failure-test evidence.
+
+Potential architecture may use Patroni or equivalent PostgreSQL HA management, etcd/Consul or another consensus store, and HAProxy or an equivalent stable routing layer.
+
+Requirements before enabling automatic promotion:
+
+- quorum design documented
+- split-brain scenarios tested
+- network partitions tested
+- stale-primary behavior tested
+- promotion eligibility rules tested
+- endpoint failover tested
+- recovery/failback tested
+- operational observability sufficient to explain every election/promotion
+
+Automatic HA must never depend on simplistic reachability-only self-promotion.
+
+---
+
+# Post-database application work
+
+Database architecture should be completed before major new application identity work.
+
+## Persona-ID canonical player identity
+
+Revisit player tracking so a player’s stable identity is anchored to persona ID when available rather than to the current visible player name.
+
+Goals:
+
+- rename-safe tracked-player identity
+- preserve continuity across player name changes
+- maintain current name separately from identity
+- preserve historical names/aliases with first/last-seen information where practical
+- session history remains attached to one persona identity
+- watched-player behavior follows the same person after rename
+
+This is especially important for BF4 Player Tracker reporting, which should eventually report name changes/history rather than treating the current name as the entire identity.
+
+A narrow bug fix may be considered for a `v3.0.x` patch only if a concrete release-impacting rename defect is found. The full identity/history redesign belongs after the database work.
 
 ## Historical persona backfill
 
-Closed unresolved historical sessions should **not** be automatically
-retried forever.
-
-If historical persona backfill is added, it should be a separate
-explicit/admin maintenance tool with bounded operator-controlled
-workload.
+Closed unresolved historical sessions should not be automatically retried forever. If historical persona backfill is implemented, it must be explicit/admin initiated, bounded, rate-controlled, and separate from live enrichment.
 
 ## Continued Keeper tuning
 
-Continue using production observations to tune:
+Production observations may continue to tune batch size, cooldowns, fast/default cadence, and the global distributed request budget. Any change must preserve conservative upstream behavior.
 
--   batch size
--   inter-batch cooldown
--   inter-sweep cooldown
--   fast/default lane cadence
--   global distributed request budget
-
-Any tuning must preserve conservative upstream behavior and avoid
-treating additional public IP addresses as permission to multiply
-request volume.
-
-------------------------------------------------------------------------
+---
 
 # Non-regression requirements
 
-Future releases should preserve these core behaviors unless a roadmap
-item explicitly redesigns them:
+Future releases preserve these unless explicitly redesigned:
 
--   global BF4 server GUID deduplication
--   unique-server presence aggregation
--   PostgreSQL-backed multi-guild state
--   Alembic migrations before normal operation
--   guild owner / Discord Administrator management bypass
--   exact-role semantics for `status_min_role_id`
--   command-channel restrictions
--   map-role autocomplete from `bf4_maps`
--   map-role ping integrated into the map-change announcement
--   announcement/message cleanup behavior
--   Discord IDs authoritative; names stored as snapshots
--   command audit history without storing command output
--   open-session-only automatic persona enrichment
--   no recurring automatic enrichment debt for closed unresolved
-    sessions
--   per-server persona batching
--   progressive enrichment no-progress backoff
--   conservative Keeper failure handling
--   no duplicate external work across workers
--   no multiple active Discord leaders
--   no unsafe/naive PostgreSQL self-promotion
+- global BF4 server GUID deduplication
+- unique-server presence aggregation
+- PostgreSQL-backed multi-guild state
+- Alembic migrations before normal operation
+- guild owner / Discord Administrator management bypass
+- exact-role semantics for `status_min_role_id`
+- command-channel restrictions
+- map-role autocomplete from `bf4_maps`
+- map-role ping integrated into map-change announcement
+- announcement/message cleanup behavior
+- Discord IDs authoritative; names stored as snapshots unless identity architecture explicitly evolves
+- command audit history without command output
+- open-session-only automatic persona enrichment
+- no recurring enrichment debt for closed unresolved sessions
+- per-server persona batching
+- progressive persona no-progress backoff
+- conservative Keeper failure handling
+- no duplicate external work across workers
+- no multiple active Discord leaders
+- durable fencing around distributed claims/leadership
+- no unsafe/naive PostgreSQL self-promotion
 
-------------------------------------------------------------------------
+---
 
-## Version summary
+# Version summary
 
-  ---------------------------------------------------------------------
-  Version                            Primary focus
-  ---------------------------------- ----------------------------------
-  `v2.6.6-pr2`                       Accepted 40/120/120 Keeper pacing,
-                                     default-server polling priority,
-                                     platform bulk-delete,
-                                     watched-player startup-baseline fix
+| Version | Primary focus | Status |
+|---|---|---|
+| `v2.6.6-pr2` | Keeper pacing and operational fixes | Complete |
+| `v2.7.0` | Watched-player and Discord UX improvements | Complete |
+| `v3.0.0-pr4-d` | Distributed Keeper/leadership foundation | Signed off |
+| `v3.0.0-pr4-e` | Distributed live persona enrichment | Signed off |
+| `v3.0.0-rc1` | Feature freeze, packaging, final regression | Next |
+| `v3.0.0` | Final distributed Server Watcher release | Pending RC validation |
+| `v3.1.0` | Dedicated PostgreSQL, replication, stable endpoint, semi-automatic strongly fenced failover | Planned |
+| Post-`v3.1` | Fully automatic PostgreSQL HA | Future |
+| Post-database | Persona-ID canonical identity/name history and other application features | Future |
 
-  `v2.7.0`                           Watched-player scope redesign,
-                                     clickable identities,
-                                     announcement/player-list UX,
-                                     legacy schema cleanup
+---
 
-  `v3.0.0`                           Distributed workers, DB-backed
-                                     leases/roles, movable Discord
-                                     leadership, coordinated polling
+# Immediate next actions
 
-  `v3.1.0`                           Dedicated PostgreSQL host,
-                                     migration/bootstrap tooling,
-                                     backup/restore validation
+1. Build `v3.0.0-rc1` from the signed-off PR4-E code line.
+2. Update version metadata and release documentation.
+3. Export and archive the current PostgreSQL schema-only snapshot.
+4. Run static/compile/Alembic checks.
+5. Produce clean runtime and documentation archives.
+6. Deploy RC1 using the validated rolling procedure.
+7. Run the final regression checklist.
+8. Fix only release-blocking issues.
+9. Promote to final `v3.0.0`.
+10. Begin the dedicated PostgreSQL / HA design and implementation program for `v3.1.0`.
 
-  Post-`v3.1` / TBD                  PostgreSQL replicas, stable DB
-                                     endpoint, quorum-based automatic
-                                     HA and disaster-recovery testing
-  ---------------------------------------------------------------------
+---
 
-------------------------------------------------------------------------
-
-*This roadmap intentionally separates near-term user-facing changes from
-the distributed-service and database-HA work so each stage can be tested
-independently.*
+*The project intentionally finishes and freezes the distributed application layer before beginning the database-HA transition. Each infrastructure layer must earn trust through staged production validation and explicit failure/recovery testing.*

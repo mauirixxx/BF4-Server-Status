@@ -22,6 +22,10 @@ from models import (
     ClusterRuntimeSetting,
     ClusterWorker,
     ClusterWorkerRole,
+    GuildServer,
+    KeeperRateGate,
+    BF4PlayerSession,
+    PlayerPersonaEnrichmentState,
 )
 
 log = logging.getLogger("serverwatcher.control_plane")
@@ -44,8 +48,14 @@ SETTING_BOUNDS = {
     "keeper.batch_size": (1, 10000),
     "keeper.batch_pause_seconds": (0, 86400),
     "keeper.403_flood_threshold": (2, 100),
+    "keeper.bulk_requests_per_second": (0.01, 10.0),
+    "keeper.fast_requests_per_second": (0.01, 10.0),
+    "keeper.fast_sweep_seconds": (30, 86400),
     "presence.update_seconds": (10, 3600),
     "persona.base_retry_seconds": (30, 86400),
+    "persona.external_requests_per_second": (0.01, 10.0),
+    "persona.sweep_seconds": (5, 86400),
+    "persona.claim_seconds": (30, 3600),
     "discord.lease_ttl_seconds": (10, 300),
     "discord.lease_renew_seconds": (1, 60),
     "worker.failure_reminder_seconds": (60, 86400),
@@ -168,6 +178,56 @@ def set_worker_status(worker_id: str, status: str) -> None:
         row.updated_at = func.now()
 
 
+def set_worker_draining(worker_id: str, draining: bool, updated_by: str | None = None) -> ClusterWorker:
+    """Persist an operator-controlled drain flag without changing worker liveness.
+
+    Draining is intentionally orthogonal to enabled/status. Heartbeats continue so
+    operators can distinguish a healthy drained worker from a dead worker. Existing
+    eligibility checks exclude draining workers from Keeper HRW assignment, lease
+    acquisition, and Discord leadership.
+    """
+    worker_id = validate_worker_id(worker_id)
+    with SessionLocal.begin() as session:
+        row = session.get(ClusterWorker, worker_id)
+        if row is None:
+            raise ValueError(f"worker {worker_id!r} not found")
+        db_now = session.scalar(select(func.now()))
+        changed = bool(row.draining) != bool(draining)
+        row.draining = bool(draining)
+        if changed:
+            row.last_role_change_at = db_now
+        row.updated_at = db_now
+        session.flush()
+        snapshot = ClusterWorker(
+            worker_id=row.worker_id, hostname=row.hostname, site_code=row.site_code,
+            ip_address=row.ip_address, app_version=row.app_version, enabled=row.enabled,
+            draining=row.draining, status=row.status, started_at=row.started_at,
+            last_heartbeat_at=row.last_heartbeat_at, last_role_change_at=row.last_role_change_at,
+            created_at=row.created_at, updated_at=row.updated_at,
+        )
+    log.info(
+        "Worker drain state changed worker_id=%s draining=%s updated_by=%s changed=%s",
+        worker_id, bool(draining), updated_by or "unknown", changed,
+    )
+    return snapshot
+
+
+def list_workers() -> list[ClusterWorker]:
+    """Return detached worker snapshots for operator controls/autocomplete."""
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(ClusterWorker).order_by(ClusterWorker.worker_id)))
+        return [
+            ClusterWorker(
+                worker_id=row.worker_id, hostname=row.hostname, site_code=row.site_code,
+                ip_address=row.ip_address, app_version=row.app_version, enabled=row.enabled,
+                draining=row.draining, status=row.status, started_at=row.started_at,
+                last_heartbeat_at=row.last_heartbeat_at, last_role_change_at=row.last_role_change_at,
+                created_at=row.created_at, updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
+
+
 def worker_is_stale(last_heartbeat_at: datetime | None, stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS) -> bool:
     if last_heartbeat_at is None:
         return True
@@ -175,6 +235,262 @@ def worker_is_stale(last_heartbeat_at: datetime | None, stale_after_seconds: int
     value = last_heartbeat_at if last_heartbeat_at.tzinfo else last_heartbeat_at.replace(tzinfo=timezone.utc)
     return value < now - timedelta(seconds=max(1, stale_after_seconds))
 
+
+
+def keeper_hrw_owner(server_guid: str, worker_ids: list[str]) -> str | None:
+    """Return the deterministic HRW/rendezvous owner for one BF4 server."""
+    workers = sorted({str(worker_id).strip() for worker_id in worker_ids if str(worker_id).strip()})
+    if not workers:
+        return None
+    guid = str(server_guid).strip().lower()
+    return max(
+        workers,
+        key=lambda worker_id: int.from_bytes(
+            hashlib.sha256(f"{guid}|{worker_id}".encode("utf-8")).digest(),
+            "big",
+        ),
+    )
+
+
+def keeper_assignment_snapshot(
+    stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
+    *,
+    role_name: str = "keeper_bulk",
+    guids: list[str] | set[str] | tuple[str, ...] | None = None,
+):
+    """Compute deterministic Keeper ownership for one role/lane.
+
+    PR4-D reuses the same HRW algorithm for both bulk and fast/default lanes.
+    Passing ``guids`` scopes ownership to that lane while preserving global GUID
+    deduplication before ownership is calculated.
+    """
+    role_name = str(role_name or "keeper_bulk").strip().lower()
+    if role_name not in {"keeper_bulk", "keeper_fast"}:
+        raise ValueError(f"unsupported Keeper role {role_name!r}")
+
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        workers = list(session.scalars(select(ClusterWorker).order_by(ClusterWorker.worker_id)))
+        keeper_roles = set(session.scalars(
+            select(ClusterWorkerRole.worker_id).where(
+                ClusterWorkerRole.role_name == role_name,
+                ClusterWorkerRole.enabled.is_(True),
+            )
+        ))
+        keeper_caps = {
+            row.worker_id: row
+            for row in session.scalars(
+                select(ClusterWorkerCapability).where(
+                    ClusterWorkerCapability.capability_name == "keeper"
+                )
+            )
+        }
+        if guids is None:
+            lane_guids = sorted(set(session.scalars(select(GuildServer.server_guid))))
+        else:
+            lane_guids = sorted({str(guid) for guid in guids if str(guid).strip()})
+
+    eligible = []
+    for worker in workers:
+        cap = keeper_caps.get(worker.worker_id)
+        stale = (
+            worker.last_heartbeat_at is None
+            or worker.last_heartbeat_at <= now - timedelta(seconds=max(1, int(stale_after_seconds)))
+        )
+        if (
+            worker.worker_id in keeper_roles
+            and worker.enabled
+            and not worker.draining
+            and not stale
+            and cap is not None
+            and cap.available
+        ):
+            eligible.append(worker.worker_id)
+
+    counts = {worker.worker_id: 0 for worker in workers}
+    owners = {}
+    for guid in lane_guids:
+        owner = keeper_hrw_owner(guid, eligible)
+        if owner is not None:
+            owners[guid] = owner
+            counts[owner] += 1
+    return counts, owners, eligible, keeper_caps
+
+
+
+def persona_hrw_owner(server_guid: str, worker_ids: list[str]) -> str | None:
+    """Return the deterministic PR4-E HRW owner for one persona-work server."""
+    workers = sorted({str(worker_id).strip() for worker_id in worker_ids if str(worker_id).strip()})
+    if not workers:
+        return None
+    guid = str(server_guid).strip().lower()
+    return max(
+        workers,
+        key=lambda worker_id: int.from_bytes(
+            hashlib.sha256(f"player_persona|{guid}|{worker_id}".encode("utf-8")).digest(),
+            "big",
+        ),
+    )
+
+
+def persona_assignment_snapshot(stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS):
+    """Compute deterministic PR4-E ownership for servers with open unresolved sessions."""
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        workers = list(session.scalars(select(ClusterWorker).order_by(ClusterWorker.worker_id)))
+        role_workers = set(session.scalars(
+            select(ClusterWorkerRole.worker_id).where(
+                ClusterWorkerRole.role_name == "player_persona",
+                ClusterWorkerRole.enabled.is_(True),
+            )
+        ))
+        capabilities = {
+            row.worker_id: row
+            for row in session.scalars(
+                select(ClusterWorkerCapability).where(
+                    ClusterWorkerCapability.capability_name == "player_persona"
+                )
+            )
+        }
+        guids = sorted(set(session.scalars(
+            select(BF4PlayerSession.server_guid).where(
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        )))
+
+    eligible = []
+    for worker in workers:
+        cap = capabilities.get(worker.worker_id)
+        stale = (
+            worker.last_heartbeat_at is None
+            or worker.last_heartbeat_at <= now - timedelta(seconds=max(1, int(stale_after_seconds)))
+        )
+        if (
+            worker.worker_id in role_workers
+            and worker.enabled
+            and not worker.draining
+            and not stale
+            and cap is not None
+            and cap.available
+        ):
+            eligible.append(worker.worker_id)
+
+    counts = {worker.worker_id: 0 for worker in workers}
+    owners = {}
+    for guid in guids:
+        owner = persona_hrw_owner(guid, eligible)
+        if owner is not None:
+            owners[guid] = owner
+            counts[owner] += 1
+    return counts, owners, eligible, capabilities
+
+
+def try_acquire_persona_rate_slot(worker_id: str, requests_per_second: float) -> tuple[bool, float]:
+    """Atomically acquire the cluster-wide PR4-E Battlelog persona request gate."""
+    worker_id = validate_worker_id(worker_id)
+    rate = max(0.01, float(requests_per_second))
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        row = session.get(KeeperRateGate, "persona", with_for_update=True)
+        if row is None:
+            raise RuntimeError("Persona cluster rate gate row is missing")
+        next_at = row.next_request_at
+        if next_at.tzinfo is None:
+            next_at = next_at.replace(tzinfo=timezone.utc)
+        wait_seconds = max(0.0, (next_at - now_aware).total_seconds())
+        if wait_seconds > 0:
+            return False, max(0.001, wait_seconds)
+        row.next_request_at = now_aware + timedelta(seconds=1.0 / rate)
+        row.last_worker_id = worker_id
+        row.total_grants = int(row.total_grants or 0) + 1
+        row.updated_at = now_aware
+        return True, 0.0
+
+
+async def wait_for_persona_cluster_slot(worker_id: str, requests_per_second: float) -> None:
+    while True:
+        granted, wait_seconds = await asyncio.to_thread(
+            try_acquire_persona_rate_slot, worker_id, requests_per_second
+        )
+        if granted:
+            return
+        await asyncio.sleep(min(max(wait_seconds, 0.001), 5.0))
+
+def try_acquire_keeper_rate_slot(
+    worker_id: str,
+    global_requests_per_second: float,
+    *,
+    lane_gate_key: str | None = None,
+    lane_requests_per_second: float | None = None,
+) -> tuple[bool, float]:
+    """Atomically acquire the global Keeper gate and, optionally, one lane gate.
+
+    The global ``keeper`` gate remains the hard aggregate request-start ceiling.
+    PR4-D adds ``keeper_bulk`` and ``keeper_fast`` lane gates so the two lanes can
+    have independent conservative rates without multiplying cluster traffic.
+    """
+    worker_id = validate_worker_id(worker_id)
+    global_rate = max(0.01, float(global_requests_per_second))
+    lane_key = str(lane_gate_key or "").strip() or None
+    lane_rate = None if lane_requests_per_second is None else max(0.01, float(lane_requests_per_second))
+
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+
+        # Always lock the global row first; all PR4-D callers use this ordering.
+        global_row = session.get(KeeperRateGate, "keeper", with_for_update=True)
+        if global_row is None:
+            raise RuntimeError("Keeper cluster global rate gate row is missing")
+
+        rows = [(global_row, global_rate)]
+        if lane_key is not None:
+            lane_row = session.get(KeeperRateGate, lane_key, with_for_update=True)
+            if lane_row is None:
+                raise RuntimeError(f"Keeper lane rate gate row {lane_key!r} is missing")
+            if lane_rate is None:
+                raise ValueError("lane_requests_per_second is required with lane_gate_key")
+            rows.append((lane_row, lane_rate))
+
+        waits = []
+        for row, _rate in rows:
+            next_at = row.next_request_at
+            if next_at.tzinfo is None:
+                next_at = next_at.replace(tzinfo=timezone.utc)
+            waits.append(max(0.0, (next_at - now_aware).total_seconds()))
+        wait_seconds = max(waits, default=0.0)
+        if wait_seconds > 0:
+            return False, max(0.001, wait_seconds)
+
+        for row, rate in rows:
+            row.next_request_at = now_aware + timedelta(seconds=1.0 / rate)
+            row.last_worker_id = worker_id
+            row.total_grants = int(row.total_grants or 0) + 1
+            row.updated_at = now_aware
+        return True, 0.0
+
+
+async def wait_for_keeper_cluster_slot(
+    worker_id: str,
+    global_requests_per_second: float,
+    *,
+    lane_gate_key: str | None = None,
+    lane_requests_per_second: float | None = None,
+) -> None:
+    """Wait for one PostgreSQL-coordinated Keeper request-start grant."""
+    while True:
+        granted, wait_seconds = await asyncio.to_thread(
+            try_acquire_keeper_rate_slot,
+            worker_id,
+            global_requests_per_second,
+            lane_gate_key=lane_gate_key,
+            lane_requests_per_second=lane_requests_per_second,
+        )
+        if granted:
+            return
+        await asyncio.sleep(min(max(wait_seconds, 0.001), 5.0))
 
 def get_worker_roles(worker_id: str) -> list[str]:
     with SessionLocal() as session:

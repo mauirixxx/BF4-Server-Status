@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import timedelta
 from sqlalchemy import func, or_, select, text
 from db import SessionLocal
-from models import ClusterOperatorDestination, ClusterOperatorEvent, ClusterOperatorEventDelivery, ClusterLease, ClusterWorker, ClusterWorkerCapability
+from models import ClusterOperatorDestination, ClusterOperatorEvent, ClusterOperatorEventDelivery, ClusterLease, ClusterWorker, ClusterWorkerCapability, GuildServer, BF4PlayerSession, PlayerPersonaEnrichmentState
 
 RECOVERY_TYPES={"worker_recovered","capability_recovered"}
 ALERT_TYPES={"worker_stale","capability_unavailable","handoff_failed","leadership_authority_expired"}
@@ -104,7 +104,7 @@ def mark_delivery_failure(delivery_id:int,error:str,permanent:bool,initial:int,m
         d.status="retry"; d.last_attempt_at=now; d.next_attempt_at=now+timedelta(seconds=delay); d.last_error=error[:255]; d.updated_at=now
         x=s.get(ClusterOperatorDestination,d.destination_id); x.last_failure_at=now; x.last_failure_reason=error[:255]; x.updated_at=now
 
-def cluster_status_snapshot():
+def cluster_status_snapshot(stale_after_seconds:int=60):
     with SessionLocal() as s:
         lease=s.get(ClusterLease,"discord:leader")
         workers=list(s.scalars(select(ClusterWorker).order_by(ClusterWorker.worker_id)))
@@ -113,7 +113,36 @@ def cluster_status_snapshot():
         pending=int(s.scalar(select(func.count()).select_from(ClusterOperatorEventDelivery).where(ClusterOperatorEventDelivery.status=="pending")) or 0)
         retry=int(s.scalar(select(func.count()).select_from(ClusterOperatorEventDelivery).where(ClusterOperatorEventDelivery.status=="retry")) or 0)
         problems=list(s.scalars(select(ClusterOperatorEvent).where(ClusterOperatorEvent.active.is_(True)).order_by(ClusterOperatorEvent.id)))
-        return lease,workers,caps,dests,pending,retry,problems
+        from control_plane import keeper_assignment_snapshot, persona_assignment_snapshot, load_effective_settings
+        settings = load_effective_settings()
+        all_guids = set(s.scalars(select(GuildServer.server_guid)))
+        default_guids = set(s.scalars(select(GuildServer.server_guid).where(GuildServer.is_default.is_(True))))
+        fast_counts, fast_owners, fast_eligible, keeper_caps = keeper_assignment_snapshot(
+            stale_after_seconds, role_name="keeper_fast", guids=default_guids
+        )
+        fast_active = bool(settings.get("keeper.fast_enabled", False)) and bool(default_guids) and bool(fast_eligible)
+        bulk_scope = all_guids - default_guids if fast_active else all_guids
+        bulk_counts, bulk_owners, keeper_eligible, bulk_caps = keeper_assignment_snapshot(
+            stale_after_seconds, role_name="keeper_bulk", guids=bulk_scope
+        )
+        keeper_counts = {w.worker_id: int(bulk_counts.get(w.worker_id, 0)) + (int(fast_counts.get(w.worker_id, 0)) if fast_active else 0) for w in workers}
+        keeper_caps = bulk_caps or keeper_caps
+        persona_counts, persona_owners, persona_eligible, persona_caps = persona_assignment_snapshot(stale_after_seconds)
+        persona_pending = int(s.scalar(
+            select(func.count()).select_from(BF4PlayerSession).where(
+                BF4PlayerSession.time_left.is_(None),
+                BF4PlayerSession.persona_id.is_(None),
+            )
+        ) or 0)
+        db_now = s.scalar(select(func.now()))
+        persona_retrying = int(s.scalar(
+            select(func.count()).select_from(PlayerPersonaEnrichmentState).where(
+                PlayerPersonaEnrichmentState.retry_after.is_not(None),
+                PlayerPersonaEnrichmentState.retry_after > db_now,
+            )
+        ) or 0)
+        return (lease,workers,caps,dests,pending,retry,problems,keeper_counts,keeper_eligible,keeper_caps,
+                persona_counts,persona_eligible,persona_caps,persona_pending,persona_retrying)
 
 def set_notifications_enabled(enabled:bool,updated_by:str):
     from models import ClusterRuntimeSetting
