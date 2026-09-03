@@ -32,6 +32,8 @@ from control_plane import (
     report_worker_capability, scan_worker_stale_transitions,
     pending_operator_events, mark_operator_event_notified, keeper_assignment_snapshot,
     wait_for_keeper_cluster_slot, persona_assignment_snapshot, wait_for_persona_cluster_slot,
+    record_keeper_lane_sweep, get_keeper_lane_cadence_seconds,
+    save_presence_aggregate_state, load_presence_aggregate_state,
 )
 from operator_notifications import (bootstrap_primary_operator, is_operator, list_destinations, add_dm, add_channel, set_destination_enabled, remove_destination, ensure_delivery_rows, due_deliveries, mark_delivery_success, mark_delivery_failure, cluster_status_snapshot, delivery_class, set_notifications_enabled)
 from discord_leader import DiscordLeadershipSupervisor
@@ -56,7 +58,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.0.0"
+BOT_VERSION = "v3.0.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -137,6 +139,16 @@ BATTLELOG_DEFAULT_429_BACKOFF_SECONDS = max(
     int(os.getenv("BATTLELOG_DEFAULT_429_BACKOFF_SECONDS", "30")),
 )
 LAST_GOOD_PRESENCE_PLAYERS: int | None = None
+LAST_GOOD_PRESENCE_COMPUTED_AT: datetime | None = None
+LAST_GOOD_PRESENCE_VALID_UNTIL: datetime | None = None
+# Player-list ETA learns the real display-cycle cadence in-process. This makes
+# the approximate timestamp follow actual distributed workload/worker behavior
+# instead of assuming the old single-process Keeper sweep duration.
+PLAYER_DISPLAY_CYCLE_LAST_STARTED_MONO: float | None = None
+PLAYER_DISPLAY_INTERVAL_HISTORY: deque[float] = deque(maxlen=6)
+PLAYER_DISPLAY_ETA_MIN_SECONDS = 60.0
+PLAYER_DISPLAY_ETA_MAX_SECONDS = 15 * 60.0
+PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO = 0.90
 KEEPER_SERVICE_FAILURE_THRESHOLD = 3
 KEEPER_SERVICE_BACKOFF_SECONDS = 60
 KEEPER_BACKOFF_UNTIL = 0.0
@@ -3823,14 +3835,56 @@ def roster_chunks_with_last_updated(chunks: list[str], updated_unix: int) -> lis
     return rendered
 
 
-def next_player_display_eta_unix(unique_count: int) -> int:
-    """Approximate the next display refresh from the configured pacing."""
-    batches = max(1, (max(0, unique_count) + KEEPER_BATCH_SIZE - 1) // KEEPER_BATCH_SIZE)
-    request_span = max(0.0, (max(0, unique_count) - 1) * EXTERNAL_REQUEST_INTERVAL_SECONDS)
-    batch_pauses = max(0, batches - 1) * KEEPER_BATCH_PAUSE_SECONDS
-    # Allow a small post-fetch budget for announcements/history/roster work.
-    estimate = KEEPER_INTER_SWEEP_COOLDOWN_SECONDS + request_span + batch_pauses + 45
-    return int((utcnow() + timedelta(seconds=estimate)).timestamp())
+def _record_player_display_cycle_start(started_mono: float) -> None:
+    """Record start-to-start display cadence for the adaptive ETA."""
+    global PLAYER_DISPLAY_CYCLE_LAST_STARTED_MONO
+    previous = PLAYER_DISPLAY_CYCLE_LAST_STARTED_MONO
+    PLAYER_DISPLAY_CYCLE_LAST_STARTED_MONO = float(started_mono)
+    if previous is None:
+        return
+    interval = max(0.0, float(started_mono) - float(previous))
+    if PLAYER_DISPLAY_ETA_MIN_SECONDS <= interval <= PLAYER_DISPLAY_ETA_MAX_SECONDS:
+        PLAYER_DISPLAY_INTERVAL_HISTORY.append(interval)
+
+
+def _player_display_eta_seconds(display_unique_count: int) -> tuple[float, str]:
+    """Return a smoothed observed cadence, with a safe startup fallback."""
+    samples = list(PLAYER_DISPLAY_INTERVAL_HISTORY)
+    if samples:
+        # Weight recent cycles more heavily so worker/load changes converge
+        # quickly while one slow cycle cannot make the ETA jump wildly.
+        weights = list(range(1, len(samples) + 1))
+        estimate = sum(value * weight for value, weight in zip(samples, weights)) / sum(weights)
+        return (
+            max(PLAYER_DISPLAY_ETA_MIN_SECONDS, min(PLAYER_DISPLAY_ETA_MAX_SECONDS, estimate)),
+            "observed",
+        )
+
+    # Before two display cycles have run, use the real post-monitor cooldown
+    # plus a modest allowance for the number of persistent player lists being
+    # rendered. Observed live cadence replaces this fallback after one sample.
+    workload_budget = min(120.0, 30.0 + max(0, int(display_unique_count)) * 3.0)
+    estimate = float(KEEPER_INTER_SWEEP_COOLDOWN_SECONDS) + workload_budget
+    return (
+        max(PLAYER_DISPLAY_ETA_MIN_SECONDS, min(PLAYER_DISPLAY_ETA_MAX_SECONDS, estimate)),
+        "fallback",
+    )
+
+
+def next_player_display_eta_unix(
+    unique_count: int,
+    *,
+    cycle_started_at: datetime | None = None,
+) -> int:
+    """Approximate the next player-list display from observed live cadence."""
+    estimate, _source = _player_display_eta_seconds(unique_count)
+    base = cycle_started_at or utcnow()
+    target = base + timedelta(seconds=estimate)
+    # Never advertise an ETA already in the past if a cycle ran unusually long.
+    minimum_target = utcnow() + timedelta(seconds=30)
+    if target < minimum_target:
+        target = minimum_target
+    return int(target.timestamp())
 
 
 def player_eta_content(next_update_unix: int) -> str:
@@ -4160,6 +4214,8 @@ async def update_persistent_player_display(
 
 
 async def refresh_persistent_player_displays(fresh: dict[str, dict]):
+    cycle_started_at = utcnow()
+    _record_player_display_cycle_start(time.monotonic())
     with SessionLocal() as session:
         rows = session.execute(
             select(GuildServer, BF4Server)
@@ -4249,7 +4305,11 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
             )
 
     unchanged = refreshed = failed = posted = deleted = edited = 0
-    next_update_unix = next_player_display_eta_unix(current_unique_server_count())
+    eta_seconds, eta_source = _player_display_eta_seconds(len(unique_guids))
+    next_update_unix = next_player_display_eta_unix(
+        len(unique_guids),
+        cycle_started_at=cycle_started_at,
+    )
     for row in requested:
         guid = row["server_guid"]
         snapshot = fresh.get(guid)
@@ -4317,7 +4377,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
         "Player display cycle complete requested=%s unique_servers=%s "
         "duplicate_roster_lookups_avoided=%s roster_lookups=%s "
         "unchanged=%s refreshed=%s failed=%s chunks_edited=%s chunks_posted=%s "
-        "old_chunks_deleted=%s next_eta=%s",
+        "old_chunks_deleted=%s next_eta=%s eta_source=%s eta_seconds=%.1f eta_samples=%s",
         len(requested),
         len(unique_guids),
         duplicate_avoided,
@@ -4329,6 +4389,9 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
         posted,
         deleted,
         next_update_unix,
+        eta_source,
+        eta_seconds,
+        len(PLAYER_DISPLAY_INTERVAL_HISTORY),
     )
     return {
         "requested": len(requested),
@@ -4369,21 +4432,139 @@ def _store_keeper_snapshot(guid: str, snapshot: dict, worker_id: str) -> None:
             row.updated_at = now
 
 
-def _load_distributed_keeper_snapshots(guids: list[str], max_age_seconds: int):
+def _load_distributed_keeper_snapshots(
+    guids: list[str],
+    default_guids: set[str],
+    *,
+    fast_active: bool,
+    fast_horizon_seconds: float,
+    bulk_horizon_seconds: float,
+):
+    """Load persisted snapshots and classify them against effective lane cadence."""
     if not guids:
-        return {}, {}, 0
+        return {}, {}, 0, 0
     with SessionLocal() as session:
         now = session.scalar(select(func.now()))
-        cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
         rows = session.scalars(
-            select(KeeperSnapshot).where(
-                KeeperSnapshot.server_guid.in_(guids),
-                KeeperSnapshot.fetched_at >= cutoff,
-            )
+            select(KeeperSnapshot).where(KeeperSnapshot.server_guid.in_(guids))
         ).all()
-    fresh = {row.server_guid: row.snapshot for row in rows}
-    workers = {row.server_guid: row.worker_id for row in rows}
-    return fresh, workers, len(guids) - len(fresh)
+
+    usable = {}
+    workers = {}
+    stale = 0
+    found = set()
+    for row in rows:
+        guid = str(row.server_guid)
+        found.add(guid)
+        horizon = (
+            float(fast_horizon_seconds)
+            if fast_active and guid in default_guids
+            else float(bulk_horizon_seconds)
+        )
+        fetched_at = row.fetched_at
+        if fetched_at is None:
+            stale += 1
+            continue
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        now_value = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (now_value - fetched_at).total_seconds())
+        if age_seconds <= max(1.0, horizon):
+            usable[guid] = row.snapshot
+            workers[guid] = row.worker_id
+        else:
+            stale += 1
+    missing = len(set(guids) - found)
+    return usable, workers, missing, stale
+
+
+def _clamp_presence_seconds(value: float, minimum: float, maximum: float) -> float:
+    low = max(1.0, float(minimum))
+    high = max(low, float(maximum))
+    return min(high, max(low, float(value)))
+
+
+async def _distributed_presence_policy(default_guids: set[str]) -> dict[str, float | bool | None]:
+    """Derive scale-aware freshness and last-good horizons from live lane cadence."""
+    snapshot_fallback = max(1.0, float(CONTROL_SETTINGS.get("keeper.snapshot_max_age_seconds", 900)))
+    stale_after = max(1, int(CONTROL_SETTINGS.get("worker.stale_after_seconds", 60)))
+    cadence_multiplier = max(1.0, float(CONTROL_SETTINGS.get("presence.snapshot_cadence_multiplier", 2.0)))
+    horizon_min = max(60.0, float(CONTROL_SETTINGS.get("presence.snapshot_horizon_min_seconds", 120)))
+    horizon_max = max(horizon_min, float(CONTROL_SETTINGS.get("presence.snapshot_horizon_max_seconds", 7200)))
+    telemetry_max_age = max(60, int(CONTROL_SETTINGS.get("presence.lane_telemetry_max_age_seconds", 7200)))
+
+    bulk_cadence, fast_cadence = await asyncio.gather(
+        asyncio.to_thread(get_keeper_lane_cadence_seconds, "bulk", stale_after, telemetry_max_age),
+        asyncio.to_thread(get_keeper_lane_cadence_seconds, "fast", stale_after, telemetry_max_age),
+    )
+    _counts, _owners, _eligible, _caps, fast_active, _default_count = await asyncio.to_thread(
+        _keeper_lane_assignment, "fast", stale_after
+    )
+
+    def horizon(cadence: float | None) -> float:
+        if cadence is None:
+            return _clamp_presence_seconds(snapshot_fallback, horizon_min, horizon_max)
+        return _clamp_presence_seconds(float(cadence) * cadence_multiplier, horizon_min, horizon_max)
+
+    bulk_horizon = horizon(bulk_cadence)
+    fast_horizon = horizon(fast_cadence) if fast_active else bulk_horizon
+
+    fallback_multiplier = max(1.0, float(CONTROL_SETTINGS.get(
+        "presence.persisted_fallback_cadence_multiplier", 3.0
+    )))
+    fallback_min = max(60.0, float(CONTROL_SETTINGS.get("presence.persisted_fallback_min_seconds", 1800)))
+    fallback_max = max(fallback_min, float(CONTROL_SETTINGS.get("presence.persisted_fallback_max_seconds", 21600)))
+    fallback_valid = _clamp_presence_seconds(
+        max(bulk_horizon, fast_horizon) * fallback_multiplier,
+        fallback_min,
+        fallback_max,
+    )
+    return {
+        "bulk_cadence_seconds": bulk_cadence,
+        "fast_cadence_seconds": fast_cadence,
+        "bulk_horizon_seconds": bulk_horizon,
+        "fast_horizon_seconds": fast_horizon,
+        "fast_active": bool(fast_active and default_guids),
+        "fallback_valid_seconds": fallback_valid,
+    }
+
+
+async def _hydrate_persisted_presence(reason: str) -> bool:
+    """Hydrate process-local presence cache from durable cluster state if still valid."""
+    global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_COMPUTED_AT
+    global LAST_GOOD_PRESENCE_VALID_UNTIL
+
+    state = await asyncio.to_thread(load_presence_aggregate_state)
+    if not state:
+        log.info("Presence aggregate hydration unavailable reason=%s persisted_state=missing", reason)
+        return False
+    _all_guids, default_guids = await asyncio.to_thread(_keeper_lane_guid_sets)
+    policy = await _distributed_presence_policy(default_guids)
+    computed_at = state["computed_at"]
+    if computed_at.tzinfo is None:
+        computed_at = computed_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    age_seconds = max(0.0, (now - computed_at).total_seconds())
+    valid_seconds = float(policy["fallback_valid_seconds"])
+    if age_seconds > valid_seconds:
+        log.info(
+            "Presence aggregate hydration unavailable reason=%s persisted_state=expired "
+            "aggregate_age_seconds=%.1f fallback_valid_seconds=%.1f",
+            reason, age_seconds, valid_seconds,
+        )
+        return False
+
+    LAST_GOOD_PRESENCE_PLAYERS = int(state["player_count"])
+    LAST_GOOD_PRESENCE_COMPUTED_AT = computed_at
+    LAST_GOOD_PRESENCE_VALID_UNTIL = computed_at + timedelta(seconds=valid_seconds)
+    log.info(
+        "Presence aggregate hydrated players=%s source=persisted_last_good reason=%s "
+        "aggregate_age_seconds=%.1f fallback_valid_seconds=%.1f source_worker_id=%s source_generation=%s",
+        LAST_GOOD_PRESENCE_PLAYERS, reason, age_seconds, valid_seconds,
+        state.get("worker_id"), state.get("leadership_generation"),
+    )
+    return True
 
 
 def _keeper_lane_guid_sets() -> tuple[set[str], set[str]]:
@@ -4462,6 +4643,7 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                 sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.distributed_sweep_seconds", 480)))
 
             succeeded = failed = skipped = 0
+            gate_wait_seconds = 0.0
             log.info(
                 "Distributed Keeper %s sweep started worker_id=%s assigned_servers=%s eligible_workers=%s "
                 "default_servers=%s fast_active=%s lane_requests_per_second=%s "
@@ -4482,7 +4664,7 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                 if retry_at > time.monotonic():
                     skipped += 1
                     continue
-                await wait_for_keeper_cluster_slot(
+                gate_wait_seconds += await wait_for_keeper_cluster_slot(
                     WORKER_ID,
                     global_rate,
                     lane_gate_key=gate_key,
@@ -4508,10 +4690,23 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
 
             elapsed = time.monotonic() - sweep_started
             sleep_for = max(1.0, sweep_seconds - elapsed)
+            cadence_seconds = elapsed + sleep_for
+            try:
+                await asyncio.to_thread(
+                    record_keeper_lane_sweep,
+                    WORKER_ID, lane_name, len(assigned), succeeded, failed, skipped,
+                    elapsed, gate_wait_seconds, cadence_seconds,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Distributed Keeper %s sweep telemetry persistence failed worker_id=%s "
+                    "error=%s message=%r",
+                    lane_name, WORKER_ID, type(exc).__name__, str(exc),
+                )
             log.info(
                 "Distributed Keeper %s sweep complete worker_id=%s assigned_servers=%s succeeded=%s failed=%s skipped=%s "
-                "elapsed_seconds=%.1f next_sweep_in_seconds=%.1f",
-                lane_name, WORKER_ID, len(assigned), succeeded, failed, skipped, elapsed, sleep_for,
+                "elapsed_seconds=%.1f gate_wait_seconds=%.1f next_sweep_in_seconds=%.1f",
+                lane_name, WORKER_ID, len(assigned), succeeded, failed, skipped, elapsed, gate_wait_seconds, sleep_for,
             )
             await asyncio.sleep(sleep_for)
         except asyncio.CancelledError:
@@ -4527,6 +4722,8 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_COMPUTED_AT
+    global LAST_GOOD_PRESENCE_VALID_UNTIL
 
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
@@ -4582,17 +4779,29 @@ async def monitor_cycle():
     circuit_opened = False
 
     now_mono = time.monotonic()
+    presence_policy = None
+    snapshot_missing = 0
+    snapshot_stale = 0
     if distributed_work:
-        max_age = int(CONTROL_SETTINGS.get("keeper.snapshot_max_age_seconds", 900))
-        fresh, snapshot_workers, missing = await asyncio.to_thread(
-            _load_distributed_keeper_snapshots, unique_guids, max_age
+        presence_policy = await _distributed_presence_policy(default_guids)
+        fresh, snapshot_workers, snapshot_missing, snapshot_stale = await asyncio.to_thread(
+            _load_distributed_keeper_snapshots,
+            unique_guids,
+            default_guids,
+            fast_active=bool(presence_policy["fast_active"]),
+            fast_horizon_seconds=float(presence_policy["fast_horizon_seconds"]),
+            bulk_horizon_seconds=float(presence_policy["bulk_horizon_seconds"]),
         )
         attempted = len(fresh)
-        skipped = missing
+        skipped = snapshot_missing + snapshot_stale
         FRESH_SERVER_CACHE = fresh
         log.info(
-            "Distributed Keeper snapshots loaded processor_worker_id=%s fresh=%s missing_or_stale=%s max_age_seconds=%s source_workers=%s",
-            WORKER_ID, len(fresh), missing, max_age,
+            "Distributed Keeper snapshots loaded processor_worker_id=%s usable=%s stale=%s missing=%s "
+            "bulk_horizon_seconds=%.1f fast_horizon_seconds=%.1f fast_active=%s source_workers=%s",
+            WORKER_ID, len(fresh), snapshot_stale, snapshot_missing,
+            float(presence_policy["bulk_horizon_seconds"]),
+            float(presence_policy["fast_horizon_seconds"]),
+            bool(presence_policy["fast_active"]),
             ",".join(sorted(set(snapshot_workers.values()))) if snapshot_workers else "none",
         )
     elif KEEPER_BACKOFF_UNTIL > now_mono:
@@ -4923,9 +5132,10 @@ async def monitor_cycle():
             str(exc),
         )
 
-    # Cycle total always reflects only snapshots fetched this cycle. Map names
-    # are process-cached so this aggregate cannot fan out into synchronous DB
-    # round trips on the Discord event loop.
+    # Distributed mode aggregates usable persisted cluster snapshots classified
+    # against the effective fast/bulk lane cadence. Map names are process-cached
+    # so this aggregate cannot fan out into synchronous DB round trips on the
+    # Discord event loop. Legacy mode continues to aggregate this cycle's fetches.
     aggregate_started = time.perf_counter()
     player_total = sum(
         get_server_status(snapshot)["players"]
@@ -4943,36 +5153,93 @@ async def monitor_cycle():
         else len(fresh) / unique_count
     )
     # Isolated per-server failures (especially Keeper 404s for offline console
-    # servers) must not freeze rich presence. Retain the previous aggregate only
-    # for genuine service/network trouble, skipped work, or an opened circuit.
-    presence_healthy = (
-        unique_count == 0
-        or (
-            len(fresh) > 0
-            and skipped == 0
-            and service_failures == 0
-            and not circuit_opened
+    # servers) must not freeze rich presence. Distributed mode tolerates a small
+    # amount of stale/missing snapshot coverage; legacy mode keeps its stricter
+    # skipped-work requirement. Genuine service trouble still retains the prior
+    # known-good aggregate.
+    if distributed_work:
+        # In distributed mode, `skipped` means missing/stale persisted snapshots,
+        # not skipped requests by this Discord-leader cycle. A small number of
+        # isolated stale/offline servers must not permanently suppress player
+        # presence, but severe snapshot loss should retain the previous total.
+        presence_healthy = (
+            unique_count == 0
+            or (
+                len(fresh) > 0
+                and success_ratio >= PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO
+                and service_failures == 0
+                and not circuit_opened
+            )
         )
-    )
+    else:
+        presence_healthy = (
+            unique_count == 0
+            or (
+                len(fresh) > 0
+                and skipped == 0
+                and service_failures == 0
+                and not circuit_opened
+            )
+        )
+    if distributed_work:
+        log.info(
+            "Presence aggregate evaluated players=%s servers=%s usable=%s stale=%s missing=%s "
+            "coverage_ratio=%.4f required_ratio=%.4f bulk_horizon_seconds=%.1f "
+            "fast_horizon_seconds=%.1f fast_active=%s healthy=%s",
+            player_total, unique_count, len(fresh), snapshot_stale, snapshot_missing,
+            success_ratio, PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO,
+            float(presence_policy["bulk_horizon_seconds"]),
+            float(presence_policy["fast_horizon_seconds"]),
+            bool(presence_policy["fast_active"]), presence_healthy,
+        )
+
     if presence_healthy:
         LAST_GOOD_PRESENCE_PLAYERS = player_total
+        computed_at = datetime.now(timezone.utc)
+        fallback_valid_seconds = (
+            float(presence_policy["fallback_valid_seconds"])
+            if distributed_work and presence_policy is not None
+            else max(1800.0, float(PRESENCE_UPDATE_SECONDS) * 6.0)
+        )
+        LAST_GOOD_PRESENCE_COMPUTED_AT = computed_at
+        LAST_GOOD_PRESENCE_VALID_UNTIL = computed_at + timedelta(seconds=fallback_valid_seconds)
+        if distributed_work:
+            try:
+                persisted_at = await asyncio.to_thread(
+                    save_presence_aggregate_state,
+                    player_count=player_total,
+                    server_count=unique_count,
+                    usable_snapshots=len(fresh),
+                    total_servers=unique_count,
+                    coverage_ratio=success_ratio,
+                    worker_id=WORKER_ID,
+                    leadership_generation=DISCORD_SESSION_GENERATION,
+                )
+                LAST_GOOD_PRESENCE_COMPUTED_AT = persisted_at
+                LAST_GOOD_PRESENCE_VALID_UNTIL = persisted_at + timedelta(seconds=fallback_valid_seconds)
+            except Exception as exc:
+                log.warning(
+                    "Presence aggregate persistence failed error=%s message=%r",
+                    type(exc).__name__, str(exc),
+                )
         log.info(
-            "Presence aggregate updated players=%s healthy=True "
-            "success_ratio=%.4f isolated_failures=%s",
-            player_total,
-            success_ratio,
-            isolated_failures,
+            "Presence aggregate updated players=%s healthy=True coverage_ratio=%.4f "
+            "isolated_failures=%s fallback_valid_seconds=%.1f",
+            player_total, success_ratio, isolated_failures, fallback_valid_seconds,
         )
     else:
         log.info(
             "Presence aggregate retained players=%s reason=unhealthy_cycle "
-            "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s",
+            "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s "
+            "coverage_ratio=%.4f distributed_work=%s",
             LAST_GOOD_PRESENCE_PLAYERS,
             len(fresh),
             unique_count,
             failures,
             skipped,
             circuit_opened,
+            success_ratio,
+            distributed_work,
         )
 
     log.info(
@@ -5026,9 +5293,43 @@ async def monitor_loop(generation: int):
 
 
 async def presence_loop():
+    global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_COMPUTED_AT
+    global LAST_GOOD_PRESENCE_VALID_UNTIL
+
     index = 0
+    hydration_attempted = False
     while True:
         try:
+            if LAST_GOOD_PRESENCE_PLAYERS is None and not hydration_attempted:
+                hydration_attempted = True
+                try:
+                    await _hydrate_persisted_presence("presence_loop_start")
+                except Exception as exc:
+                    log.warning(
+                        "Presence aggregate hydration failed error=%s message=%r",
+                        type(exc).__name__, str(exc),
+                    )
+            now = datetime.now(timezone.utc)
+            if (
+                LAST_GOOD_PRESENCE_PLAYERS is not None
+                and LAST_GOOD_PRESENCE_VALID_UNTIL is not None
+                and now > LAST_GOOD_PRESENCE_VALID_UNTIL
+            ):
+                age_seconds = (
+                    max(0.0, (now - LAST_GOOD_PRESENCE_COMPUTED_AT).total_seconds())
+                    if LAST_GOOD_PRESENCE_COMPUTED_AT is not None
+                    else 0.0
+                )
+                log.info(
+                    "Presence aggregate unavailable reason=persisted_last_good_expired "
+                    "players=%s aggregate_age_seconds=%.1f",
+                    LAST_GOOD_PRESENCE_PLAYERS, age_seconds,
+                )
+                LAST_GOOD_PRESENCE_PLAYERS = None
+                LAST_GOOD_PRESENCE_COMPUTED_AT = None
+                LAST_GOOD_PRESENCE_VALID_UNTIL = None
+
             with SessionLocal() as session:
                 unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
             if LAST_GOOD_PRESENCE_PLAYERS is None:

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from db import SessionLocal
@@ -24,6 +24,9 @@ from models import (
     ClusterWorkerRole,
     GuildServer,
     KeeperRateGate,
+    KeeperRateWaiter,
+    KeeperLaneWorkerState,
+    PresenceAggregateState,
     BF4PlayerSession,
     PlayerPersonaEnrichmentState,
 )
@@ -36,6 +39,8 @@ WORKER_ID = os.environ.get("WORKER_ID", "").strip()
 DEFAULT_HEARTBEAT_SECONDS = 5
 DEFAULT_STALE_AFTER_SECONDS = 60
 DEFAULT_RUNTIME_SETTINGS_REFRESH_SECONDS = 30
+KEEPER_RATE_WAITER_STALE_SECONDS = 15
+KEEPER_RATE_WAITER_RETRY_SECONDS = 0.5
 
 SETTING_BOUNDS = {
     "worker.heartbeat_seconds": (1, 60),
@@ -52,6 +57,13 @@ SETTING_BOUNDS = {
     "keeper.fast_requests_per_second": (0.01, 10.0),
     "keeper.fast_sweep_seconds": (30, 86400),
     "presence.update_seconds": (10, 3600),
+    "presence.snapshot_cadence_multiplier": (1.0, 10.0),
+    "presence.snapshot_horizon_min_seconds": (60, 86400),
+    "presence.snapshot_horizon_max_seconds": (60, 86400),
+    "presence.lane_telemetry_max_age_seconds": (60, 86400),
+    "presence.persisted_fallback_cadence_multiplier": (1.0, 20.0),
+    "presence.persisted_fallback_min_seconds": (60, 86400),
+    "presence.persisted_fallback_max_seconds": (60, 604800),
     "persona.base_retry_seconds": (30, 86400),
     "persona.external_requests_per_second": (0.01, 10.0),
     "persona.sweep_seconds": (5, 86400),
@@ -425,11 +437,12 @@ def try_acquire_keeper_rate_slot(
     lane_gate_key: str | None = None,
     lane_requests_per_second: float | None = None,
 ) -> tuple[bool, float]:
-    """Atomically acquire the global Keeper gate and, optionally, one lane gate.
+    """Atomically acquire the global Keeper gate and, optionally, one fair lane gate.
 
     The global ``keeper`` gate remains the hard aggregate request-start ceiling.
-    PR4-D adds ``keeper_bulk`` and ``keeper_fast`` lane gates so the two lanes can
-    have independent conservative rates without multiplying cluster traffic.
+    ``keeper_bulk`` and ``keeper_fast`` retain their independent conservative lane
+    ceilings.  PR2 adds a durable per-lane waiter queue so continuously requesting
+    workers cannot starve one another while competing for those shared slots.
     """
     worker_id = validate_worker_id(worker_id)
     global_rate = max(0.01, float(global_requests_per_second))
@@ -440,7 +453,7 @@ def try_acquire_keeper_rate_slot(
         now = session.scalar(select(func.now()))
         now_aware = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
 
-        # Always lock the global row first; all PR4-D callers use this ordering.
+        # Always lock the global row first; all Keeper callers use this ordering.
         global_row = session.get(KeeperRateGate, "keeper", with_for_update=True)
         if global_row is None:
             raise RuntimeError("Keeper cluster global rate gate row is missing")
@@ -453,6 +466,45 @@ def try_acquire_keeper_rate_slot(
             if lane_rate is None:
                 raise ValueError("lane_requests_per_second is required with lane_gate_key")
             rows.append((lane_row, lane_rate))
+
+            # A worker keeps its original queue position while it is waiting, but
+            # refreshes updated_at on every retry.  Expired rows cannot block a lane
+            # forever after a worker crash/restart.
+            stale_before = now_aware - timedelta(seconds=KEEPER_RATE_WAITER_STALE_SECONDS)
+            session.execute(
+                delete(KeeperRateWaiter).where(
+                    KeeperRateWaiter.gate_key == lane_key,
+                    KeeperRateWaiter.updated_at < stale_before,
+                )
+            )
+            waiter = session.get(
+                KeeperRateWaiter,
+                {"gate_key": lane_key, "worker_id": worker_id},
+                with_for_update=True,
+            )
+            if waiter is None:
+                waiter = KeeperRateWaiter(
+                    gate_key=lane_key,
+                    worker_id=worker_id,
+                    requested_at=now_aware,
+                    updated_at=now_aware,
+                )
+                session.add(waiter)
+                session.flush()
+            else:
+                waiter.updated_at = now_aware
+
+            head = session.scalar(
+                select(KeeperRateWaiter)
+                .where(KeeperRateWaiter.gate_key == lane_key)
+                .order_by(KeeperRateWaiter.requested_at, KeeperRateWaiter.worker_id)
+                .limit(1)
+                .with_for_update()
+            )
+            if head is None:
+                raise RuntimeError(f"Keeper lane waiter queue {lane_key!r} unexpectedly empty")
+            if head.worker_id != worker_id:
+                return False, KEEPER_RATE_WAITER_RETRY_SECONDS
 
         waits = []
         for row, _rate in rows:
@@ -469,6 +521,14 @@ def try_acquire_keeper_rate_slot(
             row.last_worker_id = worker_id
             row.total_grants = int(row.total_grants or 0) + 1
             row.updated_at = now_aware
+
+        if lane_key is not None:
+            session.execute(
+                delete(KeeperRateWaiter).where(
+                    KeeperRateWaiter.gate_key == lane_key,
+                    KeeperRateWaiter.worker_id == worker_id,
+                )
+            )
         return True, 0.0
 
 
@@ -478,8 +538,13 @@ async def wait_for_keeper_cluster_slot(
     *,
     lane_gate_key: str | None = None,
     lane_requests_per_second: float | None = None,
-) -> None:
-    """Wait for one PostgreSQL-coordinated Keeper request-start grant."""
+) -> float:
+    """Wait for one PostgreSQL-coordinated Keeper request-start grant.
+
+    Returns the local monotonic time spent waiting so sweep-level telemetry can
+    expose rate-gate contention without logging every denied attempt.
+    """
+    started = asyncio.get_running_loop().time()
     while True:
         granted, wait_seconds = await asyncio.to_thread(
             try_acquire_keeper_rate_slot,
@@ -489,8 +554,153 @@ async def wait_for_keeper_cluster_slot(
             lane_requests_per_second=lane_requests_per_second,
         )
         if granted:
-            return
+            return max(0.0, asyncio.get_running_loop().time() - started)
         await asyncio.sleep(min(max(wait_seconds, 0.001), 5.0))
+
+def record_keeper_lane_sweep(
+    worker_id: str,
+    lane: str,
+    assigned_servers: int,
+    succeeded: int,
+    failed: int,
+    skipped: int,
+    elapsed_seconds: float,
+    gate_wait_seconds: float,
+    cadence_seconds: float,
+) -> None:
+    """Persist one completed Keeper lane traversal for adaptive health policy."""
+    worker_id = validate_worker_id(worker_id)
+    lane = str(lane or "").strip().lower()
+    if lane not in {"bulk", "fast"}:
+        raise ValueError(f"unsupported Keeper lane {lane!r}")
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        key = {"worker_id": worker_id, "lane": lane}
+        row = session.get(KeeperLaneWorkerState, key)
+        if row is None:
+            row = KeeperLaneWorkerState(
+                worker_id=worker_id,
+                lane=lane,
+                assigned_servers=max(0, int(assigned_servers)),
+                succeeded=max(0, int(succeeded)),
+                failed=max(0, int(failed)),
+                skipped=max(0, int(skipped)),
+                elapsed_seconds=max(0.0, float(elapsed_seconds)),
+                gate_wait_seconds=max(0.0, float(gate_wait_seconds)),
+                cadence_seconds=max(0.0, float(cadence_seconds)),
+                sweep_completed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+        elif int(assigned_servers) > 0:
+            # Preserve the last meaningful cadence observation across drains,
+            # restarts, and temporarily empty HRW assignments. A zero-work sweep
+            # contains no traversal-cadence measurement and must not erase the
+            # most recent non-zero observation used by adaptive presence health.
+            row.assigned_servers = max(0, int(assigned_servers))
+            row.succeeded = max(0, int(succeeded))
+            row.failed = max(0, int(failed))
+            row.skipped = max(0, int(skipped))
+            row.elapsed_seconds = max(0.0, float(elapsed_seconds))
+            row.gate_wait_seconds = max(0.0, float(gate_wait_seconds))
+            row.cadence_seconds = max(0.0, float(cadence_seconds))
+            row.sweep_completed_at = now
+            row.updated_at = now
+
+
+def get_keeper_lane_cadence_seconds(
+    lane: str,
+    stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS,
+    telemetry_max_age_seconds: int = 7200,
+) -> float | None:
+    """Return the slowest recent cadence among currently eligible lane workers."""
+    lane = str(lane or "").strip().lower()
+    if lane not in {"bulk", "fast"}:
+        raise ValueError(f"unsupported Keeper lane {lane!r}")
+    role_name = "keeper_fast" if lane == "fast" else "keeper_bulk"
+    _counts, _owners, eligible, _caps = keeper_assignment_snapshot(
+        stale_after_seconds, role_name=role_name, guids=[]
+    )
+    if not eligible:
+        return None
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        cutoff = now - timedelta(seconds=max(60, int(telemetry_max_age_seconds)))
+        values = list(session.scalars(
+            select(KeeperLaneWorkerState.cadence_seconds).where(
+                KeeperLaneWorkerState.lane == lane,
+                KeeperLaneWorkerState.worker_id.in_(eligible),
+                KeeperLaneWorkerState.assigned_servers > 0,
+                KeeperLaneWorkerState.cadence_seconds > 0,
+                KeeperLaneWorkerState.sweep_completed_at >= cutoff,
+            )
+        ))
+    return max((float(value) for value in values), default=None)
+
+
+def save_presence_aggregate_state(
+    *,
+    player_count: int,
+    server_count: int,
+    usable_snapshots: int,
+    total_servers: int,
+    coverage_ratio: float,
+    worker_id: str | None,
+    leadership_generation: int | None,
+    state_key: str = "global",
+) -> datetime:
+    """Persist the last cluster-accepted presence aggregate and return its DB time."""
+    with SessionLocal.begin() as session:
+        now = session.scalar(select(func.now()))
+        row = session.get(PresenceAggregateState, str(state_key))
+        if row is None:
+            row = PresenceAggregateState(
+                state_key=str(state_key),
+                player_count=max(0, int(player_count)),
+                server_count=max(0, int(server_count)),
+                usable_snapshots=max(0, int(usable_snapshots)),
+                total_servers=max(0, int(total_servers)),
+                coverage_ratio=max(0.0, min(1.0, float(coverage_ratio))),
+                computed_at=now,
+                worker_id=str(worker_id) if worker_id else None,
+                leadership_generation=leadership_generation,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+        else:
+            row.player_count = max(0, int(player_count))
+            row.server_count = max(0, int(server_count))
+            row.usable_snapshots = max(0, int(usable_snapshots))
+            row.total_servers = max(0, int(total_servers))
+            row.coverage_ratio = max(0.0, min(1.0, float(coverage_ratio)))
+            row.computed_at = now
+            row.worker_id = str(worker_id) if worker_id else None
+            row.leadership_generation = leadership_generation
+            row.updated_at = now
+        session.flush()
+        return now
+
+
+def load_presence_aggregate_state(state_key: str = "global") -> dict[str, Any] | None:
+    """Return a detached copy of the durable last-good presence aggregate."""
+    with SessionLocal() as session:
+        row = session.get(PresenceAggregateState, str(state_key))
+        if row is None:
+            return None
+        return {
+            "state_key": row.state_key,
+            "player_count": int(row.player_count),
+            "server_count": int(row.server_count),
+            "usable_snapshots": int(row.usable_snapshots),
+            "total_servers": int(row.total_servers),
+            "coverage_ratio": float(row.coverage_ratio),
+            "computed_at": row.computed_at,
+            "worker_id": row.worker_id,
+            "leadership_generation": row.leadership_generation,
+        }
+
 
 def get_worker_roles(worker_id: str) -> list[str]:
     with SessionLocal() as session:

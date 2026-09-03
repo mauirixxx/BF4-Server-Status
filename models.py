@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, ForeignKey, Integer, JSON, String, Text,
+    BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text,
     UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -351,6 +351,53 @@ class KeeperRateGate(Base):
     next_request_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     total_grants: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class KeeperRateWaiter(Base):
+    __tablename__ = "keeper_rate_waiters"
+    gate_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class KeeperLaneWorkerState(Base):
+    __tablename__ = "keeper_lane_worker_state"
+    worker_id: Mapped[str] = mapped_column(
+        String(100),
+        ForeignKey("cluster_workers.worker_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    lane: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assigned_servers: Mapped[int] = mapped_column(Integer, nullable=False)
+    succeeded: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped: Mapped[int] = mapped_column(Integer, nullable=False)
+    elapsed_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    gate_wait_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    cadence_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    sweep_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PresenceAggregateState(Base):
+    __tablename__ = "presence_aggregate_state"
+    state_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    player_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    server_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    usable_snapshots: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_servers: Mapped[int] = mapped_column(Integer, nullable=False)
+    coverage_ratio: Mapped[float] = mapped_column(Float, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(
+        String(100),
+        ForeignKey("cluster_workers.worker_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    leadership_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
