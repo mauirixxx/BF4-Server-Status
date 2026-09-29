@@ -58,7 +58,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.0.1"
+BOT_VERSION = "v3.0.1+hf2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -1772,33 +1772,83 @@ def command_choice_list(guild_id: int, current: str, *, defaults=None):
 
 
 def player_name_choices(guild_id: int, current: str):
+    """Return the 25 most-recent matching player identities for this guild.
+
+    v3.0.1 aggregated every historical player name for every configured server,
+    returned the full result set to Python, and only then applied the user's
+    autocomplete text.  With a million-plus session rows this could block the
+    Discord event loop long enough to interfere with leader lease maintenance.
+
+    Filter and cap in PostgreSQL instead.  DISTINCT ON keeps the most-recent
+    display spelling for each normalized identity; the outer query then returns
+    the 25 most-recent identities overall.
+    """
     needle = normalize_player_name(current)
+
+    # HF2: arbitrary substring searches shorter than three characters are too
+    # broad for the historical session corpus (1M+ rows in production) and
+    # cannot make useful use of PostgreSQL trigram indexing.  Discord invokes
+    # autocomplete again as the user types, so wait for a selective token
+    # rather than launching an unbounded one/two-character history scan.
+    if len(needle) < 3:
+        return []
+
     with SessionLocal() as session:
         server_guids = session.scalars(
             select(GuildServer.server_guid).where(GuildServer.guild_id == guild_id)
         ).all()
         if not server_guids:
             return []
-        rows = session.execute(
-            select(
-                BF4PlayerSession.player_name,
-                func.max(BF4PlayerSession.last_seen).label("last_seen"),
+
+        latest_identity = select(
+            BF4PlayerSession.player_name.label("player_name"),
+            BF4PlayerSession.normalized_name.label("normalized_name"),
+            BF4PlayerSession.last_seen.label("last_seen"),
+        ).where(BF4PlayerSession.server_guid.in_(list(server_guids)))
+        if needle:
+            latest_identity = latest_identity.where(
+                BF4PlayerSession.normalized_name.contains(needle, autoescape=True)
             )
-            .where(BF4PlayerSession.server_guid.in_(list(server_guids)))
-            .group_by(BF4PlayerSession.player_name)
-            .order_by(func.max(BF4PlayerSession.last_seen).desc())
+        latest_identity = (
+            latest_identity
+            .distinct(BF4PlayerSession.normalized_name)
+            .order_by(
+                BF4PlayerSession.normalized_name,
+                BF4PlayerSession.last_seen.desc(),
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(latest_identity.c.player_name, latest_identity.c.last_seen)
+            .order_by(latest_identity.c.last_seen.desc())
+            .limit(25)
         ).all()
-    choices = []
-    seen = set()
-    for name, _ in rows:
-        normalized = normalize_player_name(name)
-        if normalized in seen or (needle and needle not in normalized):
-            continue
-        seen.add(normalized)
-        choices.append(app_commands.Choice(name=str(name)[:100], value=str(name)[:100]))
-        if len(choices) >= 25:
-            break
-    return choices
+
+    return [
+        app_commands.Choice(name=str(name)[:100], value=str(name)[:100])
+        for name, _ in rows
+    ]
+
+
+async def autocomplete_db_call(label: str, func, *args, **kwargs):
+    """Run PostgreSQL-backed autocomplete work away from Discord's event loop."""
+    started = time.perf_counter()
+    try:
+        result = await asyncio.to_thread(func, *args, **kwargs)
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        log.exception(
+            "Autocomplete DB call failed label=%s elapsed_ms=%.1f error=%s",
+            label, elapsed_ms, type(exc).__name__,
+        )
+        return []
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if elapsed_ms >= 500.0:
+        log.warning(
+            "Autocomplete DB call slow label=%s elapsed_ms=%.1f returned_choices=%s",
+            label, elapsed_ms, len(result) if hasattr(result, "__len__") else "unknown",
+        )
+    return result
 
 
 def watched_player_choices(guild_id: int, current: str):
@@ -6686,7 +6736,7 @@ async def default_add_autocomplete(interaction, current):
 
 @default_add.autocomplete("announcement_channel")
 async def default_add_channel_autocomplete(interaction, current):
-    return announcement_channel_choices(interaction, current)
+    return await autocomplete_db_call("defaultserver.add.announcement_channel", announcement_channel_choices, interaction, current)
 
 
 @default_group.command(name="modify", description="Move a default server to another announcement channel")
@@ -6860,7 +6910,7 @@ async def default_modify_server_autocomplete(interaction, current):
 
 @default_modify.autocomplete("announcement_channel")
 async def default_modify_channel_autocomplete(interaction, current):
-    return announcement_channel_choices(interaction, current)
+    return await autocomplete_db_call("defaultserver.modify.announcement_channel", announcement_channel_choices, interaction, current)
 
 
 @default_group.command(name="remove", description="Remove a server from defaults")
@@ -7285,10 +7335,7 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
         )
 
 
-@refreshserverhz.autocomplete("server")
-async def refreshserverhz_autocomplete(interaction, current):
-    if not interaction.guild:
-        return []
+def refreshserverhz_choices(guild_id: int, current: str):
     needle = (current or "").casefold().strip()
     choices = []
     with SessionLocal() as session:
@@ -7296,7 +7343,7 @@ async def refreshserverhz_autocomplete(interaction, current):
             select(GuildServer, BF4Server)
             .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
             .where(
-                GuildServer.guild_id == interaction.guild.id,
+                GuildServer.guild_id == guild_id,
                 BF4Server.tick_rate_hz.is_(None),
             )
             .order_by(GuildServer.display_name)
@@ -7314,6 +7361,15 @@ async def refreshserverhz_autocomplete(interaction, current):
         if len(choices) >= 25:
             break
     return choices
+
+
+@refreshserverhz.autocomplete("server")
+async def refreshserverhz_autocomplete(interaction, current):
+    if not interaction.guild:
+        return []
+    return await autocomplete_db_call(
+        "refreshserverhz.server", refreshserverhz_choices, interaction.guild.id, current
+    )
 
 
 @tree.command(name="delserver", description="Delete one server or all non-default servers on a platform")
@@ -7454,9 +7510,11 @@ async def delserver_autocomplete(interaction, current):
         choice for choice in bulk
         if not needle or needle in choice.name.casefold()
     ]
-    for choice in command_choice_list(
-        interaction.guild.id, current, defaults=False
-    ):
+    server_choices = await autocomplete_db_call(
+        "delserver.server", command_choice_list,
+        interaction.guild.id, current, defaults=False,
+    )
+    for choice in server_choices:
         if len(choices) >= 25:
             break
         choices.append(choice)
@@ -7672,7 +7730,7 @@ async def delannouncementchannel(
 
 @delannouncementchannel.autocomplete("channel")
 async def delannouncementchannel_autocomplete(interaction, current):
-    return announcement_channel_choices(interaction, current)
+    return await autocomplete_db_call("delannouncementchannel.channel", announcement_channel_choices, interaction, current)
 
 
 @tree.command(name="setroleschannel", description="Set the self-service BF4 map-role channel")
@@ -8147,7 +8205,7 @@ async def watchplayer(
 
 @watchplayer.autocomplete("player")
 async def watchplayer_player_autocomplete(interaction, current):
-    return player_name_choices(interaction.guild.id, current) if interaction.guild else []
+    return await autocomplete_db_call("watchplayer.player", player_name_choices, interaction.guild.id, current) if interaction.guild else []
 
 
 def watchplayer_server_choices(guild_id: int, player: str, current: str):
@@ -8194,7 +8252,7 @@ async def watchplayer_server_autocomplete(interaction, current):
     if not interaction.guild:
         return []
     player = str(getattr(interaction.namespace, "player", "") or "")
-    return watchplayer_server_choices(interaction.guild.id, player, current)
+    return await autocomplete_db_call("watchplayer.server", watchplayer_server_choices, interaction.guild.id, player, current)
 
 
 @tree.command(name="unwatchplayer", description="Remove one watched-player rule")
@@ -8237,7 +8295,7 @@ async def unwatchplayer(interaction: discord.Interaction, watch: str):
 
 @unwatchplayer.autocomplete("watch")
 async def unwatchplayer_autocomplete(interaction, current):
-    return watched_player_choices(interaction.guild.id, current) if interaction.guild else []
+    return await autocomplete_db_call("unwatchplayer.watch", watched_player_choices, interaction.guild.id, current) if interaction.guild else []
 
 
 @tree.command(name="watchedplayers", description="List this Discord server's watched-player rules")
@@ -8488,7 +8546,7 @@ async def playerhistory(
 
 @playerhistory.autocomplete("player")
 async def playerhistory_player_autocomplete(interaction, current):
-    return player_name_choices(interaction.guild.id, current) if interaction.guild else []
+    return await autocomplete_db_call("playerhistory.player", player_name_choices, interaction.guild.id, current) if interaction.guild else []
 
 
 @tree.command(name="addlistenchannel", description="Add one listen channel")
@@ -8718,7 +8776,7 @@ async def setmaprole(
 
 @setmaprole.autocomplete("map_search")
 async def setmaprole_autocomplete(interaction, current):
-    return all_map_choices(current)
+    return await autocomplete_db_call("setmaprole.map_search", all_map_choices, current)
 
 
 class EditMapRoleModal(discord.ui.Modal):
@@ -8831,7 +8889,7 @@ async def editmaprole(interaction: discord.Interaction, map_name: str, role: dis
 async def editmaprole_autocomplete(interaction, current):
     if not interaction.guild:
         return []
-    rows = configured_map_matches(interaction.guild.id, current or "")
+    rows = await autocomplete_db_call("editmaprole.map_name", configured_map_matches, interaction.guild.id, current or "")
     return [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
 
 
@@ -8922,7 +8980,7 @@ async def delmaprole(interaction: discord.Interaction, map_search: str):
 
 @delmaprole.autocomplete("map_search")
 async def delmaprole_autocomplete(interaction, current):
-    return all_map_choices(current)
+    return await autocomplete_db_call("delmaprole.map_search", all_map_choices, current)
 
 
 @tree.command(name="debug", description="Show Keeper diagnostics for a configured server")
