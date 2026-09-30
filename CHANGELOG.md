@@ -4,6 +4,14 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.1.2] - 2026-09-30
+
+- Added `/logschannel add|remove` for optional per-guild Discord mirroring of the existing database command audit.
+- Added Alembic revision `0022_v3_1_2_guild_log_channels`.
+- Kept database audit writes authoritative; Discord delivery is best-effort and cannot replace or roll back the DB record.
+- Added autocomplete that lists unconfigured guild text channels for add and configured log channels for remove.
+- Generalized and expanded the restricted fleet deployment operator documentation.
+
 ## [v3.1.1] - 2026-09-30
 
 - Added per-map minimum-player thresholds for Discord map-role mentions via `/setmaprole` and `/editmaprole`.
