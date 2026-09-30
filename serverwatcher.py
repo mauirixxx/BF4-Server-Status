@@ -6650,6 +6650,25 @@ async def default_add(
         return
 
     try:
+        # If this command is disabling an existing persistent player stack,
+        # prove the old Discord messages are gone before disabling the refresh
+        # path that would otherwise be responsible for retrying their cleanup.
+        with SessionLocal() as session:
+            existing_gs = session.get(GuildServer, (interaction.guild.id, server))
+            cleanup_existing_stack = bool(
+                existing_gs and existing_gs.include_users and not include_users
+            )
+        if cleanup_existing_stack:
+            _, cleanup_failed = await clear_persistent_player_stack(interaction.guild, server)
+            if cleanup_failed:
+                await interaction.followup.send(
+                    "⚠️ Include Users was not disabled because one or more tracked "
+                    "player-list messages could not be deleted. Tracking was retained; "
+                    "retry after Discord is reachable.",
+                    ephemeral=True,
+                )
+                return
+
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             bf = session.get(BF4Server, server)
@@ -6680,7 +6699,6 @@ async def default_add(
                     target_name=gs.display_name,
                 )
                 return
-            previous_include_users = bool(gs.include_users)
             gs.is_default = True
             gs.include_users = bool(include_users)
             gs.announcement_channel_id = selected_channel.id
@@ -6689,9 +6707,6 @@ async def default_add(
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
-
-        if previous_include_users and not include_users:
-            await clear_persistent_player_stack(interaction.guild, server)
 
         snapshot = (
             FRESH_SERVER_CACHE.get(server)
@@ -6837,6 +6852,9 @@ async def default_modify(
                 raise ValueError("default_server_not_found")
             old_channel_id = gs.announcement_channel_id
             old_channel_name = gs.announcement_channel_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            old_announcement_channel = state.announcement_channel_id if state else None
+            old_announcement_message = state.announcement_message_id if state else None
             display_name = gs.display_name
             include_users = bool(gs.include_users)
             platform = bf.platform
@@ -6879,8 +6897,29 @@ async def default_modify(
         )
 
         # Move the persistent stack using the same v2.7.0 ordering rules.
+        # Do not change routing until every tracked old-channel message is
+        # positively gone; otherwise a transient Discord failure can orphan it.
         if include_users:
-            await clear_persistent_player_stack(interaction.guild, server)
+            _, cleanup_failed = await clear_persistent_player_stack(interaction.guild, server)
+            if cleanup_failed:
+                await interaction.followup.send(
+                    "⚠️ Could not move this default server yet because one or more "
+                    "old player-list messages could not be deleted. Tracking was "
+                    "retained; retry the command after Discord is reachable.",
+                    ephemeral=True,
+                )
+                return
+        if old_announcement_channel and old_announcement_message:
+            if not await delete_discord_message(
+                interaction.guild.id, old_announcement_channel, old_announcement_message
+            ):
+                await interaction.followup.send(
+                    "⚠️ Could not move this default server yet because its old "
+                    "announcement could not be deleted. Tracking and routing were "
+                    "retained; retry the command.",
+                    ephemeral=True,
+                )
+                return
 
         with SessionLocal.begin() as session:
             live = session.get(GuildServer, (interaction.guild.id, server))
@@ -6984,30 +7023,42 @@ async def default_remove(interaction, server: str):
     if not await prepare_management(interaction):
         return
     try:
-        await clear_persistent_player_stack(interaction.guild, server)
-        old_channel = old_message = assigned_channel_id = None
-        with SessionLocal.begin() as session:
+        with SessionLocal() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
                 raise ValueError("server_not_found")
             assigned_channel_id = gs.announcement_channel_id
+            name = gs.display_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            old_channel = state.announcement_channel_id if state else None
+            old_message = state.announcement_message_id if state else None
+
+        _, stack_failed = await clear_persistent_player_stack(interaction.guild, server)
+        announcement_deleted = True
+        if old_channel and old_message:
+            announcement_deleted = await delete_discord_message(
+                interaction.guild.id, old_channel, old_message
+            )
+        if stack_failed or not announcement_deleted:
+            await interaction.followup.send(
+                "⚠️ Could not remove this default server yet because one or more "
+                "tracked Discord messages could not be deleted. Tracking and the "
+                "default-server configuration were retained; retry the command.",
+                ephemeral=True,
+            )
+            return
+
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
             gs.is_default = False
             gs.include_users = False
             gs.announcement_channel_id = None
             gs.announcement_channel_name = None
-            name = gs.display_name
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
-                old_channel = state.announcement_channel_id
-                old_message = state.announcement_message_id
                 session.delete(state)
-
-        if old_channel and old_message:
-            await delete_discord_message(
-                interaction.guild.id,
-                old_channel,
-                old_message,
-            )
         if not get_default_guild_servers(interaction.guild.id) and assigned_channel_id:
             channel = interaction.guild.get_channel(int(assigned_channel_id))
             if channel:
