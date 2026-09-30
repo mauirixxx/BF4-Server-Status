@@ -1,0 +1,24 @@
+[Unit]
+Description=BF4 Status Dashboard population sampler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bf4dashboard
+Group=bf4dashboard
+WorkingDirectory=/opt/bf4-status-dashboard
+EnvironmentFile=/etc/bf4-status-dashboard/dashboard.env
+EnvironmentFile=/etc/bf4-status-dashboard/sampler.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/bf4-status-dashboard/.venv/bin/python3 -m app.sampler
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

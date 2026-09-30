@@ -50,6 +50,14 @@ BF4 Server Watcher is designed to make it easier for Battlefield 4 communities t
 
 Server and player information is collected from Battlefield 4-related services and presented directly inside Discord.
 
+## Optional components
+
+### BF4 Status Web Dashboard
+
+The repository includes the optional **BF4 Status Web Dashboard v0.5.5 Phase 2** under `optional/web-dashboard/`. It provides a standalone FastAPI/Uvicorn web view of BF4SW population, snapshot freshness, population history, and optional worker/lease telemetry.
+
+The dashboard is independently deployable and is **not required** by the Discord bot or worker fleet. It uses dedicated PostgreSQL credentials, with a SELECT-only web login and a narrowly privileged sampler login for dashboard-owned history/cache tables. See `optional/web-dashboard/README.md` for installation and database setup.
+
 ## PostgreSQL HA (optional, v3.1.0)
 
 BF4 Server Watcher does not require a PostgreSQL HA cluster. A normal self-hosted installation can continue using one PostgreSQL server through `DATABASE_URL`.
