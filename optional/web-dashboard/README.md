@@ -11,6 +11,8 @@ It is intentionally **not a dependency of the Discord bot or worker fleet**. Ope
 - Strict and adaptive snapshot-freshness/coverage views.
 - Optional aggregate worker/lease health and an opt-in detailed operator panel.
 - Five-minute population history through a narrowly privileged sampler role.
+- Optional database/DNS availability panel with primary/replica identification and lightweight PostgreSQL facts.
+- Population history is the primary top-of-page visual, followed immediately by numerical BF4 statistics.
 - Cached Persona-ID statistics so lifetime distinct-player counting stays off the HTTP request path.
 
 ## Security model
@@ -93,4 +95,17 @@ Likewise, dashboard failures must not affect Keeper polling, Discord leadership,
 
 ## Version
 
-Dashboard baseline included here: **v0.5.5-phase2**.
+Dashboard baseline included here: **v0.5.6-phase2**.
+
+## Optional infrastructure panel (v0.5.6)
+
+Set `PUBLIC_INFRASTRUCTURE_PANEL=true` to show database and DNS availability in Cluster Health. Nodes are configured independently of the BF4SW core deployment:
+
+```env
+DATABASE_NODES=primary-site=db-01.example.com,remote-site=db-02.example.com
+DNS_NODES=site-a=dns-01.example.com,site-b=dns-02.example.com
+```
+
+Database probes reuse the dashboard read-only PostgreSQL credential and identify each reachable node as primary or replica using `pg_is_in_recovery()`. DNS availability uses a short TCP/53 connection probe. The panel also reports current database size, the PostgreSQL transaction counter, and an average transactions/day calculated since PostgreSQL statistics were last reset.
+
+Infrastructure hostnames are intentionally deployment configuration, not hard-coded BF4SW topology. Leave the panel disabled or either node list empty when those probes are not wanted.

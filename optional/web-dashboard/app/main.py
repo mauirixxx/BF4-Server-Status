@@ -10,6 +10,9 @@ from .config import get_settings
 from .db import close_pool, open_pool
 from .repository import (
     get_cluster_health,
+    get_database_facts,
+    get_database_nodes,
+    get_dns_nodes,
     get_leadership,
     get_platforms,
     get_population_history,
@@ -51,6 +54,9 @@ def dashboard(request: Request):
     workers = get_workers()
     leadership = get_leadership()
     cluster_health = get_cluster_health(workers, leadership)
+    database_nodes = get_database_nodes() if settings.public_infrastructure_panel else []
+    dns_nodes = get_dns_nodes() if settings.public_infrastructure_panel else []
+    database_facts = get_database_facts() if settings.public_infrastructure_panel else {"available": False}
     current_total = sum(int(p.get("players") or 0) for p in platforms)
     return templates.TemplateResponse(
         request=request,
@@ -61,6 +67,8 @@ def dashboard(request: Request):
             "leadership": leadership if settings.public_operator_panel else [],
             "cluster_health": cluster_health, "current_total": current_total,
             "operator_enabled": settings.public_operator_panel,
+            "infrastructure_enabled": settings.public_infrastructure_panel,
+            "database_nodes": database_nodes, "dns_nodes": dns_nodes, "database_facts": database_facts,
             "fresh_minutes": settings.snapshot_fresh_seconds // 60,
             "adaptive_seconds": settings.snapshot_adaptive_seconds,
             "adaptive_minutes": round(settings.snapshot_adaptive_seconds / 60),

@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     worker_healthy_seconds: int = 60
     worker_warning_seconds: int = 180
     public_operator_panel: bool = False
+    public_infrastructure_panel: bool = False
+    database_nodes: str = ""
+    dns_nodes: str = ""
+    infrastructure_probe_timeout_seconds: float = 2.0
 
     model_config = SettingsConfigDict(
         env_file=".env",
