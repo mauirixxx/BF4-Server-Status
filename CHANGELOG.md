@@ -4,6 +4,22 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.1.0] - 2026-09-29
+
+### Changed
+- Promoted the production `v3.0.1+hf2` Server Watcher runtime to `v3.1.0`.
+- Docker Compose image metadata now targets `bf4-server-watcher:3.1.0`.
+- Added Alembic revision `0020_v3_1_0_hf2_search` so HF2's PostgreSQL `pg_trgm` extension and concurrent GIN player-history search index are part of the normal schema chain.
+
+### Added
+- Added the optional `postgresql-ha/` semi-automatic PostgreSQL HA toolkit for multi-database deployments. Normal single-PostgreSQL installations do not require or start the HA tooling.
+- Added production HA release notes and the 2026-09-29 live validation record.
+
+### HA validation
+- Production failover completed through workload quiesce, former-primary fencing/recovery, standby promotion, survivor reparenting, BIND/TSIG DNS cutover, guarded eight-worker resume, and former-primary full reseed/rejoin.
+- Final HA journal reached revision 12 / `rejoin-completed`; all five database nodes returned to one primary plus four streaming standbys.
+- Candidate12 real-executable crash/recovery/adversarial validation reached 124/124 PASS before release promotion.
+
 ## [v3.0.1] - 2026-09-02
 
 ### Added

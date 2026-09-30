@@ -1,0 +1,42 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+import argparse,json,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import controller_identity,journal_effective_for_operation,load_config,read_json_file,ssh,validate_journal_semantics
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--remote',action='store_true'); a=ap.parse_args(); cfg=load_config(); activep=Path(cfg['state']['fence_file']); recovery=Path(cfg['state']['dir'])/'recovery'
+    print('='*68); print(' BF4 HA JOURNAL STATUS'); print('='*68); print('Controller:',controller_identity()); print('Active path:',activep)
+    active=None; eff=None
+    if activep.exists():
+        try: active=read_json_file(activep); validate_journal_semantics(active); print(f"ACTIVE: op={active.get('operation_id')} rev={active.get('revision')} owner={active.get('current_controller')} phase={active.get('journal_phase')}")
+        except Exception as exc: print(f'ACTIVE INVALID: {exc}'); return 10
+        try: eff=journal_effective_for_operation(cfg,str(active['operation_id']))
+        except Exception as exc: print(f'EFFECTIVE LOCAL: AMBIGUOUS/INVALID ({exc})'); return 11
+        if eff:
+            ep,es=eff; print(f"EFFECTIVE LOCAL JOURNAL: {ep} rev={es['revision']} owner={es['current_controller']} phase={es['journal_phase']}")
+            if ep != activep or es != active: print('ACTIVE JOURNAL: SUPERSEDED LOCALLY')
+    else: print('Active journal: none')
+    print('\nLOCAL RECOVERY COPIES')
+    files=sorted(recovery.glob('*.json')) if recovery.exists() else []
+    if not files: print('none')
+    for f in files:
+        try:
+            s=read_json_file(f); validate_journal_semantics(s); print(f"{s.get('operation_id')} rev={s.get('revision')} owner={s.get('current_controller')} phase={s.get('journal_phase')} VALID")
+        except Exception as exc: print(f'{f.name}: INVALID ({exc})')
+    if a.remote:
+        print('\nREMOTE EFFECTIVE COPY STATUS')
+        if not eff: print('not checked: no effective active operation'); return 0
+        _,es=eff; op=es['operation_id']; here=controller_identity(); good=0
+        for name,meta in cfg.get('controllers',{}).items():
+            if name==here: continue
+            rc,out,err=ssh(meta['ip'],f'/opt/bf4-ha/bin/bf4-ha-journal-export --operation {op}',timeout=8)
+            if rc==0:
+                try: info=json.loads(out); match=(int(info.get('revision',0))==int(es['revision']) and info.get('journal_phase')==es['journal_phase'] and info.get('current_controller')==es['current_controller'])
+                except Exception: match=False
+                good+=int(match); print(f"{name:<10} {'PASS' if match else 'STALE/CONFLICT'} {out.strip()}")
+            else: print(f'{name:<10} UNREACHABLE/MISSING {err or out}')
+        req=int(cfg.get('state',{}).get('minimum_recovery_copies',2)); print(f'Recovery quorum visibility: {good} matching peer copies; required={req}')
+    return 0
+if __name__=='__main__': raise SystemExit(main())

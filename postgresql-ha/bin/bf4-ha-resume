@@ -1,0 +1,137 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+
+import argparse
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee, current_primary, failure_domain_snapshot, load_config, log_path,
+    parse_pipe_rows, psql, ssh
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def container_running(ip):
+    rc, out, err = ssh(
+        ip,
+        f'docker ps --filter name=^{CONTAINER}$ '
+        '--format "{{.Names}}|{{.Status}}"',
+    )
+    return rc, out.strip(), err
+
+
+def client_ips(primary_ip):
+    sql = """
+SELECT DISTINCT client_addr
+FROM pg_stat_activity
+WHERE datname='bf4_serverwatcher'
+  AND backend_type='client backend'
+  AND usename='bf4_serverwatcher'
+  AND client_addr IS NOT NULL;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    rows = parse_pipe_rows(out) if rc == 0 else []
+    return rc, {r[0] for r in rows if r}, err or out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--timeout", type=int, default=90)
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("resume"))
+    try:
+        snap = failure_domain_snapshot(cfg)
+        primary = current_primary(snap["db_states"])
+        if not primary:
+            log.line("NO-GO: exactly one reachable primary not found")
+            return 10
+        if snap["ambiguous_isolated_sites"]:
+            log.line(
+                "NO-GO: ambiguous isolated sites: "
+                + ", ".join(sorted(snap["ambiguous_isolated_sites"]))
+            )
+            return 16
+
+        deferred = set(snap["deferred_workers"])
+        target_workers = [
+            name for name in cfg["workers"] if name not in deferred
+        ]
+        target_ips = {cfg["workers"][n]["ip"] for n in target_workers}
+        primary_ip = cfg["nodes"][primary]["ip"]
+
+        log.line("=" * 68)
+        log.line(" BF4 HA RESUME")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line(f"Current primary: {primary} ({primary_ip})")
+        log.line(
+            "Deferred isolated workers: "
+            + (", ".join(sorted(deferred)) if deferred else "none")
+        )
+
+        stopped = []
+        for name in target_workers:
+            ip = cfg["workers"][name]["ip"]
+            rc, state, err = container_running(ip)
+            if rc != 0:
+                log.line(f"NO-GO: {name} inspection failed")
+                return 16
+            if state:
+                log.line(f"  {name:<8} RUNNING {state}")
+            else:
+                log.line(f"  {name:<8} STOPPED")
+                stopped.append((name, ip))
+
+        if not args.execute:
+            log.line("DRY RUN ONLY.")
+            for name, ip in stopped:
+                log.line(f"WOULD START {name} ({ip})")
+            return 0
+
+        required = f"RESUME {len(target_workers)} REACHABLE WORKERS"
+        if not confirm_exact(required, f"Type {required} to continue: "):
+            return 20
+
+        for name, ip in stopped:
+            rc, out, err = ssh(ip, f"docker start {CONTAINER}")
+            if rc != 0:
+                log.line(f"FAIL: {name}: {err or out}")
+                return 16
+            log.line(f"PASS: {name} started")
+
+        deadline = time.time() + args.timeout
+        seen = set()
+        while time.time() < deadline:
+            rc, seen, err = client_ips(primary_ip)
+            if rc != 0:
+                return 11
+            if target_ips.issubset(seen):
+                break
+            time.sleep(3)
+        else:
+            log.line("FAIL: reachable worker DB sessions did not all return")
+            for ip in sorted(target_ips - seen):
+                log.line(f"  missing: {ip}")
+            return 30
+
+        log.line("RESUMED")
+        log.line(
+            f"Reachable workers verified: {len(target_workers)}; "
+            f"deferred: {len(deferred)}"
+        )
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

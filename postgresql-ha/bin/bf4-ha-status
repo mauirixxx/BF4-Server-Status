@@ -1,0 +1,101 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import sys
+import argparse
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import banner,classify_site_isolation,controller_identity,current_primary,db_client_ips,dig_exact_a,discover_roles,load_config,parse_pipe_rows,psql,ssh
+
+
+
+def active_dns_servers(cfg):
+    return list(cfg['dns'].get('bind',{}).get('authoritative_servers',[]))
+
+def dns_name(cfg,ip):
+    return cfg.get('dns',{}).get('bind',{}).get('authoritative_names',{}).get(ip,ip)
+
+def site_for(cfg,kind,name):
+    key={'db':'db_nodes','worker':'workers','dns':'dns_servers'}[kind]
+    return next((c for c,s in cfg['sites'].items() if name in s.get(key,[])),None)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Show BF4 PostgreSQL HA cluster status")
+    return parser.parse_args()
+
+def main():
+    parse_args()
+    cfg=load_config(); nodes=cfg['nodes']; health=cfg.get('health',{}); lag_warn=int(health.get('replication_lag_warn_bytes',1)); lag_bad=int(health.get('replication_lag_degraded_bytes',1048576)); problems=[]; warnings=[]
+    backend=cfg.get('dns',{}).get('backend')
+    if backend!='bind-tsig':
+        banner('BF4 PostgreSQL HA Status')
+        print(f"CONFIG ERROR: unsupported or missing DNS backend: {backend!r}; required 'bind-tsig'")
+        return 2
+    banner('BF4 PostgreSQL HA Status'); print(f"Controller       : {controller_identity()}"); print(f"Service endpoint : {cfg['service_dns']}")
+    states,_=discover_roles(cfg); primary=current_primary(states); pc=sum(1 for s in states.values() if s.get('role')=='PRIMARY')
+    if pc!=1: problems.append(f'expected exactly one primary, found {pc}')
+    worker_reach={n:ssh(m['ip'],'hostname')[0]==0 for n,m in cfg['workers'].items()}
+    record=cfg['dns'].get('service_record',cfg['service_dns']); dns_servers=active_dns_servers(cfg); dns_reach={d:dig_exact_a(d,record)[0]==0 for d in dns_servers}
+    isolated={c for c in cfg['sites'] if classify_site_isolation(cfg,c,states,worker_reach,dns_reach)}
+    banner('DATABASE NODES')
+    for name,meta in nodes.items():
+        s=states.get(name,{}); site=site_for(cfg,'db',name)
+        if not s.get('reachable'):
+            if site in isolated: print(f"{name:<12} {meta['ip']:<15} ISOLATED-SITE({site})"); warnings.append(f'{name}: unavailable with isolated site {site}')
+            else: print(f"{name:<12} {meta['ip']:<15} UNAVAILABLE"); problems.append(f'{name}: unavailable outside isolated-site policy')
+        elif not s.get('postgresql'): print(f"{name:<12} {meta['ip']:<15} PostgreSQL FAIL"); problems.append(f'{name}: PostgreSQL query failed')
+        else: print(f"{name:<12} {meta['ip']:<15} {s['role']:<8} wal_log_hints={s['wal_log_hints']}")
+    expected=nodes[primary]['ip'] if primary else None; banner('DNS BACKEND'); print("Active backend    : bind-tsig"); banner('SERVICE DNS')
+    for dns in dns_servers:
+        rc,vals,err=dig_exact_a(dns,record); site=site_for(cfg,'dns',dns)
+        if rc==0 and expected and vals==[expected]: print(f"{dns_name(cfg,dns):<12} {dns:<16} -> {expected:<15} PASS")
+        elif rc!=0 and site in isolated: print(f"{dns:<16} -> (unreachable)    ISOLATED-SITE({site})"); warnings.append(f'DNS {dns}: isolated site {site}')
+        else: got=','.join(vals) if vals else '(no answer)'; print(f"{dns:<16} -> {got:<15} FAIL"); problems.append(f'DNS {dns} returned {got}')
+    if primary:
+        pip=nodes[primary]['ip']; banner(f'PRIMARY REPLICATION VIEW ({primary})'); sql="""SELECT client_addr,state,sync_state,sent_lsn,write_lsn,flush_lsn,replay_lsn,pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint FROM pg_stat_replication ORDER BY client_addr;"""; rc,out,err=psql(pip,sql); seen=set()
+        if rc!=0: problems.append('primary replication query failed')
+        else:
+            for r in parse_pipe_rows(out):
+                if len(r)<8: continue
+                ip,state,sync,*lsns,lag=r[:8]; seen.add(ip); print(f"{ip:<16} {state:<10} {sync:<6} lag={lag} bytes")
+                if state!='streaming': problems.append(f'replica {ip} state={state}')
+                else:
+                    try:
+                        li=int(lag)
+                        if li>=lag_bad: problems.append(f'replica {ip} lag={li} bytes')
+                        elif li>=lag_warn: warnings.append(f'replica {ip} transient lag={li} bytes')
+                    except: problems.append(f'replica {ip} invalid lag={lag}')
+            for name,meta in nodes.items():
+                if name==primary or meta['ip'] in seen: continue
+                site=site_for(cfg,'db',name)
+                if site in isolated: print(f"{meta['ip']:<16} unavailable due to isolated site {site}"); warnings.append(f'replica {name}: isolated site {site}')
+                else: problems.append(f'missing replica: {name} ({meta["ip"]})')
+    banner('WORKER CONTROL PLANE'); clients=set()
+    if primary:
+        rc,clients,err=db_client_ips(nodes[primary]['ip']);
+        if rc!=0: problems.append('could not query worker DB client IPs')
+    for name,meta in cfg['workers'].items():
+        site=site_for(cfg,'worker',name); rc,out,err=ssh(meta['ip'],'docker ps --filter name=BF4_ServerWatcher_Agent --format "{{.Names}}|{{.Status}}"')
+        if rc==0 and out: print(f"{name:<8} {meta['ip']:<15} {out}")
+        elif site in isolated and meta['ip'] not in clients: print(f"{name:<8} {meta['ip']:<15} ISOLATED-SITE({site}) no-db-session"); warnings.append(f'worker {name}: isolated site {site}, no DB session')
+        elif rc!=0: print(f"{name:<8} {meta['ip']:<15} SSH FAIL"); problems.append(f'worker {name}: unreachable')
+        else: print(f"{name:<8} {meta['ip']:<15} STOPPED"); problems.append(f'worker {name}: stopped')
+    banner('SITE / FAILURE DOMAINS')
+    for code,site in cfg['sites'].items():
+        if code in isolated:
+            label='ISOLATED'
+        else:
+            db_ok=all(states.get(n,{}).get('reachable',False) for n in site.get('db_nodes',[]))
+            worker_ok=all(worker_reach.get(w,False) for w in site.get('workers',[]))
+            dns_ok=all(dns_reach.get(d,False) for d in site.get('dns_servers',[]))
+            label='AVAILABLE' if db_ok and worker_ok and dns_ok else 'PARTIAL'
+        print(f"{code:<4} {site['name']:<10} {label}")
+    banner('VERDICT')
+    if problems:
+        print('DEGRADED'); [print('  - '+p) for p in problems];
+        if warnings: print('Warnings:'); [print('  - '+w) for w in warnings]
+        return 1
+    if warnings: print('HEALTHY-DEGRADED'); [print('  - '+w) for w in warnings]
+    else: print('HEALTHY')
+    if primary: print(f"Primary: {primary} ({nodes[primary]['ip']})")
+    return 0
+if __name__=='__main__': raise SystemExit(main())

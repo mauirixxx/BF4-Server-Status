@@ -1,0 +1,24 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse,sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import controller_identity,journal_effective_active,journal_effective_for_operation,journal_replicate,load_config,validate_journal_semantics
+
+def main():
+    ap=argparse.ArgumentParser(description='Safely verify journal recovery-copy transport/quorum using the effective committed journal'); ap.add_argument('--operation'); a=ap.parse_args(); cfg=load_config()
+    try:
+        eff=journal_effective_for_operation(cfg,a.operation) if a.operation else journal_effective_active(cfg)
+    except Exception as exc: print(f'NO-GO: {exc}'); return 10
+    if not eff: print('NO-GO: effective journal is missing'); return 10
+    _,st=eff
+    try: validate_journal_semantics(st)
+    except Exception as exc: print(f'NO-GO: invalid journal: {exc}'); return 10
+    here=controller_identity()
+    if st.get('current_controller') != here: print(f"NO-GO: effective journal is owned by {st.get('current_controller')}; this controller is {here}"); return 11
+    print('='*68); print(' BF4 HA JOURNAL RECOVERY QUORUM CHECK'); print('='*68); print('Controller :',here); print('Operation  :',st.get('operation_id')); print('Revision   :',st.get('revision')); print('Phase      :',st.get('journal_phase')); print('Action     : resend the exact already-committed effective journal to peer recovery paths only')
+    report=journal_replicate(cfg,st)
+    for n in report['succeeded']: print(f'{n:<10} PASS')
+    for n,e in report['failed'].items(): print(f'{n:<10} FAIL {e}')
+    ok=len(report['succeeded']) >= int(report['required']); print(f"Quorum     : {'PASS' if ok else 'FAIL'} succeeded={len(report['succeeded'])} required={report['required']}"); return 0 if ok else 20
+if __name__=='__main__': raise SystemExit(main())

@@ -1,0 +1,144 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+
+import argparse
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    banner,
+    current_primary,
+    discover_roles,
+    load_config,
+    psql,
+)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Generate a live, read-only BF4 PostgreSQL HA failover plan."
+    )
+    ap.add_argument(
+        "--candidate",
+        required=True,
+        help="Target database node, e.g. mak-db-01",
+    )
+    args = ap.parse_args()
+
+    cfg = load_config()
+    nodes = cfg["nodes"]
+
+    if args.candidate not in nodes:
+        print(f"ERROR: unknown candidate {args.candidate!r}", file=sys.stderr)
+        return 10
+
+    states, problems = discover_roles(cfg)
+    if problems:
+        print("ERROR: topology discovery failed:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 11
+
+    primary = current_primary(states)
+    if not primary:
+        print("ERROR: did not discover exactly one primary", file=sys.stderr)
+        return 10
+
+    if args.candidate == primary:
+        print("ERROR: candidate is already primary", file=sys.stderr)
+        return 10
+
+    if states[args.candidate].get("role") != "STANDBY":
+        print("ERROR: candidate is not a standby", file=sys.stderr)
+        return 10
+
+    primary_ip = nodes[primary]["ip"]
+    candidate_ip = nodes[args.candidate]["ip"]
+
+    # Determine current rewind readiness of the old primary.
+    rc, out, err = psql(
+        primary_ip,
+        """
+SHOW wal_log_hints;
+SHOW data_checksums;
+"""
+    )
+    rewind_ready = False
+    rewind_detail = "unknown"
+    if rc == 0:
+        vals = [x.strip() for x in out.splitlines() if x.strip()]
+        if len(vals) >= 2:
+            wal_log_hints, data_checksums = vals[:2]
+            rewind_ready = wal_log_hints == "on" or data_checksums == "on"
+            rewind_detail = (
+                f"wal_log_hints={wal_log_hints}, "
+                f"data_checksums={data_checksums}"
+            )
+
+    banner("BF4 PostgreSQL HA Live Failover Plan")
+    print("MODE: READ ONLY")
+    print()
+    print(f"Current primary : {primary} ({primary_ip})")
+    print(f"Candidate       : {args.candidate} ({candidate_ip})")
+    print(f"Service DNS     : {cfg['service_dns']}")
+    print()
+
+    banner("OLD PRIMARY REJOIN EXPECTATION")
+    if rewind_ready:
+        print("Preferred rejoin method after failover: pg_rewind")
+        print(f"Reason: {rewind_detail}")
+    else:
+        print("Expected rejoin method after failover: pg_basebackup reseed")
+        print(f"Reason: {rewind_detail}")
+        print(
+            "NOTE: this does not block failover, but the former primary "
+            "will require a full reseed before rejoining."
+        )
+
+    banner("ORDERED EXECUTION PLAN")
+    steps = [
+        ("01", "Run strict failover preflight", "READ ONLY"),
+        ("02", "Quiesce all BF4_ServerWatcher_Agent containers", "WRITE/DISRUPTIVE"),
+        ("03", "Verify bf4_serverwatcher writer connections are zero", "READ ONLY"),
+        ("04", "Re-check candidate replay and require zero-byte lag", "READ ONLY"),
+        ("05", f"Fence old primary VM: {nodes[primary]['vm_name']}", "DESTRUCTIVE"),
+        ("06", f"Verify {primary_ip}:5432 is unreachable", "READ ONLY"),
+        ("07", f"Promote candidate {args.candidate}", "DESTRUCTIVE"),
+        ("08", "Verify new primary is writable and not in recovery", "READ ONLY"),
+        ("09", "Create physical slots for surviving standbys", "WRITE"),
+        ("10", "Reparent surviving standbys to new primary", "WRITE"),
+        ("11", "Verify all surviving standbys streaming with zero lag", "READ ONLY"),
+        ("12", f"Update {cfg['service_dns']} to {candidate_ip}", "WRITE"),
+        ("13", "Require nsupdate exit code 0", "VERIFY"),
+        ("14", "Authoritatively verify exact DNS A record on update server", "VERIFY"),
+        ("15", "Wait for every configured internal resolver to converge", "VERIFY"),
+        ("16", "Restart all BF4_ServerWatcher_Agent containers", "WRITE"),
+        ("17", "Verify all worker DB sessions land on the new primary", "VERIFY"),
+        ("18", "Verify all surviving replicas remain streaming", "VERIFY"),
+        ("19", "Record failover completion and begin former-primary rejoin", "POST"),
+    ]
+
+    for num, desc, kind in steps:
+        print(f"{num}. [{kind:<16}] {desc}")
+
+    banner("SAFETY INVARIANTS")
+    invariants = [
+        "Never promote before vCenter reports the old primary poweredOff.",
+        "Never promote while the old primary still answers TCP/5432.",
+        "Never restart workers until authoritative DNS and every configured resolver point to the new primary.",
+        "Never trust DNS update stderr alone: require exit code 0 plus authoritative value verification.",
+        "Never treat transient async replica lag as general cluster failure; candidate failover lag must still be exactly 0.",
+        "Never power the former primary back into service until it is explicitly rebuilt/rejoined as a standby.",
+    ]
+    for item in invariants:
+        print(f"  - {item}")
+
+    print()
+    print("NO ACTION WAS TAKEN.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

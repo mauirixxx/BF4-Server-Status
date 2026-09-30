@@ -1,0 +1,271 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+
+import argparse
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee,
+    ambiguous_worker_session_lines,
+    current_primary,
+    failure_domain_snapshot,
+    load_config,
+    log_path,
+    parse_pipe_rows,
+    psql,
+    site_for_worker,
+    ssh,
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def container_state(ip: str):
+    rc, out, err = ssh(
+        ip,
+        f'docker ps --filter name=^{CONTAINER}$ '
+        '--format "{{.Names}}|{{.Status}}"',
+    )
+    return rc, out.strip(), err
+
+
+def wait_until_stopped(ip: str, timeout: int = 20, poll_seconds: float = 1.0):
+    """Return success only after the worker container is verified stopped."""
+    deadline = time.time() + timeout
+    last_rc, last_state, last_err = 0, "", ""
+    while time.time() < deadline:
+        last_rc, last_state, last_err = container_state(ip)
+        if last_rc == 0 and not last_state:
+            return True, last_rc, last_state, last_err
+        time.sleep(poll_seconds)
+    return False, last_rc, last_state, last_err
+
+
+def writer_rows(primary_ip: str):
+    sql = """
+SELECT client_addr, state, count(*)
+FROM pg_stat_activity
+WHERE datname = 'bf4_serverwatcher'
+  AND backend_type = 'client backend'
+  AND usename = 'bf4_serverwatcher'
+GROUP BY client_addr, state
+ORDER BY client_addr, state;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    return rc, parse_pipe_rows(out) if rc == 0 else [], err or out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument(
+        "--timeout", type=int, default=60,
+        help="seconds to wait for PostgreSQL writer sessions to drain",
+    )
+    ap.add_argument(
+        "--docker-stop-timeout", type=int, default=30,
+        help="Docker graceful-stop timeout in seconds (default: 30)",
+    )
+    ap.add_argument(
+        "--stop-verify-timeout", type=int, default=20,
+        help="seconds to verify the worker is stopped after docker stop",
+    )
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("quiesce"))
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA QUIESCE")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line()
+
+        snap = failure_domain_snapshot(cfg)
+        states = snap["db_states"]
+        primary = current_primary(states)
+        if not primary:
+            log.line("NO-GO: did not discover exactly one reachable primary")
+            return 10
+        if snap["ambiguous_isolated_sites"]:
+            log.line(
+                "NO-GO: ambiguous isolated site(s): "
+                + ", ".join(sorted(snap["ambiguous_isolated_sites"]))
+            )
+            log.line("Unreachable site still has ServerWatcher DB sessions:")
+            primary_for_diag = current_primary(snap["db_states"])
+            if primary_for_diag:
+                for line in ambiguous_worker_session_lines(
+                    cfg, cfg["nodes"][primary_for_diag]["ip"], snap["ambiguous_isolated_sites"]
+                ):
+                    log.line(line)
+            log.line("Failover remains blocked until PostgreSQL detects those clients as dead.")
+            return 16
+
+        primary_ip = cfg["nodes"][primary]["ip"]
+        deferred = set(snap["deferred_workers"])
+
+        log.line(f"Current primary: {primary} ({primary_ip})")
+        log.line(
+            "Safe isolated sites: "
+            + (
+                ", ".join(sorted(snap["safe_isolated_sites"]))
+                if snap["safe_isolated_sites"] else "none"
+            )
+        )
+        log.line()
+
+        running = []
+        stopped = []
+        inspection_failures = []
+
+        log.line("Worker inventory:")
+        for name, meta in cfg["workers"].items():
+            site = site_for_worker(cfg, name)
+            rc, state, err = container_state(meta["ip"])
+            if rc != 0:
+                if name in deferred:
+                    log.line(
+                        f"  {name:<8} {meta['ip']:<15} "
+                        f"DEFERRED ISOLATED-SAFE({site})"
+                    )
+                else:
+                    log.line(
+                        f"  {name:<8} {meta['ip']:<15} ERROR {err or state}"
+                    )
+                    inspection_failures.append(name)
+            elif state:
+                log.line(f"  {name:<8} {meta['ip']:<15} RUNNING {state}")
+                running.append((name, meta["ip"]))
+            else:
+                log.line(f"  {name:<8} {meta['ip']:<15} STOPPED")
+                stopped.append((name, meta["ip"]))
+
+        if inspection_failures:
+            log.line("NO-GO: worker inspection failed outside a safe isolated site.")
+            return 16
+
+        rc, rows, err = writer_rows(primary_ip)
+        if rc != 0:
+            log.line(f"NO-GO: writer-session query failed: {err}")
+            return 11
+
+        deferred_ips = {cfg["workers"][w]["ip"] for w in deferred}
+        deferred_sessions = [
+            row for row in rows if row and row[0] in deferred_ips
+        ]
+        if deferred_sessions:
+            log.line("NO-GO: deferred worker still has a DB session:")
+            for row in deferred_sessions:
+                log.line("  " + " | ".join(row))
+            return 16
+
+        log.line()
+        log.line(f"Writer-session groups before action: {len(rows)}")
+
+        if not args.execute:
+            log.line()
+            log.line("DRY RUN ONLY.")
+            for name, ip in running:
+                log.line(f"WOULD STOP {name} ({ip})")
+            for name in sorted(deferred):
+                log.line(f"WOULD DEFER {name} (ISOLATED-SAFE)")
+            log.line("NO ACTION WAS TAKEN.")
+            return 0
+
+        reachable_count = len(cfg["workers"]) - len(deferred)
+        required = f"QUIESCE {reachable_count} REACHABLE WORKERS"
+        if not confirm_exact(required, f"Type {required} to continue: "):
+            log.line("CANCELLED: confirmation did not match.")
+            return 20
+
+        log.line()
+        log.line("Stopping reachable ServerWatcher containers...")
+        for name, ip in running:
+            command_timeout = max(args.docker_stop_timeout + 15, 30)
+            rc, out, err = ssh(
+                ip,
+                f"docker stop --time {args.docker_stop_timeout} {CONTAINER}",
+                timeout=command_timeout,
+            )
+
+            verified, vrc, vstate, verr = wait_until_stopped(
+                ip, timeout=args.stop_verify_timeout
+            )
+
+            if verified:
+                if rc == 0:
+                    log.line(f"  PASS {name:<8} {ip:<15} stopped")
+                else:
+                    log.line(
+                        f"  PASS {name:<8} {ip:<15} stopped "
+                        f"(docker-stop rc={rc}: {err or out or 'no detail'}; "
+                        "state verified)"
+                    )
+                continue
+
+            if vrc != 0:
+                detail = f"verification failed: {verr or vstate or 'unknown'}"
+            else:
+                detail = f"container still running: {vstate or 'unknown state'}"
+            log.line(
+                f"  FAIL {name}: docker-stop rc={rc}: "
+                f"{err or out or 'no detail'}; {detail}"
+            )
+            return 16
+
+        log.line()
+        log.line("Verifying reachable workers are stopped...")
+        for name, meta in cfg["workers"].items():
+            if name in deferred:
+                log.line(f"  DEFERRED {name}: ISOLATED-SAFE")
+                continue
+            rc, state, err = container_state(meta["ip"])
+            if rc != 0 or state:
+                log.line(
+                    f"  FAIL {name}: "
+                    f"{'inspection failed' if rc != 0 else 'still running'}"
+                )
+                return 16
+            log.line(f"  PASS {name}: stopped")
+
+        deadline = time.time() + args.timeout
+        last_rows = []
+        while time.time() < deadline:
+            rc, rows, err = writer_rows(primary_ip)
+            if rc != 0:
+                log.line(f"FAIL: writer-session query failed: {err}")
+                return 11
+            last_rows = rows
+            if not rows:
+                break
+            time.sleep(2)
+
+        if last_rows:
+            log.line(
+                f"FAIL: writer sessions did not drain within {args.timeout}s."
+            )
+            for row in last_rows:
+                log.line("  " + " | ".join(row))
+            return 30
+
+        log.line()
+        log.line("QUIESCED")
+        log.line(
+            f"Reachable workers stopped: {reachable_count}; "
+            f"deferred isolated workers: {len(deferred)}"
+        )
+        log.line("No bf4_serverwatcher client sessions remain.")
+        log.line(f"Log: {log.path}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

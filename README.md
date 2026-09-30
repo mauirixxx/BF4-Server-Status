@@ -49,3 +49,9 @@ You will need to setup the roles in Discord first, and then you can use the bot 
 BF4 Server Watcher is designed to make it easier for Battlefield 4 communities to follow their favorite servers without constantly checking the game or external server browsers.
 
 Server and player information is collected from Battlefield 4-related services and presented directly inside Discord.
+
+## PostgreSQL HA (optional, v3.1.0)
+
+BF4 Server Watcher does not require a PostgreSQL HA cluster. A normal self-hosted installation can continue using one PostgreSQL server through `DATABASE_URL`.
+
+v3.1.0 additionally ships an optional semi-automatic PostgreSQL HA toolkit under `postgresql-ha/` for operators running multiple database nodes. It provides guarded fencing, promotion, survivor reparenting, service-DNS cutover, worker resume/postcheck, recovery/takeover, and former-primary rejoin workflows. See `postgresql-ha/README.md` before using it.

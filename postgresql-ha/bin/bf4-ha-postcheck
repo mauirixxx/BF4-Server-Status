@@ -1,0 +1,289 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee, atomic_write_json, journal_commit_or_die, journal_advance, journal_assert_owned, journal_effective_active, dig_exact_a, load_config, log_path,
+    parse_pipe_rows, prompt_vcenter_password, psql, read_json_file, ssh,
+    tcp_check, vcenter_power_state, fence_backend_power_state, prompt_fence_backend_password
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def primary_ok(ip):
+    sql = """
+SELECT pg_is_in_recovery(),
+       current_setting('transaction_read_only'),
+       current_setting('default_transaction_read_only');
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, err or out
+    p = out.split("|")
+    return len(p) >= 3 and p[0] == "f" and p[1] == "off" and p[2] == "off", out
+
+
+def replication_and_slots(ip, survivors, max_lag, barrier_lsn=None):
+    if barrier_lsn is None:
+        lag_expr = "pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint"
+    else:
+        # Compare each standby against one fixed WAL barrier captured while the
+        # application is quiesced. Later housekeeping WAL on the primary must
+        # not move the goalposts while we wait for standbys to catch up.
+        safe_barrier = str(barrier_lsn).replace("'", "''")
+        lag_expr = f"GREATEST(pg_wal_lsn_diff('{safe_barrier}'::pg_lsn, replay_lsn)::bigint, 0)"
+    sql = f"""
+SELECT client_addr, state,
+       {lag_expr}
+FROM pg_stat_replication;
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, [err or out]
+    repl = {r[0]: r for r in parse_pipe_rows(out) if len(r) >= 3}
+
+    sql = """
+SELECT slot_name, slot_type, active
+FROM pg_replication_slots;
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, [err or out]
+    slots = {r[0]: r for r in parse_pipe_rows(out) if len(r) >= 3}
+
+    failures = []
+    for name, meta in survivors.items():
+        row = repl.get(meta["ip"])
+        slot = slots.get(meta["slot"])
+        if not row or row[1] != "streaming":
+            failures.append(f"{name}: not streaming")
+            continue
+        try:
+            lag = int(row[2])
+        except ValueError:
+            failures.append(f"{name}: invalid lag")
+            continue
+        if lag > max_lag:
+            failures.append(f"{name}: lag={lag} > {max_lag}")
+        if not slot or slot[1] != "physical" or slot[2] != "t":
+            failures.append(f"{name}: slot {meta['slot']} not active physical")
+    return not failures, failures
+
+
+def db_clients(ip):
+    sql = """
+SELECT DISTINCT client_addr
+FROM pg_stat_activity
+WHERE datname='bf4_serverwatcher'
+  AND backend_type='client backend'
+  AND usename='bf4_serverwatcher'
+  AND client_addr IS NOT NULL;
+"""
+    rc, out, err = psql(ip, sql)
+    return rc, {r[0] for r in parse_pipe_rows(out) if r} if rc == 0 else set(), err or out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Guarded post-cutover validation and ServerWatcher resume")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--expect-primary")
+    ap.add_argument("--timeout", type=int, default=120, help="seconds to wait for pre-resume replication convergence and post-resume health")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("postcheck"))
+    state_file = Path(cfg["state"]["fence_file"])
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA POST-CUTOVER CHECK")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line("NOTE: this command owns the guarded ServerWatcher resume; do not start workers manually first.")
+
+        if not state_file.exists():
+            log.line(f"NO-GO: HA handoff state is missing: {state_file}")
+            return 14
+        effective = journal_effective_active(cfg)
+        if not effective:
+            raise RuntimeError("no effective active HA journal")
+        _effective_path, state = effective
+
+        journal_assert_owned(state)
+
+        for flag in ("promotion_completed", "reparent_completed", "dns_completed"):
+            if not state.get(flag):
+                log.line(f"NO-GO: {flag} is not true")
+                return 10
+        if state.get("postcheck_completed"):
+            log.line("NO-GO: postcheck_completed is already true")
+            return 10
+
+        old = state["old_primary"]
+        old_ip = state["old_primary_ip"]
+        new = state["new_primary"]
+        new_ip = state["new_primary_ip"]
+
+        if not args.execute and args.expect_primary is not None and args.expect_primary != new:
+            log.line(f"NO-GO: --expect-primary must equal {new}")
+            log.line("NO ACTION WAS TAKEN.")
+            return 10
+        if args.execute and args.expect_primary != new:
+            log.line(f"NO-GO: --expect-primary must equal {new}")
+            return 20
+
+        ok, detail = primary_ok(new_ip)
+        if not ok:
+            log.line(f"NO-GO: promoted primary is not writable: {detail}")
+            return 11
+
+        password = prompt_fence_backend_password(cfg, state)
+        ok, power = fence_backend_power_state(cfg, state, old, password)
+        if not ok or power != "poweredOff":
+            log.line("NO-GO: former primary fence no longer verified")
+            return 14
+        if tcp_check(old_ip, 5432, timeout=3):
+            log.line("NO-GO: former primary TCP/5432 is reachable")
+            return 30
+
+        # Only DNS servers still unreachable are allowed to remain deferred.
+        deferred_dns = set(state.get("deferred_dns_servers", []))
+        log.line()
+        log.line("Service DNS:")
+        for dns in cfg["dns"]["verify_servers"]:
+            rc, values, err = dig_exact_a(
+                dns, cfg["dns"].get("service_record", cfg["service_dns"])
+            )
+            if rc == 0:
+                if values != [new_ip]:
+                    log.line(f"  {dns}: FAIL {values}")
+                    return 13
+                log.line(f"  {dns}: PASS {new_ip}")
+            elif dns in deferred_dns:
+                log.line(f"  {dns}: DEFERRED unreachable")
+            else:
+                log.line(f"  {dns}: FAIL unreachable")
+                return 13
+
+        survivors = state.get("survivors", {})
+        # Capture one fixed WAL barrier while workers are still quiesced, then
+        # require every survivor to replay through that barrier. This preserves
+        # the exact pre-resume catch-up invariant without racing new WAL that
+        # PostgreSQL itself may generate while we are checking.
+        rc, barrier_lsn, err = psql(new_ip, "SELECT pg_current_wal_lsn();")
+        if rc != 0 or not barrier_lsn.strip():
+            log.line(f"NO-GO: unable to capture pre-resume WAL barrier: {err or barrier_lsn}")
+            return 12
+        barrier_lsn = barrier_lsn.strip().splitlines()[-1]
+        log.line()
+        log.line(f"Pre-resume WAL barrier: {barrier_lsn}")
+        log.line(f"Pre-resume replication: waiting up to {args.timeout}s for every survivor to replay through the fixed barrier")
+        deadline = time.time() + args.timeout
+        failures = []
+        while True:
+            ok, failures = replication_and_slots(new_ip, survivors, 0, barrier_lsn=barrier_lsn)
+            if ok:
+                log.line("Pre-resume replication: PASS (all survivors streaming, slots active, fixed WAL barrier replayed)")
+                break
+            if time.time() >= deadline:
+                for item in failures:
+                    log.line(f"NO-GO: {item}")
+                return 12
+            time.sleep(3)
+
+        deferred_workers = set(state.get("deferred_workers", []))
+        target_workers = [
+            name for name in cfg["workers"]
+            if name not in deferred_workers
+        ]
+
+        # Recovery-safe worker resume: a previous controller may have started
+        # only part of the fleet before disappearing. Preserve already-running
+        # workers and start only the missing ones after verifying their DB sessions.
+        log.line()
+        log.line("Pre-resume reachable workers:")
+        running_workers=[]; stopped_workers=[]
+        for name in target_workers:
+            ip=cfg["workers"][name]["ip"]
+            rc,out,err=ssh(ip,f'docker ps --filter name=^{CONTAINER}$ --format "{{{{.Names}}}}|{{{{.Status}}}}"')
+            if rc != 0:
+                log.line(f"NO-GO: {name} inspection failed"); return 16
+            if out.strip(): running_workers.append(name); log.line(f"  {name}: RUNNING (recovery-preserved)")
+            else: stopped_workers.append(name); log.line(f"  {name}: STOPPED")
+        rc,clients,err=db_clients(new_ip)
+        if rc != 0: return 11
+        running_ips={cfg["workers"][n]["ip"] for n in running_workers}; stopped_ips={cfg["workers"][n]["ip"] for n in stopped_workers}; target_ips=running_ips|stopped_ips
+        if clients & stopped_ips:
+            log.line("NO-GO: stopped workers unexpectedly have DB sessions"); return 16
+        if running_workers and not running_ips.issubset(clients):
+            log.line("NO-GO: running workers do not all have expected DB sessions"); return 16
+        if not args.execute:
+            log.line(); log.line("DRY RUN RESULT: PASS"); log.line(f"WOULD START {len(stopped_workers)} missing workers; preserve {len(running_workers)} already running; deferred={len(deferred_workers)}"); log.line("NO ACTION WAS TAKEN."); return 0
+        required=f"RESUME {len(stopped_workers)} MISSING WORKERS ON {new}"
+        if not confirm_exact(required): return 20
+        for name in stopped_workers:
+            ip=cfg["workers"][name]["ip"]; rc,out,err=ssh(ip,f"docker start {CONTAINER}")
+            if rc != 0: log.line(f"FAIL: {name}: {err or out}"); return 16
+            log.line(f"PASS: {name} started")
+        deadline=time.time()+args.timeout; seen=set()
+        while time.time()<deadline:
+            rc,seen,err=db_clients(new_ip)
+            if rc==0 and target_ips.issubset(seen): break
+            time.sleep(3)
+        else:
+            log.line("FAIL: not all reachable worker DB sessions appeared")
+            for ip in sorted(target_ips-seen): log.line(f"  missing: {ip}")
+            return 30
+
+        lag_limit = int(
+            cfg.get("health", {}).get(
+                "replication_lag_degraded_bytes", 1048576
+            )
+        ) - 1
+        deadline = time.time() + args.timeout
+        while time.time() < deadline:
+            ok, failures = replication_and_slots(new_ip, survivors, lag_limit)
+            if ok:
+                break
+            time.sleep(3)
+        else:
+            for item in failures:
+                log.line(f"FAIL: {item}")
+            return 30
+
+        state["resume_completed"] = True
+        state["resume_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["postcheck_completed"] = True
+        state["postcheck_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["postcheck_primary"] = new
+        state["postcheck_primary_ip"] = new_ip
+        state["postcheck_reachable_worker_count"] = len(target_workers)
+        state["postcheck_deferred_workers"] = sorted(deferred_workers)
+        journal_advance(state, "postcheck-completed")
+        journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+
+        log.line()
+        log.line("POST-CUTOVER VERIFIED")
+        log.line(
+            f"Reachable workers={len(target_workers)} "
+            f"deferred={len(deferred_workers)}"
+        )
+        log.line(
+            "SERVICE FAILOVER PATH IS COMPLETE; deferred-site recovery and "
+            "former-primary rejoin remain separate phases."
+        )
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

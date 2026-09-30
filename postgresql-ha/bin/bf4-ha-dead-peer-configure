@@ -1,0 +1,46 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse, sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import confirm_exact, banner, current_primary, failure_domain_snapshot, load_config, parse_pipe_rows, psql
+
+SETTINGS = [
+    ('tcp_keepalives_idle','60'),
+    ('tcp_keepalives_interval','15'),
+    ('tcp_keepalives_count','4'),
+    ('client_connection_check_interval','30s'),
+]
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--execute',action='store_true'); a=ap.parse_args()
+    cfg=load_config(); snap=failure_domain_snapshot(cfg); primary=current_primary(snap['db_states'])
+    banner('BF4 HA SERVERWATCHER DEAD-PEER CONFIGURE')
+    print(f"Mode: {'EXECUTE' if a.execute else 'DRY RUN'}")
+    if not primary:
+        print('NO-GO: exactly one reachable primary was not discovered'); return 10
+    ip=cfg['nodes'][primary]['ip']; print(f'Primary: {primary} ({ip})'); print('Role   : bf4_serverwatcher'); print()
+    rc,out,err=psql(ip,"SELECT rolconfig FROM pg_roles WHERE rolname='bf4_serverwatcher';")
+    if rc!=0: print('NO-GO:',err or out); return 11
+    rows=parse_pipe_rows(out); print('Current rolconfig:', rows[0][0] if rows and rows[0] else '(none)')
+    for k,v in SETTINGS: print(f'  WOULD SET {k} = {v}')
+    print('\nThese ALTER ROLE defaults affect NEW connections only; no workers are restarted by this tool.')
+    if not a.execute:
+        print('\nDRY RUN ONLY. NO DATABASE STATE WAS CHANGED.'); return 0
+    phrase='CONFIGURE BF4 SERVERWATCHER DEAD PEER DETECTION'
+    if not confirm_exact(phrase):
+        print('ABORTED: confirmation did not match'); return 20
+    stmts='\n'.join(f"ALTER ROLE bf4_serverwatcher SET {k} = '{v}';" for k,v in SETTINGS)
+    rc,out,err=psql(ip,stmts)
+    if rc!=0: print('FAIL:',err or out); return 12
+    rc,out,err=psql(ip,"SELECT rolconfig FROM pg_roles WHERE rolname='bf4_serverwatcher';")
+    if rc!=0: print('FAIL: verification query failed:',err or out); return 13
+    raw=(parse_pipe_rows(out)[0][0] if parse_pipe_rows(out) else '')
+    missing=[f'{k}={v}' for k,v in SETTINGS if f'{k}={v}' not in raw]
+    if missing: print('FAIL: verification missing:', ', '.join(missing)); return 14
+    print('\nCONFIGURATION VERIFIED')
+    print('New ServerWatcher DB connections will use the bounded dead-peer settings.')
+    print('Existing worker DB sessions are unchanged until they reconnect.')
+    return 0
+
+if __name__=='__main__': raise SystemExit(main())

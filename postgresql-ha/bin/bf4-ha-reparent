@@ -1,0 +1,716 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee,
+    atomic_write_json, journal_commit_or_die, journal_advance, journal_assert_owned, journal_effective_active,
+    conninfo_set_host,
+    load_config,
+    log_path,
+    parse_pipe_rows,
+    prompt_vcenter_password,
+    psql,
+    read_json_file,
+    sql_literal,
+    ssh,
+    tcp_check,
+    vcenter_power_state, fence_backend_power_state, prompt_fence_backend_password,
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def primary_state(ip: str):
+    sql = """
+SELECT
+    pg_is_in_recovery(),
+    current_setting('transaction_read_only'),
+    current_setting('default_transaction_read_only'),
+    pg_current_wal_lsn();
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    parts = out.split("|")
+    if len(parts) < 4:
+        return False, {}, f"unexpected primary-state output: {out!r}"
+    return True, {
+        "in_recovery": parts[0],
+        "transaction_read_only": parts[1],
+        "default_transaction_read_only": parts[2],
+        "wal_lsn": parts[3],
+    }, ""
+
+
+def standby_state(ip: str):
+    sql = """
+SELECT
+    pg_is_in_recovery(),
+    pg_is_wal_replay_paused(),
+    current_setting('primary_slot_name', true),
+    current_setting('primary_conninfo', true),
+    pg_last_wal_receive_lsn(),
+    pg_last_wal_replay_lsn();
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+
+    parts = out.split("|", 5)
+    if len(parts) < 6:
+        return False, {}, f"unexpected standby-state output: {out!r}"
+
+    return True, {
+        "in_recovery": parts[0],
+        "replay_paused": parts[1],
+        "primary_slot_name": parts[2],
+        "primary_conninfo": parts[3],
+        "receive_lsn": parts[4],
+        "replay_lsn": parts[5],
+    }, ""
+
+
+def wal_receiver_state(ip: str):
+    sql = """
+SELECT
+    status,
+    sender_host,
+    sender_port,
+    slot_name,
+    written_lsn,
+    flushed_lsn,
+    latest_end_lsn
+FROM pg_stat_wal_receiver;
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+
+    rows = parse_pipe_rows(out)
+    if not rows:
+        return True, {}, ""
+
+    row = rows[0]
+    if len(row) < 7:
+        return False, {}, f"unexpected WAL receiver row: {row!r}"
+
+    return True, {
+        "status": row[0],
+        "sender_host": row[1],
+        "sender_port": row[2],
+        "slot_name": row[3],
+        "written_lsn": row[4],
+        "flushed_lsn": row[5],
+        "latest_end_lsn": row[6],
+    }, ""
+
+
+def workload_quiesced(cfg, new_primary_ip: str, deferred_workers=None):
+    deferred_workers = set(deferred_workers or [])
+    running = []
+    errors = []
+
+    for name, meta in cfg["workers"].items():
+        rc, out, err = ssh(
+            meta["ip"],
+            f'docker ps --filter name=^{CONTAINER}$ '
+            '--format "{{.Names}}|{{.Status}}"',
+        )
+        if rc != 0:
+            if name not in deferred_workers:
+                errors.append(f"{name}: worker inspection failed ({err or out})")
+        elif out.strip():
+            running.append(name)
+
+    sql = """
+SELECT client_addr, state, count(*)
+FROM pg_stat_activity
+WHERE datname = 'bf4_serverwatcher'
+  AND backend_type = 'client backend'
+  AND usename = 'bf4_serverwatcher'
+GROUP BY client_addr, state
+ORDER BY client_addr, state;
+"""
+    rc, out, err = psql(new_primary_ip, sql)
+    if rc != 0:
+        errors.append(f"writer-session query failed: {err or out}")
+        return False, running, [], errors
+
+    rows = parse_pipe_rows(out)
+    return not running and not rows and not errors, running, rows, errors
+
+def slot_inventory(primary_ip: str):
+    sql = """
+SELECT
+    slot_name,
+    slot_type,
+    active,
+    restart_lsn,
+    wal_status
+FROM pg_replication_slots
+ORDER BY slot_name;
+
+SELECT setting::int
+FROM pg_settings
+WHERE name = 'max_replication_slots';
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        return False, {}, None, err or out
+
+    lines = [line for line in out.splitlines() if line.strip()]
+    if not lines:
+        return False, {}, None, "empty slot inventory output"
+
+    try:
+        max_slots = int(lines[-1].strip())
+    except ValueError:
+        return False, {}, None, f"invalid max_replication_slots: {lines[-1]!r}"
+
+    slots = {}
+    for line in lines[:-1]:
+        parts = line.split("|")
+        if len(parts) < 5:
+            return False, {}, None, f"malformed slot row: {line!r}"
+        slots[parts[0]] = {
+            "slot_type": parts[1],
+            "active": parts[2],
+            "restart_lsn": parts[3],
+            "wal_status": parts[4],
+        }
+
+    return True, slots, max_slots, ""
+
+
+def primary_replication_view(primary_ip: str):
+    sql = """
+SELECT
+    client_addr,
+    state,
+    sync_state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint AS lag_bytes
+FROM pg_stat_replication
+ORDER BY client_addr;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    rows = parse_pipe_rows(out)
+    view = {}
+    for row in rows:
+        if len(row) >= 8:
+            view[row[0]] = {
+                "state": row[1],
+                "sync_state": row[2],
+                "sent_lsn": row[3],
+                "write_lsn": row[4],
+                "flush_lsn": row[5],
+                "replay_lsn": row[6],
+                "lag_bytes": row[7],
+            }
+    return True, view, ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Guarded survivor-slot creation and standby reparenting after a "
+            "verified fence + promotion."
+        )
+    )
+    ap.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually create slots and reparent survivors. Default is dry-run.",
+    )
+    ap.add_argument(
+        "--expect-primary",
+        help=(
+            "Required with --execute. Must exactly match the promoted primary "
+            "recorded in the HA handoff state."
+        ),
+    )
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=90,
+        help="Seconds to wait for all survivors to stream/catch up (default: 90).",
+    )
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("reparent"))
+    fence_file = Path(cfg["state"]["fence_file"])
+
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA SURVIVOR REPARENT")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line()
+
+        if not fence_file.exists():
+            log.line(
+                f"NO-GO: HA handoff state is missing: {fence_file}"
+            )
+            log.line(
+                "A reparent operation requires a successful live fence and "
+                "promotion from v0.6.0 or later."
+            )
+            return 14
+
+        try:
+            effective = journal_effective_active(cfg)
+            if not effective:
+                raise RuntimeError("no effective active HA journal")
+            _effective_path, state = effective
+
+            journal_assert_owned(state)
+        except Exception as exc:
+            log.line(f"NO-GO: cannot read HA handoff state: {exc}")
+            return 14
+
+        if not state.get("promotion_completed"):
+            log.line("NO-GO: handoff does not record promotion_completed=true")
+            return 10
+
+        if state.get("reparent_completed"):
+            log.line("NO-GO: handoff already records reparent_completed=true")
+            return 10
+
+        old_primary = state.get("old_primary")
+        old_primary_ip = state.get("old_primary_ip")
+        new_primary = state.get("new_primary")
+        new_primary_ip = state.get("new_primary_ip")
+
+        if not all([old_primary, old_primary_ip, new_primary, new_primary_ip]):
+            log.line("NO-GO: HA handoff state is incomplete")
+            return 14
+
+        if new_primary not in cfg["nodes"] or old_primary not in cfg["nodes"]:
+            log.line("NO-GO: HA handoff references unknown DB nodes")
+            return 10
+
+        deferred_db_nodes = set(state.get("deferred_db_nodes", []))
+        all_survivors = [
+            name
+            for name in cfg["nodes"]
+            if name not in (old_primary, new_primary)
+        ]
+        survivors = [
+            name for name in all_survivors
+            if name not in deferred_db_nodes
+        ]
+        deferred_survivors = [
+            name for name in all_survivors
+            if name in deferred_db_nodes
+        ]
+
+        log.line("HA handoff:")
+        log.line(f"  old primary : {old_primary} ({old_primary_ip})")
+        log.line(f"  new primary : {new_primary} ({new_primary_ip})")
+        log.line(
+            "  survivors   : "
+            + (", ".join(survivors) if survivors else "none")
+        )
+        log.line(
+            "  deferred    : "
+            + (", ".join(deferred_survivors) if deferred_survivors else "none")
+        )
+        log.line()
+
+        if not args.execute and args.expect_primary is not None and args.expect_primary != new_primary:
+            log.line(f"NO-GO: --expect-primary must equal {new_primary}")
+            log.line("NO ACTION WAS TAKEN.")
+            return 10
+        if args.execute and args.expect_primary != new_primary:
+            log.line(
+                "NO-GO: live execution requires "
+                f"--expect-primary {new_primary}"
+            )
+            return 20
+
+        # Verify new primary is actually writable.
+        ok, pstate, err = primary_state(new_primary_ip)
+        if not ok:
+            log.line(f"NO-GO: new-primary query failed: {err}")
+            return 11
+
+        log.line("New-primary state:")
+        for k, v in pstate.items():
+            log.line(f"  {k:<29}: {v}")
+
+        if (
+            pstate["in_recovery"] != "f"
+            or pstate["transaction_read_only"] != "off"
+            or pstate["default_transaction_read_only"] != "off"
+        ):
+            log.line("NO-GO: handoff new primary is not currently writable primary")
+            return 10
+
+        # Old primary must still be fenced right now.
+        password = prompt_fence_backend_password(cfg, state)
+        ok, power = fence_backend_power_state(cfg, state, old_primary, password)
+        if not ok:
+            log.line(f"NO-GO: old-primary fence-backend check failed: {power}")
+            return 14
+        log.line()
+        log.line(f"Old-primary fence state: {power}")
+        if power != "poweredOff":
+            log.line("NO-GO: old primary is no longer poweredOff")
+            return 14
+
+        if tcp_check(old_primary_ip, 5432, timeout=3.0):
+            log.line("NO-GO: old primary TCP/5432 is reachable")
+            return 30
+        log.line(f"Old-primary TCP/5432: unreachable")
+
+        # Workload should remain quiesced until DNS cutover.
+        q_ok, running, writers, q_errors = workload_quiesced(
+            cfg, new_primary_ip, state.get("deferred_workers", [])
+        )
+        log.line()
+        log.line("Workload quiesce state:")
+        if q_errors:
+            for item in q_errors:
+                log.line(f"  ERROR: {item}")
+        log.line(
+            "  running workers       : "
+            + (", ".join(running) if running else "none")
+        )
+        log.line(f"  writer-session groups : {len(writers)}")
+        log.line(f"  verdict               : {'QUIESCED' if q_ok else 'NOT QUIESCED'}")
+
+        if args.execute and not q_ok:
+            log.line("NO-GO: workload must remain quiesced during reparent")
+            return 16
+
+        # Validate survivors and capture current conninfo without logging password.
+        survivor_state = {}
+        log.line()
+        log.line("Surviving standby readiness:")
+
+        for name in survivors:
+            ip = cfg["nodes"][name]["ip"]
+            slot = cfg["nodes"][name]["slot"]
+            ok, sstate, err = standby_state(ip)
+            if not ok:
+                log.line(f"  {name:<12} FAIL: {err}")
+                return 11
+
+            if sstate["in_recovery"] != "t":
+                log.line(f"  {name:<12} FAIL: not in recovery")
+                return 10
+            if sstate["replay_paused"] != "f":
+                log.line(f"  {name:<12} FAIL: WAL replay paused")
+                return 11
+            if sstate["primary_slot_name"] != slot:
+                log.line(
+                    f"  {name:<12} FAIL: primary_slot_name="
+                    f"{sstate['primary_slot_name']!r}, expected {slot!r}"
+                )
+                return 10
+
+            wr_ok, wr, wr_err = wal_receiver_state(ip)
+            if not wr_ok:
+                log.line(f"  {name:<12} FAIL: WAL receiver query: {wr_err}")
+                return 11
+
+            sender = wr.get("sender_host", "(disconnected)")
+            status = wr.get("status", "(none)")
+            log.line(
+                f"  {name:<12} recovery=t replay_paused=f "
+                f"slot={slot} receiver={status} sender={sender}"
+            )
+
+            survivor_state[name] = {
+                "ip": ip,
+                "slot": slot,
+                "conninfo": sstate["primary_conninfo"],
+            }
+
+        # Validate slot capacity and collision safety.
+        ok, slots, max_slots, err = slot_inventory(new_primary_ip)
+        if not ok:
+            log.line(f"NO-GO: slot inventory failed: {err}")
+            return 11
+
+        needed_names = {survivor_state[name]["slot"] for name in survivors}
+        existing_count = len(slots)
+        missing_slots = sorted(needed_names - set(slots))
+        free_capacity = max_slots - existing_count
+
+        log.line()
+        log.line("New-primary replication slot readiness:")
+        log.line(f"  max slots         : {max_slots}")
+        log.line(f"  existing slots    : {existing_count}")
+        log.line(f"  missing required  : {len(missing_slots)}")
+        log.line(f"  free capacity     : {free_capacity}")
+
+        if free_capacity < len(missing_slots):
+            log.line("NO-GO: insufficient replication slot capacity")
+            return 11
+
+        for slot_name in sorted(needed_names):
+            if slot_name not in slots:
+                log.line(f"  {slot_name:<14} AVAILABLE (would create)")
+                continue
+
+            slot = slots[slot_name]
+            if slot["slot_type"] != "physical":
+                log.line(
+                    f"  {slot_name:<14} FAIL: existing slot is "
+                    f"{slot['slot_type']}, not physical"
+                )
+                return 10
+
+            # Existing physical slots are acceptable; active ones are only safe
+            # if the corresponding survivor is already streaming to this primary.
+            log.line(
+                f"  {slot_name:<14} EXISTS physical "
+                f"active={slot['active']} wal_status={slot['wal_status'] or '-'}"
+            )
+
+        if not args.execute:
+            log.line()
+            log.line("DRY RUN RESULT: PASS")
+            for name in survivors:
+                meta = survivor_state[name]
+                action = (
+                    "CREATE SLOT + REPARENT"
+                    if meta["slot"] in missing_slots
+                    else "REPARENT USING EXISTING SLOT"
+                )
+                log.line(
+                    f"WOULD {action}: {name} ({meta['ip']}) "
+                    f"-> {new_primary_ip} slot={meta['slot']}"
+                )
+            if not q_ok:
+                log.line(
+                    "EXECUTION BLOCKER: workload is not quiesced. "
+                    "--execute would refuse to continue."
+                )
+            log.line("NO ACTION WAS TAKEN.")
+            log.line(f"Log: {log.path}")
+            return 0
+
+        required = f"REPARENT {len(survivors)} SURVIVORS TO {new_primary}"
+        log.line()
+        log.line("WRITE BOUNDARY")
+        log.line(f"Required confirmation: {required}")
+        confirmation = required if confirm_exact(required, "Type confirmation exactly: ") else ""
+        if confirmation != required:
+            log.line("CANCELLED: confirmation did not match.")
+            return 20
+
+        # Create missing physical slots first.
+        log.line()
+        log.line("Creating missing physical replication slots...")
+        for slot_name in missing_slots:
+            sql = (
+                "SELECT slot_name "
+                "FROM pg_create_physical_replication_slot("
+                f"{sql_literal(slot_name)}"
+                ");"
+            )
+            rc, out, err = psql(new_primary_ip, sql)
+            if rc != 0:
+                log.line(
+                    f"  FAIL {slot_name}: {err or out}"
+                )
+                return 11
+            log.line(f"  PASS {slot_name}: created")
+
+        if not missing_slots:
+            log.line("  No slots needed creation.")
+
+        # Reparent each survivor using the fixed IP of the new primary.
+        log.line()
+        log.line("Reparenting survivors...")
+        for name in survivors:
+            meta = survivor_state[name]
+            try:
+                new_conninfo = conninfo_set_host(
+                    meta["conninfo"], new_primary_ip
+                )
+            except Exception as exc:
+                log.line(f"  FAIL {name}: cannot rewrite conninfo: {exc}")
+                return 11
+
+            # ALTER SYSTEM cannot be combined with other commands in one
+            # psql -c query string because PostgreSQL treats the multi-command
+            # string as a transaction block. Execute each ALTER SYSTEM as its
+            # own top-level statement, then reload separately.
+            statements = (
+                (
+                    "primary_conninfo",
+                    "ALTER SYSTEM SET primary_conninfo = "
+                    f"{sql_literal(new_conninfo)};",
+                ),
+                (
+                    "primary_slot_name",
+                    "ALTER SYSTEM SET primary_slot_name = "
+                    f"{sql_literal(meta['slot'])};",
+                ),
+                (
+                    "reload",
+                    "SELECT pg_reload_conf();",
+                ),
+            )
+
+            for label, statement in statements:
+                rc, out, err = psql(meta["ip"], statement)
+                if rc != 0:
+                    log.line(
+                        f"  FAIL {name}: {label} update failed: {err or out}"
+                    )
+                    return 11
+
+            log.line(
+                f"  PASS {name}: primary_conninfo host -> {new_primary_ip}, "
+                f"slot={meta['slot']}"
+            )
+
+        # Wait for survivor WAL receivers.
+        deadline = time.time() + args.timeout
+        last_receiver = {}
+        while time.time() < deadline:
+            all_ok = True
+            for name in survivors:
+                meta = survivor_state[name]
+                ok, wr, err = wal_receiver_state(meta["ip"])
+                if not ok:
+                    all_ok = False
+                    last_receiver[name] = {"error": err}
+                    continue
+                last_receiver[name] = wr
+                if not (
+                    wr.get("status") == "streaming"
+                    and wr.get("sender_host") == new_primary_ip
+                    and wr.get("slot_name") == meta["slot"]
+                ):
+                    all_ok = False
+
+            if all_ok:
+                break
+            time.sleep(2)
+        else:
+            log.line()
+            log.line("FAIL: survivors did not all begin streaming in time.")
+            for name in survivors:
+                log.line(f"  {name}: {last_receiver.get(name, {})}")
+            return 30
+
+        log.line()
+        log.line("All survivor WAL receivers are streaming from new primary:")
+        for name in survivors:
+            wr = last_receiver[name]
+            log.line(
+                f"  {name:<12} sender={wr['sender_host']} "
+                f"slot={wr['slot_name']} latest_end_lsn={wr['latest_end_lsn']}"
+            )
+
+        # Now require the new primary to see all survivors with zero lag and
+        # their slots active.
+        deadline = time.time() + args.timeout
+        last_view = {}
+        last_slots = {}
+        while time.time() < deadline:
+            ok1, view, err1 = primary_replication_view(new_primary_ip)
+            ok2, slot_view, _, err2 = slot_inventory(new_primary_ip)
+            if not ok1 or not ok2:
+                time.sleep(2)
+                continue
+
+            last_view = view
+            last_slots = slot_view
+
+            all_ok = True
+            for name in survivors:
+                meta = survivor_state[name]
+                row = view.get(meta["ip"])
+                slot = slot_view.get(meta["slot"])
+                if not row or row["state"] != "streaming":
+                    all_ok = False
+                    break
+                try:
+                    if int(row["lag_bytes"]) != 0:
+                        all_ok = False
+                        break
+                except Exception:
+                    all_ok = False
+                    break
+                if not slot or slot["slot_type"] != "physical" or slot["active"] != "t":
+                    all_ok = False
+                    break
+
+            if all_ok:
+                break
+            time.sleep(2)
+        else:
+            log.line()
+            log.line("FAIL: survivor zero-lag/active-slot verification timed out.")
+            for name in survivors:
+                meta = survivor_state[name]
+                log.line(
+                    f"  {name}: replication={last_view.get(meta['ip'])} "
+                    f"slot={last_slots.get(meta['slot'])}"
+                )
+            return 30
+
+        log.line()
+        log.line("REPARENT VERIFIED")
+        for name in survivors:
+            meta = survivor_state[name]
+            row = last_view[meta["ip"]]
+            slot = last_slots[meta["slot"]]
+            log.line(
+                f"  {name:<12} streaming lag={row['lag_bytes']} bytes "
+                f"slot={meta['slot']} active={slot['active']}"
+            )
+
+        state["deferred_db_nodes"] = sorted(deferred_db_nodes)
+        state["reparent_deferred_db_nodes"] = sorted(deferred_survivors)
+        state["reparent_completed"] = True
+        state["reparent_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["survivors"] = {
+            name: {
+                "ip": survivor_state[name]["ip"],
+                "slot": survivor_state[name]["slot"],
+                "upstream_ip": new_primary_ip,
+                "verified_streaming": True,
+                "verified_lag_bytes": 0,
+            }
+            for name in survivors
+        }
+        journal_advance(state, "reparent-completed")
+        journal_commit_or_die(fence_file, state, cfg, require_recovery=True)
+
+        log.line()
+        log.line(f"Updated handoff state: {fence_file}")
+        log.line(
+            "THIS TOOL DOES NOT CHANGE SERVICE DNS, RESUME WORKERS, "
+            "OR REJOIN THE FENCED FORMER PRIMARY."
+        )
+        log.line(f"Log: {log.path}")
+        return 0
+
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,349 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee,
+    atomic_write_json, journal_commit_or_die, journal_advance, journal_assert_owned, journal_effective_active,
+    load_config,
+    log_path,
+    prompt_vcenter_password,
+    psql,
+    read_json_file,
+    tcp_check,
+    vcenter_power_state, fence_backend_power_state, prompt_fence_backend_password,
+)
+
+
+def candidate_state(candidate_ip: str):
+    sql = """
+SELECT
+    pg_is_in_recovery(),
+    pg_is_wal_replay_paused(),
+    pg_last_wal_receive_lsn(),
+    pg_last_wal_replay_lsn();
+"""
+    rc, out, err = psql(candidate_ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    parts = out.split("|")
+    if len(parts) < 4:
+        return False, {}, f"unexpected output: {out!r}"
+    data = {
+        "in_recovery": parts[0],
+        "replay_paused": parts[1],
+        "receive_lsn": parts[2],
+        "replay_lsn": parts[3],
+    }
+    return True, data, ""
+
+
+def writable_state(candidate_ip: str):
+    sql = """
+SELECT
+    pg_is_in_recovery(),
+    current_setting('transaction_read_only'),
+    current_setting('default_transaction_read_only'),
+    pg_current_wal_lsn();
+"""
+    rc, out, err = psql(candidate_ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    parts = out.split("|")
+    if len(parts) < 4:
+        return False, {}, f"unexpected output: {out!r}"
+    data = {
+        "in_recovery": parts[0],
+        "transaction_read_only": parts[1],
+        "default_transaction_read_only": parts[2],
+        "current_wal_lsn": parts[3],
+    }
+    return True, data, ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Guarded PostgreSQL promotion primitive after a verified fence."
+    )
+    ap.add_argument(
+        "--candidate",
+        required=True,
+        help="Exact candidate hostname to promote.",
+    )
+    ap.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually promote the candidate. Default is dry-run.",
+    )
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="pg_promote wait timeout in seconds (default: 60).",
+    )
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("promote"))
+    fence_file = Path(cfg["state"]["fence_file"])
+
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA POSTGRESQL PROMOTE")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line(f"Requested candidate: {args.candidate}")
+        log.line()
+
+        if args.candidate not in cfg["nodes"]:
+            log.line(f"NO-GO: unknown candidate {args.candidate!r}")
+            return 10
+
+        if not fence_file.exists():
+            log.line(
+                f"NO-GO: verified fence handoff state is missing: {fence_file}"
+            )
+            log.line(
+                "A live promotion requires a successful bf4-ha-fence --execute "
+                "from v0.6.0 or later."
+            )
+            return 14
+
+        try:
+            effective = journal_effective_active(cfg)
+            if not effective:
+                raise RuntimeError("no effective active HA journal")
+            _effective_path, state = effective
+
+            journal_assert_owned(state)
+        except Exception as exc:
+            log.line(f"NO-GO: cannot read fence state: {exc}")
+            return 14
+
+        old_primary = state.get("old_primary")
+        old_primary_ip = state.get("old_primary_ip")
+        candidate = state.get("candidate")
+        candidate_ip = state.get("candidate_ip")
+
+        log.line("Fence handoff:")
+        log.line(f"  old primary : {old_primary} ({old_primary_ip})")
+        log.line(f"  candidate   : {candidate} ({candidate_ip})")
+        log.line(f"  created     : {state.get('created_at_utc', '?')}")
+        log.line(
+            f"  fence backend: {state.get('fencing_backend', 'vcenter')} / power={state.get('fence_power_state_verified', state.get('vcenter_power_state_verified', '?'))}"
+        )
+        log.line(
+            "  TCP/5432    : "
+            + (
+                "unreachable"
+                if state.get("old_primary_tcp_5432_verified_unreachable")
+                else "NOT VERIFIED"
+            )
+        )
+
+        if state.get("promotion_completed"):
+            log.line("NO-GO: fence state already records promotion_completed=true")
+            return 10
+
+        if candidate != args.candidate:
+            log.line(
+                f"NO-GO: requested candidate {args.candidate!r} does not match "
+                f"fence handoff candidate {candidate!r}"
+            )
+            return 10
+
+        if not old_primary or not old_primary_ip or not candidate_ip:
+            log.line("NO-GO: fence handoff state is incomplete")
+            return 14
+
+        if state.get("fence_power_state_verified", state.get("vcenter_power_state_verified")) != "poweredOff":
+            log.line("NO-GO: fence handoff does not prove poweredOff")
+            return 14
+
+        if not state.get("old_primary_tcp_5432_verified_unreachable"):
+            log.line("NO-GO: fence handoff does not prove TCP/5432 unreachable")
+            return 14
+
+        # Re-verify old primary is still fenced NOW.
+        password = prompt_fence_backend_password(cfg, state)
+        ok, power = fence_backend_power_state(cfg, state, old_primary, password)
+        if not ok:
+            log.line(f"NO-GO: {power}")
+            return 14
+        log.line()
+        log.line(f"Live fence-backend old-primary state: {power}")
+        if power != "poweredOff":
+            log.line("NO-GO: old primary is no longer poweredOff")
+            return 14
+
+        if tcp_check(old_primary_ip, 5432, timeout=3.0):
+            log.line("NO-GO: old primary TCP/5432 is reachable")
+            return 30
+        log.line(f"Live TCP check: {old_primary_ip}:5432 unreachable")
+
+        # Candidate may already have been promoted if a previous controller died
+        # after pg_promote() but before the journal checkpoint. Reconcile reality.
+        already_promoted = False
+        wok, wstate, werr = writable_state(candidate_ip)
+        if wok and wstate.get("in_recovery") == "f" and wstate.get("transaction_read_only") == "off" and wstate.get("default_transaction_read_only") == "off":
+            already_promoted = True
+            cstate = None
+            log.line("RECOVERY: candidate is already the writable primary; promotion checkpoint is missing.")
+        else:
+            ok, cstate, err = candidate_state(candidate_ip)
+        if not ok:
+            log.line(f"NO-GO: candidate query failed: {err}")
+            return 11
+
+        if not already_promoted:
+            log.line()
+            log.line("Candidate state:")
+            log.line(f"  in_recovery   : {cstate['in_recovery']}")
+            log.line(f"  replay_paused : {cstate['replay_paused']}")
+            log.line(f"  receive_lsn   : {cstate['receive_lsn']}")
+            log.line(f"  replay_lsn    : {cstate['replay_lsn']}")
+
+            if cstate["in_recovery"] != "t":
+                log.line("NO-GO: candidate is not currently a standby")
+                return 10
+            if cstate["replay_paused"] != "f":
+                log.line("NO-GO: candidate WAL replay is paused")
+                return 11
+            if (
+                not cstate["receive_lsn"]
+                or cstate["receive_lsn"] != cstate["replay_lsn"]
+            ):
+                log.line("NO-GO: candidate receive/replay LSNs do not match")
+                return 12
+
+            # Require no regression behind the exact replay LSN recorded before fence.
+            recorded_replay = state.get("candidate_replay_lsn_before_fence")
+            if recorded_replay and cstate["replay_lsn"] != recorded_replay:
+                # It may advance slightly after the pre-fence sample before the old
+                # primary fully powers off. That's safe, but it must never go backwards.
+                # Compare through PostgreSQL itself to avoid parsing LSNs in Python.
+                sql = (
+                    "SELECT pg_wal_lsn_diff("
+                    f"'{cstate['replay_lsn']}'::pg_lsn,"
+                    f"'{recorded_replay}'::pg_lsn"
+                    ")::bigint;"
+                )
+                rc, out, err2 = psql(candidate_ip, sql)
+                if rc != 0:
+                    log.line(f"NO-GO: LSN comparison failed: {err2 or out}")
+                    return 12
+                try:
+                    diff = int(out.strip())
+                except ValueError:
+                    log.line(f"NO-GO: invalid LSN comparison result {out!r}")
+                    return 12
+                log.line(
+                    f"  replay delta vs pre-fence sample: {diff} bytes"
+                )
+                if diff < 0:
+                    log.line("NO-GO: candidate replay LSN regressed")
+                    return 12
+            else:
+                log.line("  replay delta vs pre-fence sample: 0 bytes")
+
+        if not args.execute:
+            log.line()
+            log.line("DRY RUN RESULT: PASS")
+            log.line(f"WOULD PROMOTE {candidate} ({candidate_ip})")
+            log.line("Old primary remains positively fenced.")
+            log.line("Candidate replay state is safe.")
+            log.line("NO ACTION WAS TAKEN.")
+            log.line(f"Log: {log.path}")
+            return 0
+
+        required = f"PROMOTE {candidate} AFTER FENCE {old_primary}"
+        log.line()
+        log.line("PROMOTION BOUNDARY")
+        log.line(f"Required confirmation: {required}")
+        confirmation = required if confirm_exact(required, "Type confirmation exactly: ") else ""
+        if confirmation != required:
+            log.line("CANCELLED: confirmation did not match.")
+            return 20
+
+        if already_promoted:
+            verified = wstate
+            log.line("RECOVERY: skipping duplicate pg_promote(); independently verified writable primary.")
+        else:
+            log.line()
+            log.line("Calling pg_promote()...")
+            sql = f"SELECT pg_promote(true, {int(args.timeout)});"
+            rc, out, err = psql(candidate_ip, sql, timeout=args.timeout + 15)
+            if rc != 0:
+                log.line(f"FAIL: pg_promote query failed: {err or out}")
+                return 11
+            if out.strip() != "t":
+                log.line(f"FAIL: pg_promote returned {out!r}, expected 't'")
+                return 30
+            deadline = time.time() + 30
+            verified = None
+            while time.time() < deadline:
+                ok, verified, err = writable_state(candidate_ip)
+                if ok and verified["in_recovery"] == "f" and verified["transaction_read_only"] == "off" and verified["default_transaction_read_only"] == "off":
+                    break
+                time.sleep(1)
+            else:
+                log.line(f"FAIL: primary verification did not converge: {verified or err}")
+                return 30
+
+        if not tcp_check(candidate_ip, 5432, timeout=3.0):
+            log.line("FAIL: promoted candidate is not reachable on TCP/5432")
+            return 30
+
+        # Re-check old primary fence after promotion too.
+        ok, power = fence_backend_power_state(cfg, state, old_primary, password)
+        if not ok or power != "poweredOff":
+            log.line(
+                f"FAIL: post-promotion fence recheck failed: {power}"
+            )
+            return 30
+        if tcp_check(old_primary_ip, 5432, timeout=3.0):
+            log.line(
+                "FAIL: old primary became reachable on TCP/5432 after promotion"
+            )
+            return 30
+
+        state["promotion_completed"] = True
+        state["promotion_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["new_primary"] = candidate
+        state["new_primary_ip"] = candidate_ip
+        state["new_primary_wal_lsn_after_promotion"] = verified["current_wal_lsn"]
+        journal_advance(state, "promotion-completed")
+        journal_commit_or_die(fence_file, state, cfg, require_recovery=True)
+
+        log.line()
+        log.line("PRIMARY VERIFIED")
+        log.line(f"New primary                 : {candidate} ({candidate_ip})")
+        log.line("pg_is_in_recovery           : false")
+        log.line("transaction_read_only       : off")
+        log.line("default_transaction_read_only: off")
+        log.line(f"current WAL LSN             : {verified['current_wal_lsn']}")
+        log.line("TCP/5432                    : reachable")
+        log.line(f"Former primary              : {old_primary} remains poweredOff")
+        log.line(f"Former primary TCP/5432     : unreachable")
+        log.line(f"Updated handoff state       : {fence_file}")
+        log.line()
+        log.line(
+            "THIS TOOL DOES NOT CREATE SURVIVOR SLOTS, REPARENT STANDBYS, "
+            "CHANGE DNS, OR RESUME WORKERS."
+        )
+        log.line(f"Log: {log.path}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

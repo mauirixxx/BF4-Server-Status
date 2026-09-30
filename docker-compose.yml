@@ -1,7 +1,7 @@
 services:
   bf4-server-watcher:
     build: .
-    image: bf4-server-watcher:3.0.1
+    image: bf4-server-watcher:3.1.0
     container_name: BF4_ServerWatcher
     restart: unless-stopped
     stop_grace_period: 30s
@@ -14,7 +14,3 @@ services:
       - ./:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
-      - "rnt-01:192.168.200.47"
-      - "hnl-01:192.168.5.70"
-      - "mak-01:192.168.10.70"
-      - "kah-01:192.168.21.70"
