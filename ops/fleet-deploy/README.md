@@ -12,18 +12,9 @@ Use FQDNs for fleet infrastructure access; do not rely on short hostnames.
 
 ## Production fleet
 
-The eight workers are:
+Current membership is defined by `fleet-inventory.txt`. Fleet size is not fixed; add or remove FQDN entries as workers enter or leave production. Runtime roles and Discord leadership are intentionally not encoded in the inventory.
 
-- `mak-01.bf4statusbot.com`
-- `mak-02.bf4statusbot.com`
-- `mak-03.bf4statusbot.com`
-- `mak-04.bf4statusbot.com`
-- `hnl-01.bf4statusbot.com`
-- `hnl-02.bf4statusbot.com`
-- `kah-01.bf4statusbot.com`
-- `rnt-01.bf4statusbot.com`
-
-`mak-01` is the orchestration host. The seven other workers use the forced-command SSH path. The local `mak-01` deployment can invoke the same wrapper by setting `SSH_ORIGINAL_COMMAND` directly.
+`mak-01.bf4statusbot.com` is currently the orchestration host. Remote workers use the forced-command SSH path. A local `mak-01` deployment can invoke the same wrapper by setting `SSH_ORIGINAL_COMMAND` directly.
 
 ## Generalized release deployer
 
@@ -56,7 +47,7 @@ If replacement, container recreation, or post-start validation fails after the w
 7. Require `DEPLOYMENT PASS`, the expected image, a running container, and an unchanged `.env` fingerprint.
 8. Resume the canary and verify `/operator status` before continuing serially through the fleet.
 9. Move Discord leadership deliberately before deploying the current leader.
-10. Upgrade the former leader last, resume all workers, and verify the eight-node cluster has rebalanced.
+10. Upgrade the former leader last, resume all workers, and verify the current inventory has rebalanced.
 
 The first production v3.1.1 rollout used `mak-02` as the official-release canary, moved Discord leadership from `mak-01` to `mak-02`, upgraded `mak-01` last, and then resumed the fleet.
 
