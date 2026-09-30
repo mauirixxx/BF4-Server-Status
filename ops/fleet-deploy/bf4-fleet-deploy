@@ -17,6 +17,9 @@ release_metadata()
         3.1.2)
             printf '%s\n' '3.1.2|BF4_Server_Watcher_v3.1.2.zip|8110b825a8ea41b158e0cc3849de00d6c1b336e760a6c663082995510d463a0a'
             ;;
+        3.1.3)
+            printf '%s\n' '3.1.3|BF4_Server_Watcher_v3.1.3.zip|8bdc9053925c127a01c28736b87ba0a6be75bffd844a041c820e31e4b889e2d4'
+            ;;
         *)
             return 1
             ;;
@@ -309,6 +312,7 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
     approved-releases)
         echo 'v3.1.1'
         echo 'v3.1.2'
+        echo 'v3.1.3'
         ;;
     deploy-v*)
         VERSION="${SSH_ORIGINAL_COMMAND#deploy-v}"

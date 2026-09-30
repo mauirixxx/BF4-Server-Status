@@ -4,6 +4,14 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.1.3] - 2026-09-30
+
+- Added command-audit coverage for all leaf `/operator ...` commands.
+- Reused the existing authoritative database `CommandAudit` path and v3.1.2 best-effort Discord `/logschannel` mirror instead of introducing a second logging subsystem.
+- Added failure audit results for authorization denials, uncaught operator command errors, handled worker/destination errors, and failed destination tests.
+- Added operator audit target metadata for worker, destination, channel, and user arguments when available.
+- No database migration is required from v3.1.2.
+
 ## [v3.1.2] - 2026-09-30
 
 - Added `/logschannel add|remove` for optional per-guild Discord mirroring of the existing database command audit.
