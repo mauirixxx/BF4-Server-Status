@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample BF4 population every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+Persistent=true
+AccuracySec=10s
+Unit=bf4-status-dashboard-sampler.service
+
+[Install]
+WantedBy=timers.target
