@@ -3789,7 +3789,13 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         old_channel = state.announcement_channel_id if state else None
         old_message = state.announcement_message_id if state else None
     if old_channel and old_message:
-        await delete_discord_message(guild_id, old_channel, old_message)
+        old_deleted = await delete_discord_message(guild_id, old_channel, old_message)
+        if not old_deleted:
+            log.warning(
+                "Announcement replacement deferred because previous message cleanup failed guild=%s server=%s channel=%s message=%s",
+                guild_id, gs.server_guid, old_channel, old_message,
+            )
+            return None
 
     try:
         role_line, role_id = active_map_role_line(
