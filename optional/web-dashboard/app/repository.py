@@ -133,10 +133,12 @@ def get_database_facts():
         with db_connection() as conn:
             row=conn.execute("""SELECT pg_database_size(current_database()) AS size_bytes, d.xact_commit+d.xact_rollback AS transactions, d.stats_reset FROM pg_stat_database d WHERE d.datname=current_database()""").fetchone()
         if not row: return {"available":False}
-        size=int(row["size_bytes"] or 0); tx=int(row["transactions"] or 0); reset=row.get("stats_reset"); per_day=None
+        size=int(row["size_bytes"] or 0); tx=int(row["transactions"] or 0); reset=row.get("stats_reset")
+        per_day=per_hour=per_minute=None
         if reset:
-            days=max((datetime.now(timezone.utc)-reset).total_seconds()/86400,1/86400)
-            per_day=round(tx/days)
-        return {"available":True,"size_bytes":size,"size_text":f"{size/(1024**3):.2f} GiB" if size>=1024**3 else f"{size/(1024**2):.1f} MiB","transactions":tx,"transactions_per_day":per_day,"stats_reset":reset}
+            elapsed_seconds=max((datetime.now(timezone.utc)-reset).total_seconds(),1)
+            per_second=tx/elapsed_seconds
+            per_day=round(per_second*86400); per_hour=round(per_second*3600); per_minute=round(per_second*60)
+        return {"available":True,"size_bytes":size,"size_text":f"{size/(1024**3):.2f} GiB" if size>=1024**3 else f"{size/(1024**2):.1f} MiB","transactions":tx,"transactions_per_day":per_day,"transactions_per_hour":per_hour,"transactions_per_minute":per_minute,"stats_reset":reset}
     except Exception as exc:
         logger.info("Database facts unavailable: %s",type(exc).__name__); return {"available":False}
