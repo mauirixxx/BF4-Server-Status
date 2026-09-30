@@ -9447,15 +9447,67 @@ async def prepare_operator(interaction: discord.Interaction) -> bool:
     # work. Discord interaction tokens have a short initial response window;
     # deferring first prevents a temporarily busy leader event loop or slow DB
     # lookup from turning a successful operator action into error 10062.
+    interaction.extras.setdefault("operator_audit_started", time.perf_counter())
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
     if not await asyncio.to_thread(is_operator, interaction.user.id):
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "unauthorized"
         await interaction.followup.send(
             "⛔ Cluster operator authorization required.",
             ephemeral=True,
         )
         return False
     return True
+
+
+def _operator_audit_target(interaction: discord.Interaction):
+    """Return a useful target tuple for operator command audit rows."""
+    namespace = getattr(interaction, "namespace", None)
+    if namespace is None:
+        return None, None, None
+    worker_id = getattr(namespace, "worker_id", None)
+    if worker_id:
+        return "worker", worker_id, worker_id
+    destination_id = getattr(namespace, "destination_id", None)
+    if destination_id is not None:
+        return "destination", destination_id, str(destination_id)
+    channel = getattr(namespace, "channel", None)
+    if channel is not None:
+        return "channel", getattr(channel, "id", None), getattr(channel, "name", str(channel))
+    user = getattr(namespace, "user", None)
+    if user is not None:
+        return "user", getattr(user, "id", None), str(user)
+    return None, None, None
+
+
+def audit_operator_interaction(
+    interaction: discord.Interaction,
+    *,
+    success: bool,
+    result_code: str,
+    error=None,
+):
+    command = getattr(interaction, "command", None)
+    qualified_name = getattr(command, "qualified_name", "") or ""
+    if not (qualified_name == "operator" or qualified_name.startswith("operator ")):
+        return
+    started = interaction.extras.get("operator_audit_started", time.perf_counter())
+    target_type, target_id, target_name = _operator_audit_target(interaction)
+    audit_command(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        user=interaction.user,
+        command_name=qualified_name,
+        command_type="slash",
+        success=success,
+        started=started,
+        result_code=result_code,
+        error=error,
+        target_type=target_type,
+        target_id=target_id,
+        target_name=target_name,
+    )
 
 operator_group=app_commands.Group(name="operator",description="Cluster operator controls")
 operator_destinations=app_commands.Group(name="destinations",description="Operator notification destinations",parent=operator_group)
@@ -9538,6 +9590,8 @@ async def operator_worker_drain(interaction:discord.Interaction,worker_id:str):
             await interaction.followup.send(f"ℹ️ `{worker_id}` is already draining.",ephemeral=True); return
         row=await asyncio.to_thread(set_worker_draining,worker_id,True,f"discord:{interaction.user.id}")
     except (ValueError,RuntimeError) as exc:
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "failed"
         await interaction.followup.send(f"⚠️ {exc}",ephemeral=True); return
     await interaction.followup.send(
         f"🟡 `{row.worker_id}` is now **draining**. It remains online/heartbeating but is excluded from new Keeper assignments and Discord leadership. "
@@ -9556,6 +9610,8 @@ async def operator_worker_resume(interaction:discord.Interaction,worker_id:str):
             await interaction.followup.send(f"ℹ️ `{worker_id}` is not draining.",ephemeral=True); return
         row=await asyncio.to_thread(set_worker_draining,worker_id,False,f"discord:{interaction.user.id}")
     except (ValueError,RuntimeError) as exc:
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "failed"
         await interaction.followup.send(f"⚠️ {exc}",ephemeral=True); return
     await interaction.followup.send(
         f"🟢 `{row.worker_id}` is no longer draining and may rejoin eligible Keeper/Discord roles on the next control-plane cycle.",
@@ -9590,21 +9646,30 @@ async def operator_add_channel(interaction:discord.Interaction,channel:discord.T
 async def operator_dest_enable(interaction:discord.Interaction,destination_id:int):
     if not await prepare_operator(interaction): return
     try: await asyncio.to_thread(set_destination_enabled,destination_id,True); msg="✅ Destination enabled."
-    except ValueError as e: msg=f"⚠️ {e}"
+    except ValueError as e:
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "failed"
+        msg=f"⚠️ {e}"
     await interaction.followup.send(msg,ephemeral=True)
 
 @operator_destinations.command(name="disable",description="Disable an operator destination")
 async def operator_dest_disable(interaction:discord.Interaction,destination_id:int):
     if not await prepare_operator(interaction): return
     try: await asyncio.to_thread(set_destination_enabled,destination_id,False); msg="✅ Destination disabled."
-    except ValueError as e: msg=f"⚠️ {e}"
+    except ValueError as e:
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "failed"
+        msg=f"⚠️ {e}"
     await interaction.followup.send(msg,ephemeral=True)
 
 @operator_destinations.command(name="remove",description="Remove an operator destination")
 async def operator_dest_remove(interaction:discord.Interaction,destination_id:int):
     if not await prepare_operator(interaction): return
     try: await asyncio.to_thread(remove_destination,destination_id); msg="✅ Destination removed."
-    except ValueError as e: msg=f"⚠️ {e}"
+    except ValueError as e:
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "failed"
+        msg=f"⚠️ {e}"
     await interaction.followup.send(msg,ephemeral=True)
 
 async def _send_operator_test(d):
@@ -9623,6 +9688,9 @@ async def operator_dest_test(interaction:discord.Interaction,destination_id:int|
     for d in dests:
         try: await _send_operator_test(d); results.append(f"🟢 {_destination_label(d)} — delivered")
         except Exception as e: results.append(f"🔴 {_destination_label(d)} — {type(e).__name__}")
+    if any(result.startswith("🔴") for result in results):
+        interaction.extras["operator_audit_success"] = False
+        interaction.extras["operator_audit_result"] = "delivery_failed"
     await interaction.followup.send("**Operator destination test complete**\n"+("\n".join(results) if results else "No matching destinations."),ephemeral=True)
 
 async def operator_destination_autocomplete(interaction:discord.Interaction,current:int):
@@ -9999,11 +10067,41 @@ async def on_message(message: discord.Message):
             pass
 
 
+@client.event
+async def on_app_command_completion(
+    interaction: discord.Interaction,
+    command: app_commands.Command | app_commands.ContextMenu,
+):
+    qualified_name = getattr(command, "qualified_name", "") or ""
+    if not (qualified_name == "operator" or qualified_name.startswith("operator ")):
+        return
+    success = bool(interaction.extras.get("operator_audit_success", True))
+    result_code = str(
+        interaction.extras.get(
+            "operator_audit_result",
+            "ok" if success else "failed",
+        )
+    )
+    audit_operator_interaction(
+        interaction,
+        success=success,
+        result_code=result_code,
+    )
+
+
 @tree.error
 async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ):
+    qualified_name = getattr(getattr(interaction, "command", None), "qualified_name", "") or ""
+    if qualified_name == "operator" or qualified_name.startswith("operator "):
+        audit_operator_interaction(
+            interaction,
+            success=False,
+            result_code="failed",
+            error=error,
+        )
     log.error(
         "Slash command error guild=%s channel=%s user=%s command=%s error=%s message=%r",
         getattr(interaction.guild, "id", None),
