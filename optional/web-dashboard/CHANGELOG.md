@@ -1,5 +1,12 @@
 # BF4 Status Web Dashboard changelog
 
+## v0.5.6.1
+
+- Restored platform-specific population legend colors: PC orange, Xbox green, PlayStation blue, and Total yellow.
+- Restored semantic Cluster Health summary colors for healthy, warning, stale, draining, worker, and lease states.
+- Normalized the dashboard VERSION value to `0.5.6.1` so static assets receive a fresh cache-busting version after the presentation fix.
+- PostgreSQL infrastructure tables retain the v0.5.6 Online/Offline and PRIMARY/Replica presentation.
+
 ## v0.5.6
 
 - Moved Population History to the top of the dashboard as the primary visual.
