@@ -15,7 +15,7 @@ release_metadata()
             printf '%s\n' '3.1.1|BF4_Server_Watcher_v3.1.1.zip|fd779e4423c1275cee0a7552c57ed9a5e5137d321f5600579b9e21157a53c9bf'
             ;;
         3.1.2)
-            printf '%s\n' '3.1.2|BF4_Server_Watcher_v3.1.2.zip|ecb0f73217c16bff5b2639c83c1218ae88a680516fa15161fc1d5ddc8319c95c'
+            printf '%s\n' '3.1.2|BF4_Server_Watcher_v3.1.2.zip|8110b825a8ea41b158e0cc3849de00d6c1b336e760a6c663082995510d463a0a'
             ;;
         *)
             return 1
