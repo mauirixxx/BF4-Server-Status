@@ -1,0 +1,301 @@
+#!/bin/bash
+set -euo pipefail
+
+DOCKER=/usr/bin/docker
+APP=/opt/bf4-serverwatcher
+CONTAINER=BF4_ServerWatcher_Agent
+
+VERSION="3.1.1"
+IMAGE="bf4-server-watcher:${VERSION}"
+
+ASSET="BF4_Server_Watcher_v3.1.1.zip"
+EXPECTED_SHA="fd779e4423c1275cee0a7552c57ed9a5e5137d321f5600579b9e21157a53c9bf"
+
+URL="https://github.com/mauirixxx/BF4-Server-Status/releases/download/v3.1.1/${ASSET}"
+
+deploy_v311()
+{
+    WORK="$(mktemp -d /tmp/bf4-v311-deploy.XXXXXX)"
+    ZIP="${WORK}/${ASSET}"
+    STAGE="${WORK}/stage"
+    ENV_BACKUP="${WORK}/.env"
+
+    cleanup()
+    {
+        rm -rf "$WORK"
+    }
+    trap cleanup EXIT
+
+    echo "============================================================"
+    echo " BF4 SERVER WATCHER v3.1.1 DEPLOYMENT"
+    echo "============================================================"
+    echo "host=$(hostname)"
+    echo
+
+    #
+    # Preconditions
+    #
+    test -d "$APP" || {
+        echo "FAIL: $APP does not exist"
+        return 20
+    }
+
+    test -f "$APP/.env" || {
+        echo "FAIL: $APP/.env does not exist"
+        return 21
+    }
+
+    command -v curl >/dev/null
+    command -v unzip >/dev/null
+
+    BEFORE_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+    cp -a "$APP/.env" "$ENV_BACKUP"
+
+    echo "current_container:"
+    "$DOCKER" inspect \
+        --format='image={{.Config.Image}} status={{.State.Status}} running={{.State.Running}}' \
+        "$CONTAINER"
+
+    echo "env_before=${BEFORE_ENV}"
+
+    #
+    # Download and authenticate the public GitHub Release BEFORE stopping
+    # the existing worker.
+    #
+    echo
+    echo "Downloading official v3.1.1 release..."
+
+    curl \
+        --fail \
+        --location \
+        --silent \
+        --show-error \
+        --output "$ZIP" \
+        "$URL"
+
+    ACTUAL_SHA="$(sha256sum "$ZIP" | awk '{print $1}')"
+
+    echo "release_sha256=${ACTUAL_SHA}"
+
+    if test "$ACTUAL_SHA" != "$EXPECTED_SHA"; then
+        echo "FAIL: release SHA256 mismatch"
+        return 30
+    fi
+
+    echo "release checksum: PASS"
+
+    #
+    # Validate ZIP before write boundary.
+    #
+    if unzip -Z1 "$ZIP" |
+        grep -Eq '(^|/)(\.env$|__pycache__/|.*\.(pyc|pyo)$|\.git/)'
+    then
+        echo "FAIL: release contains forbidden mutable/cache content"
+        return 31
+    fi
+
+    mkdir "$STAGE"
+    unzip -q "$ZIP" -d "$STAGE"
+
+    test -f "$STAGE/Dockerfile" || {
+        echo "FAIL: Dockerfile missing from release"
+        return 32
+    }
+
+    test -f "$STAGE/docker-compose.worker-agent.yml" || {
+        echo "FAIL: worker-agent compose file missing"
+        return 33
+    }
+
+    test -f "$STAGE/serverwatcher.py" || {
+        echo "FAIL: serverwatcher.py missing"
+        return 34
+    }
+
+    grep -q 'BOT_VERSION = "v3.1.1"' "$STAGE/serverwatcher.py" || {
+        echo "FAIL: release does not identify as v3.1.1"
+        return 35
+    }
+
+    echo "release contents: PASS"
+
+    #
+    # WRITE BOUNDARY
+    #
+    echo
+    echo "========== WRITE BOUNDARY =========="
+    echo "Stopping ${CONTAINER}..."
+
+    "$DOCKER" stop "$CONTAINER"
+
+    #
+    # Replace application tree, preserving the node-local .env.
+    #
+    find "$APP" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        ! -name '.env' \
+        -exec rm -rf -- {} +
+
+    cp -a "$STAGE"/. "$APP"/
+    cp -a "$ENV_BACKUP" "$APP/.env"
+
+    AFTER_COPY_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+
+    if test "$AFTER_COPY_ENV" != "$BEFORE_ENV"; then
+        echo "FAIL: .env changed during release replacement"
+        return 40
+    fi
+
+    echo ".env preservation after extraction: PASS"
+
+    #
+    # Build the immutable release image locally.
+    #
+    echo
+    echo "Building ${IMAGE}..."
+
+    "$DOCKER" build \
+        --pull \
+        --tag "$IMAGE" \
+        "$APP"
+
+    echo "image build: PASS"
+
+    #
+    # Remove old stopped container. Compose will recreate it from the
+    # existing node-local .env and v3.1.1 worker-agent definition.
+    #
+    "$DOCKER" rm "$CONTAINER"
+
+    echo
+    echo "Starting v3.1.1 worker..."
+
+    cd "$APP"
+
+    "$DOCKER" compose \
+        -f docker-compose.yml \
+        -f docker-compose.worker-agent.yml \
+        up -d bf4-worker-agent
+
+    #
+    # Basic startup stabilization.
+    #
+    sleep 12
+
+    RUNNING="$(
+        "$DOCKER" inspect \
+            --format='{{.State.Running}}' \
+            "$CONTAINER"
+    )"
+
+    RUN_IMAGE="$(
+        "$DOCKER" inspect \
+            --format='{{.Config.Image}}' \
+            "$CONTAINER"
+    )"
+
+    FINAL_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+
+    echo
+    echo "========== VALIDATION =========="
+    echo "running=${RUNNING}"
+    echo "image=${RUN_IMAGE}"
+    echo "env_after=${FINAL_ENV}"
+
+    if test "$RUNNING" != "true"; then
+        echo "FAIL: v3.1.1 container is not running"
+        "$DOCKER" logs --tail 100 "$CONTAINER" || true
+        return 50
+    fi
+
+    if test "$RUN_IMAGE" != "$IMAGE"; then
+        echo "FAIL: unexpected deployed image: ${RUN_IMAGE}"
+        return 51
+    fi
+
+    if test "$FINAL_ENV" != "$BEFORE_ENV"; then
+        echo "FAIL: .env fingerprint changed"
+        return 52
+    fi
+
+    echo
+    echo "recent startup log:"
+    "$DOCKER" logs --tail 80 "$CONTAINER" 2>&1
+
+    echo
+    echo "============================================================"
+    echo " DEPLOYMENT PASS"
+    echo " host=$(hostname)"
+    echo " image=${IMAGE}"
+    echo " env=UNCHANGED"
+    echo "============================================================"
+}
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+    probe)
+        echo "host=$(hostname)"
+        echo "app_dir=$(test -d "$APP" && echo yes || echo no)"
+        echo "env=$(test -f "$APP/.env" && echo yes || echo no)"
+
+        "$DOCKER" inspect \
+            --format='image={{.Config.Image}} status={{.State.Status}} running={{.State.Running}}' \
+            "$CONTAINER"
+        ;;
+
+    env-sha256)
+        test -f "$APP/.env"
+        sha256sum "$APP/.env" | awk '{print $1}'
+        ;;
+
+    container-health)
+        "$DOCKER" inspect \
+            --format='image={{.Config.Image}} status={{.State.Status}} running={{.State.Running}} started={{.State.StartedAt}} exit={{.State.ExitCode}}' \
+            "$CONTAINER"
+        ;;
+
+    container-command)
+        "$DOCKER" inspect \
+            --format='entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}' \
+            "$CONTAINER"
+        ;;
+
+    container-policy)
+        "$DOCKER" inspect \
+            --format='restart={{.HostConfig.RestartPolicy.Name}} network={{.HostConfig.NetworkMode}}' \
+            "$CONTAINER"
+        ;;
+
+    container-mounts)
+        "$DOCKER" inspect \
+            --format='{{json .Mounts}}' \
+            "$CONTAINER"
+        ;;
+
+    compose-files)
+        cd "$APP"
+
+        for FILE in \
+            docker-compose.yml \
+            docker-compose.yaml \
+            compose.yml \
+            compose.yaml \
+            docker-compose.worker-agent.yml
+        do
+            test -f "$FILE" && echo "$FILE"
+        done
+        ;;
+
+    container-logs)
+        exec "$DOCKER" logs --tail 250 "$CONTAINER"
+        ;;
+
+    deploy-v3.1.1)
+        deploy_v311
+        ;;
+
+    *)
+        echo "DENIED: unsupported BF4 fleet deployment operation" >&2
+        exit 64
+        ;;
+esac
