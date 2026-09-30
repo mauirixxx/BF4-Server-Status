@@ -58,7 +58,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.1.0"
+BOT_VERSION = "v3.1.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -3749,13 +3749,16 @@ async def delete_discord_message(guild_id, channel_id, message_id):
         return False
 
 
-def active_map_role_line(guild_id: int, map_key: str | None):
+def active_map_role_line(guild_id: int, map_key: str | None, player_count: int = 0):
     """Return the configured role mention/message for this guild/map, if enabled."""
     if not map_key:
         return None, None
     with SessionLocal() as session:
         ping = session.get(GuildMapRolePing, (guild_id, map_key))
         if not ping or not ping.role_id:
+            return None, None
+        # A threshold of X means suppress the ping at X players or fewer.
+        if int(player_count or 0) <= int(ping.min_players or 0):
             return None, None
         return f"<@&{ping.role_id}> {ping.message}", int(ping.role_id)
 
@@ -3786,12 +3789,19 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         old_channel = state.announcement_channel_id if state else None
         old_message = state.announcement_message_id if state else None
     if old_channel and old_message:
-        await delete_discord_message(guild_id, old_channel, old_message)
+        old_deleted = await delete_discord_message(guild_id, old_channel, old_message)
+        if not old_deleted:
+            log.warning(
+                "Announcement replacement deferred because previous message cleanup failed guild=%s server=%s channel=%s message=%s",
+                guild_id, gs.server_guid, old_channel, old_message,
+            )
+            return None
 
     try:
         role_line, role_id = active_map_role_line(
             guild_id,
             status.get("map_key"),
+            int(status.get("players") or 0),
         )
         sent = await channel.send(
             build_map_announcement(
@@ -3973,8 +3983,10 @@ def player_message_rows(guild_id: int, server_guid: str | None = None):
 
 
 async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, int]:
+    """Delete tracked roster messages without forgetting transient failures."""
     deleted = 0
     failed = 0
+    confirmed_gone = []
     for row in rows:
         channel = guild.get_channel(int(row["channel_id"]))
         if channel is None:
@@ -3991,12 +4003,14 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
             message = await channel.fetch_message(int(row["message_id"]))
             await message.delete()
             deleted += 1
+            confirmed_gone.append(row)
             log.debug(
                 "Deleted player display message guild=%s server=%s channel=%s message=%s chunk=%s",
                 guild.id, row["server_guid"], channel.id, row["message_id"], row["chunk_index"],
             )
         except discord.NotFound:
             deleted += 1
+            confirmed_gone.append(row)
         except discord.Forbidden:
             failed += 1
             log.warning(
@@ -4009,6 +4023,17 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
                 "Player display message delete failed guild=%s server=%s channel=%s message=%s error=%s message_text=%r",
                 guild.id, row["server_guid"], channel.id, row["message_id"], type(exc).__name__, str(exc),
             )
+    if confirmed_gone:
+        with SessionLocal.begin() as session:
+            for row in confirmed_gone:
+                session.execute(
+                    delete(GuildServerPlayerMessage).where(
+                        GuildServerPlayerMessage.guild_id == int(row["guild_id"]),
+                        GuildServerPlayerMessage.server_guid == row["server_guid"],
+                        GuildServerPlayerMessage.chunk_index == int(row["chunk_index"]),
+                        GuildServerPlayerMessage.message_id == int(row["message_id"]),
+                    )
+                )
     return deleted, failed
 
 
@@ -4018,13 +4043,8 @@ async def clear_persistent_player_display(
 ) -> tuple[int, int]:
     rows = player_message_rows(guild.id, server_guid)
     deleted, failed = await delete_player_message_rows(guild, rows)
-    with SessionLocal.begin() as session:
-        stmt = delete(GuildServerPlayerMessage).where(
-            GuildServerPlayerMessage.guild_id == guild.id
-        )
-        if server_guid is not None:
-            stmt = stmt.where(GuildServerPlayerMessage.server_guid == server_guid)
-        session.execute(stmt)
+    # delete_player_message_rows removes DB tracking only for messages proven
+    # deleted/already absent. Failed/unresolved rows stay durable for retry.
     if rows:
         log.info(
             "Player display cleared guild=%s server=%s rows=%s deleted=%s failed=%s",
@@ -4056,20 +4076,33 @@ async def clear_persistent_player_eta(guild: discord.Guild, server_guid: str) ->
                     "Player ETA delete failed guild=%s server=%s channel=%s message=%s error=%s",
                     guild.id, server_guid, channel_id, message_id, type(exc).__name__,
                 )
-    with SessionLocal.begin() as session:
-        state = session.get(GuildServerState, (guild.id, server_guid))
-        if state:
-            state.player_eta_channel_id = None
-            state.player_eta_channel_name = None
-            state.player_eta_message_id = None
+    if deleted:
+        with SessionLocal.begin() as session:
+            state = session.get(GuildServerState, (guild.id, server_guid))
+            if state:
+                state.player_eta_channel_id = None
+                state.player_eta_channel_name = None
+                state.player_eta_message_id = None
+    elif failed and message_id:
+        log.warning(
+            "Player ETA tracking retained for retry guild=%s server=%s channel=%s message=%s",
+            guild.id, server_guid, channel_id, message_id,
+        )
     return deleted, failed
 
 
-async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) -> None:
-    """Remove ETA and roster so a map-change announcement can be posted first."""
-    await clear_persistent_player_eta(guild, server_guid)
-    await clear_persistent_player_display(guild, server_guid)
+async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) -> tuple[int, int]:
+    """Remove ETA/roster, retaining failed Discord deletions for later retry."""
+    eta_deleted, eta_failed = await clear_persistent_player_eta(guild, server_guid)
+    roster_deleted, roster_failed = await clear_persistent_player_display(guild, server_guid)
     PLAYER_DISPLAY_VALIDATED.discard((guild.id, server_guid))
+    failed = eta_failed + roster_failed
+    if failed:
+        log.warning(
+            "Player stack cleanup incomplete; tracking retained guild=%s server=%s failed=%s",
+            guild.id, server_guid, failed,
+        )
+    return eta_deleted + roster_deleted, failed
 
 
 async def player_display_messages_exist(guild: discord.Guild, rows) -> bool:
@@ -4115,11 +4148,17 @@ async def upsert_player_eta(
             pass
         except Exception as exc:
             log.warning(
-                "Player ETA edit failed guild=%s server=%s message=%s error=%s message_text=%r",
+                "Player ETA edit failed; tracking retained for retry guild=%s server=%s message=%s error=%s message_text=%r",
                 guild.id, gs.server_guid, old_message_id, type(exc).__name__, str(exc),
             )
+            return "retry_pending"
     elif old_channel_id and old_message_id:
-        await delete_discord_message(guild.id, old_channel_id, old_message_id)
+        if not await delete_discord_message(guild.id, old_channel_id, old_message_id):
+            log.warning(
+                "Player ETA move deferred; old message tracking retained guild=%s server=%s channel=%s message=%s",
+                guild.id, gs.server_guid, old_channel_id, old_message_id,
+            )
+            return "retry_pending"
 
     message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
     with SessionLocal.begin() as session:
@@ -4170,8 +4209,18 @@ async def update_persistent_player_display(
     # already existed (for example the first v2.7.0 run), rebuild the roster so
     # Discord ordering remains announcement -> ETA -> roster.
     eta_result = await upsert_player_eta(guild, gs, channel, next_update_unix)
+    if eta_result == "retry_pending":
+        return {"result": "cleanup_pending", "posted": 0, "deleted": 0, "edited": 0, "failed": 1}
     if eta_result == "posted" and old_rows:
-        deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        deleted, cleanup_failed = await clear_persistent_player_display(guild, gs.server_guid)
+        if cleanup_failed:
+            return {
+                "result": "cleanup_pending",
+                "posted": 0,
+                "deleted": deleted,
+                "edited": 0,
+                "failed": cleanup_failed,
+            }
         old_rows = []
         PLAYER_DISPLAY_VALIDATED.discard(key)
     else:
@@ -4197,8 +4246,16 @@ async def update_persistent_player_display(
     # Reuse/edit existing chunks when they are valid in the target channel.
     existing_by_index = {int(row["chunk_index"]): row for row in old_rows if row["channel_id"] == channel.id}
     if old_rows and not await player_display_messages_exist(guild, old_rows):
-        extra_deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        extra_deleted, cleanup_failed = await clear_persistent_player_display(guild, gs.server_guid)
         deleted += extra_deleted
+        if cleanup_failed:
+            return {
+                "result": "cleanup_pending",
+                "posted": 0,
+                "deleted": deleted,
+                "edited": 0,
+                "failed": cleanup_failed,
+            }
         old_rows = []
         existing_by_index = {}
 
@@ -4218,8 +4275,13 @@ async def update_persistent_player_display(
 
         # Remove only excess old chunks when the roster shrinks.
         excess = [row for idx, row in existing_by_index.items() if idx >= len(rendered_chunks)]
-        extra_deleted, _ = await delete_player_message_rows(guild, excess)
+        extra_deleted, excess_failed = await delete_player_message_rows(guild, excess)
         deleted += extra_deleted
+        if excess_failed:
+            log.warning(
+                "Player display excess cleanup pending guild=%s server=%s failed=%s",
+                guild.id, gs.server_guid, excess_failed,
+            )
     except Exception as exc:
         log.error(
             "Player display in-place update failed guild=%s server=%s posted=%s edited=%s error=%s message=%r",
@@ -4228,26 +4290,29 @@ async def update_persistent_player_display(
         return {"result": "update_failed", "posted": posted, "deleted": deleted, "edited": edited}
 
     with SessionLocal.begin() as session:
-        session.execute(
-            delete(GuildServerPlayerMessage).where(
-                GuildServerPlayerMessage.guild_id == guild.id,
-                GuildServerPlayerMessage.server_guid == gs.server_guid,
-            )
-        )
+        # Upsert current chunks instead of deleting every tracking row. Any
+        # excess row whose Discord deletion failed must survive for retry.
         for chunk_index, message in authoritative:
-            session.add(
-                GuildServerPlayerMessage(
+            row = session.get(
+                GuildServerPlayerMessage,
+                (guild.id, gs.server_guid, chunk_index),
+            )
+            if row is None:
+                row = GuildServerPlayerMessage(
                     guild_id=guild.id,
-                    guild_name=guild.name,
                     server_guid=gs.server_guid,
-                    server_name=gs.display_name,
                     chunk_index=chunk_index,
                     channel_id=channel.id,
-                    channel_name=channel.name,
                     message_id=message.id,
                     content_hash=content_hash,
                 )
-            )
+                session.add(row)
+            row.guild_name = guild.name
+            row.server_name = gs.display_name
+            row.channel_id = channel.id
+            row.channel_name = channel.name
+            row.message_id = message.id
+            row.content_hash = content_hash
 
     PLAYER_DISPLAY_VALIDATED.add(key)
     log.debug(
@@ -6585,6 +6650,25 @@ async def default_add(
         return
 
     try:
+        # If this command is disabling an existing persistent player stack,
+        # prove the old Discord messages are gone before disabling the refresh
+        # path that would otherwise be responsible for retrying their cleanup.
+        with SessionLocal() as session:
+            existing_gs = session.get(GuildServer, (interaction.guild.id, server))
+            cleanup_existing_stack = bool(
+                existing_gs and existing_gs.include_users and not include_users
+            )
+        if cleanup_existing_stack:
+            _, cleanup_failed = await clear_persistent_player_stack(interaction.guild, server)
+            if cleanup_failed:
+                await interaction.followup.send(
+                    "⚠️ Include Users was not disabled because one or more tracked "
+                    "player-list messages could not be deleted. Tracking was retained; "
+                    "retry after Discord is reachable.",
+                    ephemeral=True,
+                )
+                return
+
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             bf = session.get(BF4Server, server)
@@ -6615,7 +6699,6 @@ async def default_add(
                     target_name=gs.display_name,
                 )
                 return
-            previous_include_users = bool(gs.include_users)
             gs.is_default = True
             gs.include_users = bool(include_users)
             gs.announcement_channel_id = selected_channel.id
@@ -6624,9 +6707,6 @@ async def default_add(
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
-
-        if previous_include_users and not include_users:
-            await clear_persistent_player_stack(interaction.guild, server)
 
         snapshot = (
             FRESH_SERVER_CACHE.get(server)
@@ -6772,6 +6852,9 @@ async def default_modify(
                 raise ValueError("default_server_not_found")
             old_channel_id = gs.announcement_channel_id
             old_channel_name = gs.announcement_channel_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            old_announcement_channel = state.announcement_channel_id if state else None
+            old_announcement_message = state.announcement_message_id if state else None
             display_name = gs.display_name
             include_users = bool(gs.include_users)
             platform = bf.platform
@@ -6814,8 +6897,29 @@ async def default_modify(
         )
 
         # Move the persistent stack using the same v2.7.0 ordering rules.
+        # Do not change routing until every tracked old-channel message is
+        # positively gone; otherwise a transient Discord failure can orphan it.
         if include_users:
-            await clear_persistent_player_stack(interaction.guild, server)
+            _, cleanup_failed = await clear_persistent_player_stack(interaction.guild, server)
+            if cleanup_failed:
+                await interaction.followup.send(
+                    "⚠️ Could not move this default server yet because one or more "
+                    "old player-list messages could not be deleted. Tracking was "
+                    "retained; retry the command after Discord is reachable.",
+                    ephemeral=True,
+                )
+                return
+        if old_announcement_channel and old_announcement_message:
+            if not await delete_discord_message(
+                interaction.guild.id, old_announcement_channel, old_announcement_message
+            ):
+                await interaction.followup.send(
+                    "⚠️ Could not move this default server yet because its old "
+                    "announcement could not be deleted. Tracking and routing were "
+                    "retained; retry the command.",
+                    ephemeral=True,
+                )
+                return
 
         with SessionLocal.begin() as session:
             live = session.get(GuildServer, (interaction.guild.id, server))
@@ -6919,30 +7023,42 @@ async def default_remove(interaction, server: str):
     if not await prepare_management(interaction):
         return
     try:
-        await clear_persistent_player_stack(interaction.guild, server)
-        old_channel = old_message = assigned_channel_id = None
-        with SessionLocal.begin() as session:
+        with SessionLocal() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
                 raise ValueError("server_not_found")
             assigned_channel_id = gs.announcement_channel_id
+            name = gs.display_name
+            state = session.get(GuildServerState, (interaction.guild.id, server))
+            old_channel = state.announcement_channel_id if state else None
+            old_message = state.announcement_message_id if state else None
+
+        _, stack_failed = await clear_persistent_player_stack(interaction.guild, server)
+        announcement_deleted = True
+        if old_channel and old_message:
+            announcement_deleted = await delete_discord_message(
+                interaction.guild.id, old_channel, old_message
+            )
+        if stack_failed or not announcement_deleted:
+            await interaction.followup.send(
+                "⚠️ Could not remove this default server yet because one or more "
+                "tracked Discord messages could not be deleted. Tracking and the "
+                "default-server configuration were retained; retry the command.",
+                ephemeral=True,
+            )
+            return
+
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
             gs.is_default = False
             gs.include_users = False
             gs.announcement_channel_id = None
             gs.announcement_channel_name = None
-            name = gs.display_name
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
-                old_channel = state.announcement_channel_id
-                old_message = state.announcement_message_id
                 session.delete(state)
-
-        if old_channel and old_message:
-            await delete_discord_message(
-                interaction.guild.id,
-                old_channel,
-                old_message,
-            )
         if not get_default_guild_servers(interaction.guild.id) and assigned_channel_id:
             channel = interaction.guild.get_channel(int(assigned_channel_id))
             if channel:
@@ -8686,6 +8802,7 @@ async def setstatusrole(interaction: discord.Interaction, role: discord.Role | N
     role="Discord role to ping",
     message="Optional custom map-live message",
     disable="Disable the map ping by setting role ID to 0",
+    min_players="Do not ping when the server has this many players or fewer (0-64)",
 )
 async def setmaprole(
     interaction: discord.Interaction,
@@ -8693,6 +8810,7 @@ async def setmaprole(
     role: discord.Role | None = None,
     message: str | None = None,
     disable: bool = False,
+    min_players: app_commands.Range[int, 0, 64] = 0,
 ):
     started = time.perf_counter()
     if not await prepare_management(interaction):
@@ -8739,6 +8857,7 @@ async def setmaprole(
                     role_id=role_id,
                     role_name=(role.name if role and role_id else None),
                     message=text,
+                    min_players=int(min_players),
                 )
             )
         else:
@@ -8747,12 +8866,16 @@ async def setmaprole(
             ping.role_id = role_id
             ping.role_name = role.name if role and role_id else None
             ping.message = text
+            ping.min_players = int(min_players)
 
     warning = map_role_self_service_warning(interaction.guild, role_id)
     if get_settings(interaction.guild.id).roles_channel_id:
         await reconcile_role_panel(interaction.guild)
 
-    response = f"✅ Map role updated for **{map_row.map_name}**."
+    response = (
+        f"✅ Map role updated for **{map_row.map_name}**. "
+        f"Role ping requires **more than {int(min_players)} players**."
+    )
     if warning:
         response += (
             f"\n⚠️ **Self-service warning:** {warning}. "
@@ -8776,13 +8899,26 @@ async def setmaprole(
 
 @setmaprole.autocomplete("map_search")
 async def setmaprole_autocomplete(interaction, current):
-    return await autocomplete_db_call("setmaprole.map_search", all_map_choices, current)
+    started = time.perf_counter()
+    log.info(
+        "Autocomplete received command=setmaprole option=map_search guild=%s channel=%s user=%s current=%r",
+        getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None),
+        getattr(interaction.user, "id", None), current,
+    )
+    choices = await autocomplete_db_call("setmaprole.map_search", all_map_choices, current)
+    log.info(
+        "Autocomplete completed command=setmaprole option=map_search guild=%s choices=%s elapsed_ms=%.1f",
+        getattr(interaction.guild, "id", None), len(choices),
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return choices
 
 
 class EditMapRoleModal(discord.ui.Modal):
-    def __init__(self, guild_id, map_key, map_name, role_id, current_message):
+    def __init__(self, guild_id, map_key, map_name, role_id, current_message, min_players=None):
         super().__init__(title=f"Edit map role — {map_name}"[:45])
         self.guild_id, self.map_key, self.map_name, self.role_id = guild_id, map_key, map_name, role_id
+        self.min_players = min_players
         self.message_input = discord.ui.TextInput(label="Map ping message", style=discord.TextStyle.paragraph, default=current_message[:4000], max_length=4000)
         self.add_item(self.message_input)
 
@@ -8822,6 +8958,8 @@ class EditMapRoleModal(discord.ui.Modal):
                         else None
                     )
                 ping.message = str(self.message_input.value).strip()
+                if self.min_players is not None:
+                    ping.min_players = int(self.min_players)
                 final_role_id = int(ping.role_id or 0)
 
             warning = (
@@ -8871,7 +9009,12 @@ class EditMapRoleModal(discord.ui.Modal):
 
 
 @tree.command(name="editmaprole", description="Edit an existing map-role ping")
-async def editmaprole(interaction: discord.Interaction, map_name: str, role: discord.Role | None = None):
+async def editmaprole(
+    interaction: discord.Interaction,
+    map_name: str,
+    role: discord.Role | None = None,
+    min_players: app_commands.Range[int, 0, 64] | None = None,
+):
     started = time.perf_counter()
     if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not can_manage(interaction.user) or not management_channel_allowed(interaction):
         await interaction.response.send_message("⛔ You cannot use that command here.", ephemeral=True)
@@ -8881,16 +9024,36 @@ async def editmaprole(interaction: discord.Interaction, map_name: str, role: dis
         await interaction.response.send_message("⚠️ Choose one configured map.", ephemeral=True)
         return
     ping, map_row = matches[0]
-    await interaction.response.send_modal(EditMapRoleModal(interaction.guild.id, map_row.map_key, map_row.map_name, role.id if role else None, ping.message))
+    await interaction.response.send_modal(
+        EditMapRoleModal(
+            interaction.guild.id,
+            map_row.map_key,
+            map_row.map_name,
+            role.id if role else None,
+            ping.message,
+            min_players=min_players,
+        )
+    )
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="editmaprole", command_type="slash", success=True, started=started, result_code="modal_opened", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
 
 
 @editmaprole.autocomplete("map_name")
 async def editmaprole_autocomplete(interaction, current):
+    started = time.perf_counter()
+    log.info(
+        "Autocomplete received command=editmaprole option=map_name guild=%s channel=%s user=%s current=%r",
+        getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None),
+        getattr(interaction.user, "id", None), current,
+    )
     if not interaction.guild:
         return []
     rows = await autocomplete_db_call("editmaprole.map_name", configured_map_matches, interaction.guild.id, current or "")
-    return [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
+    choices = [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
+    log.info(
+        "Autocomplete completed command=editmaprole option=map_name guild=%s choices=%s elapsed_ms=%.1f",
+        interaction.guild.id, len(choices), (time.perf_counter() - started) * 1000.0,
+    )
+    return choices
 
 
 @tree.command(name="delmaprole", description="Delete a configured map-role ping")

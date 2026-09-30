@@ -4,6 +4,14 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.1.1] - 2026-09-30
+
+- Added per-map minimum-player thresholds for Discord map-role mentions via `/setmaprole` and `/editmaprole`.
+- Added Alembic revision `0021_v3_1_1_map_role_min_players`.
+- Hardened persistent Discord message cleanup so failed deletions retain authoritative tracking and defer replacement instead of creating stale duplicates.
+- Fixed Discord leadership startup so the generation-fenced lease is renewed while READY/reconciliation/slash-command sync is still running.
+- Added autocomplete boundary diagnostics for map-role commands.
+
 ## [v3.1.0] - 2026-09-29
 
 ### Changed

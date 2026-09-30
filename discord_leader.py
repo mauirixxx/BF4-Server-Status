@@ -415,24 +415,104 @@ class DiscordLeadershipSupervisor:
 
         self.state = "LEADER_CONNECTING"
         self._discord_session_started = True
+        generation = self.generation
+        connect_task = asyncio.create_task(
+            self.connect_callback(generation),
+            name=f"discord-leader-connect-g{generation}",
+        )
+
+        # Discord READY initialization can legitimately take longer than one
+        # lease TTL (for example global slash-command sync). Keep renewing the
+        # generation-fenced lease while startup is in progress rather than
+        # treating the initial acquisition deadline as a startup timeout.
         try:
-            await asyncio.wait_for(
-                self.connect_callback(self.generation),
-                timeout=remaining,
-            )
+            while not connect_task.done():
+                remaining = self._remaining_authority_seconds()
+                if remaining <= 0:
+                    log.error(
+                        "Discord leader startup lost lease authority "
+                        "worker_id=%s generation=%s",
+                        self.worker_id, generation,
+                    )
+                    connect_task.cancel()
+                    await asyncio.gather(connect_task, return_exceptions=True)
+                    await self._release_authority(
+                        "discord_start_authority_expired"
+                    )
+                    return False
+
+                wait_seconds = min(
+                    float(self._lease_renew_seconds()),
+                    remaining,
+                )
+                done, _ = await asyncio.wait(
+                    {connect_task},
+                    timeout=max(0.01, wait_seconds),
+                )
+                if connect_task in done:
+                    break
+
+                remaining = self._remaining_authority_seconds()
+                if remaining <= 0:
+                    continue
+
+                ttl_seconds = self._lease_ttl_seconds()
+                request_started = time.monotonic()
+                renew_timeout = min(
+                    max(0.1, float(self.config.db_operation_timeout_seconds)),
+                    remaining,
+                )
+                try:
+                    renewed = await self._db_bounded(
+                        renew_lease,
+                        DISCORD_LEASE_KEY,
+                        self.worker_id,
+                        generation,
+                        ttl_seconds,
+                        timeout_seconds=renew_timeout,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Discord startup lease renewal failed worker_id=%s "
+                        "generation=%s authority_remaining_seconds=%.3f "
+                        "error=%s message=%r",
+                        self.worker_id, generation,
+                        self._remaining_authority_seconds(),
+                        type(exc).__name__, str(exc),
+                    )
+                    continue
+
+                if not renewed.acquired or renewed.generation != generation:
+                    log.error(
+                        "Discord startup lease authority lost worker_id=%s "
+                        "expected_generation=%s observed_generation=%s",
+                        self.worker_id, generation, renewed.generation,
+                    )
+                    connect_task.cancel()
+                    await asyncio.gather(connect_task, return_exceptions=True)
+                    await self._release_authority(
+                        "discord_start_authority_lost"
+                    )
+                    return False
+
+                self._set_authority(
+                    generation=renewed.generation,
+                    expires_at=renewed.expires_at,
+                    request_started_monotonic=request_started,
+                    ttl_seconds=ttl_seconds,
+                )
+                log.info(
+                    "Discord startup lease renewed worker_id=%s generation=%s "
+                    "authority_remaining_seconds=%.3f",
+                    self.worker_id, generation,
+                    self._remaining_authority_seconds(),
+                )
+
+            await connect_task
         except asyncio.CancelledError:
+            connect_task.cancel()
+            await asyncio.gather(connect_task, return_exceptions=True)
             raise
-        except asyncio.TimeoutError:
-            log.error(
-                "Discord leader startup exceeded authority window "
-                "worker_id=%s generation=%s",
-                self.worker_id,
-                self.generation,
-            )
-            await self._release_authority(
-                "discord_start_authority_expired"
-            )
-            return False
         except Exception as exc:
             log.error(
                 "Discord leader startup failed worker_id=%s generation=%s "
