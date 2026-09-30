@@ -1,0 +1,10 @@
+services:
+  bf4-status-dashboard:
+    build: .
+    image: bf4-status-dashboard:0.5.5-phase2
+    container_name: BF4_Status_Dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
