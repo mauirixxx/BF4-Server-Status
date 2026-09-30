@@ -36,7 +36,7 @@ echo "PASS: static trust-boundary checks"
 # Commands that do not need Docker can be exercised directly by setting the
 # same environment variable OpenSSH supplies to a forced command.
 APPROVED="$(SSH_ORIGINAL_COMMAND=approved-releases bash "$WRAPPER")"
-test "$APPROVED" = 'v3.1.1' || fail "unexpected approved release list: $APPROVED"
+test "$APPROVED" = $'v3.1.1\nv3.1.2' || fail "unexpected approved release list: $APPROVED"
 echo "PASS: approved release list"
 
 set +e
@@ -48,7 +48,7 @@ grep -Fq 'DENIED:' <<<"$OUT" || fail "arbitrary command was not denied"
 echo "PASS: arbitrary command denied"
 
 set +e
-OUT="$(SSH_ORIGINAL_COMMAND='deploy-v3.1.2' bash "$WRAPPER" 2>&1)"
+OUT="$(SSH_ORIGINAL_COMMAND='deploy-v3.1.3' bash "$WRAPPER" 2>&1)"
 RC=$?
 set -e
 test "$RC" -eq 64 || fail "unapproved release rc=$RC"
