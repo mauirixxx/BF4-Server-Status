@@ -3977,8 +3977,10 @@ def player_message_rows(guild_id: int, server_guid: str | None = None):
 
 
 async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, int]:
+    """Delete tracked roster messages without forgetting transient failures."""
     deleted = 0
     failed = 0
+    confirmed_gone = []
     for row in rows:
         channel = guild.get_channel(int(row["channel_id"]))
         if channel is None:
@@ -3995,12 +3997,14 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
             message = await channel.fetch_message(int(row["message_id"]))
             await message.delete()
             deleted += 1
+            confirmed_gone.append(row)
             log.debug(
                 "Deleted player display message guild=%s server=%s channel=%s message=%s chunk=%s",
                 guild.id, row["server_guid"], channel.id, row["message_id"], row["chunk_index"],
             )
         except discord.NotFound:
             deleted += 1
+            confirmed_gone.append(row)
         except discord.Forbidden:
             failed += 1
             log.warning(
@@ -4013,6 +4017,17 @@ async def delete_player_message_rows(guild: discord.Guild, rows) -> tuple[int, i
                 "Player display message delete failed guild=%s server=%s channel=%s message=%s error=%s message_text=%r",
                 guild.id, row["server_guid"], channel.id, row["message_id"], type(exc).__name__, str(exc),
             )
+    if confirmed_gone:
+        with SessionLocal.begin() as session:
+            for row in confirmed_gone:
+                session.execute(
+                    delete(GuildServerPlayerMessage).where(
+                        GuildServerPlayerMessage.guild_id == int(row["guild_id"]),
+                        GuildServerPlayerMessage.server_guid == row["server_guid"],
+                        GuildServerPlayerMessage.chunk_index == int(row["chunk_index"]),
+                        GuildServerPlayerMessage.message_id == int(row["message_id"]),
+                    )
+                )
     return deleted, failed
 
 
@@ -4022,13 +4037,8 @@ async def clear_persistent_player_display(
 ) -> tuple[int, int]:
     rows = player_message_rows(guild.id, server_guid)
     deleted, failed = await delete_player_message_rows(guild, rows)
-    with SessionLocal.begin() as session:
-        stmt = delete(GuildServerPlayerMessage).where(
-            GuildServerPlayerMessage.guild_id == guild.id
-        )
-        if server_guid is not None:
-            stmt = stmt.where(GuildServerPlayerMessage.server_guid == server_guid)
-        session.execute(stmt)
+    # delete_player_message_rows removes DB tracking only for messages proven
+    # deleted/already absent. Failed/unresolved rows stay durable for retry.
     if rows:
         log.info(
             "Player display cleared guild=%s server=%s rows=%s deleted=%s failed=%s",
@@ -4060,20 +4070,33 @@ async def clear_persistent_player_eta(guild: discord.Guild, server_guid: str) ->
                     "Player ETA delete failed guild=%s server=%s channel=%s message=%s error=%s",
                     guild.id, server_guid, channel_id, message_id, type(exc).__name__,
                 )
-    with SessionLocal.begin() as session:
-        state = session.get(GuildServerState, (guild.id, server_guid))
-        if state:
-            state.player_eta_channel_id = None
-            state.player_eta_channel_name = None
-            state.player_eta_message_id = None
+    if deleted:
+        with SessionLocal.begin() as session:
+            state = session.get(GuildServerState, (guild.id, server_guid))
+            if state:
+                state.player_eta_channel_id = None
+                state.player_eta_channel_name = None
+                state.player_eta_message_id = None
+    elif failed and message_id:
+        log.warning(
+            "Player ETA tracking retained for retry guild=%s server=%s channel=%s message=%s",
+            guild.id, server_guid, channel_id, message_id,
+        )
     return deleted, failed
 
 
-async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) -> None:
-    """Remove ETA and roster so a map-change announcement can be posted first."""
-    await clear_persistent_player_eta(guild, server_guid)
-    await clear_persistent_player_display(guild, server_guid)
+async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) -> tuple[int, int]:
+    """Remove ETA/roster, retaining failed Discord deletions for later retry."""
+    eta_deleted, eta_failed = await clear_persistent_player_eta(guild, server_guid)
+    roster_deleted, roster_failed = await clear_persistent_player_display(guild, server_guid)
     PLAYER_DISPLAY_VALIDATED.discard((guild.id, server_guid))
+    failed = eta_failed + roster_failed
+    if failed:
+        log.warning(
+            "Player stack cleanup incomplete; tracking retained guild=%s server=%s failed=%s",
+            guild.id, server_guid, failed,
+        )
+    return eta_deleted + roster_deleted, failed
 
 
 async def player_display_messages_exist(guild: discord.Guild, rows) -> bool:
@@ -4119,11 +4142,17 @@ async def upsert_player_eta(
             pass
         except Exception as exc:
             log.warning(
-                "Player ETA edit failed guild=%s server=%s message=%s error=%s message_text=%r",
+                "Player ETA edit failed; tracking retained for retry guild=%s server=%s message=%s error=%s message_text=%r",
                 guild.id, gs.server_guid, old_message_id, type(exc).__name__, str(exc),
             )
+            return "retry_pending"
     elif old_channel_id and old_message_id:
-        await delete_discord_message(guild.id, old_channel_id, old_message_id)
+        if not await delete_discord_message(guild.id, old_channel_id, old_message_id):
+            log.warning(
+                "Player ETA move deferred; old message tracking retained guild=%s server=%s channel=%s message=%s",
+                guild.id, gs.server_guid, old_channel_id, old_message_id,
+            )
+            return "retry_pending"
 
     message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
     with SessionLocal.begin() as session:
@@ -4174,8 +4203,18 @@ async def update_persistent_player_display(
     # already existed (for example the first v2.7.0 run), rebuild the roster so
     # Discord ordering remains announcement -> ETA -> roster.
     eta_result = await upsert_player_eta(guild, gs, channel, next_update_unix)
+    if eta_result == "retry_pending":
+        return {"result": "cleanup_pending", "posted": 0, "deleted": 0, "edited": 0, "failed": 1}
     if eta_result == "posted" and old_rows:
-        deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        deleted, cleanup_failed = await clear_persistent_player_display(guild, gs.server_guid)
+        if cleanup_failed:
+            return {
+                "result": "cleanup_pending",
+                "posted": 0,
+                "deleted": deleted,
+                "edited": 0,
+                "failed": cleanup_failed,
+            }
         old_rows = []
         PLAYER_DISPLAY_VALIDATED.discard(key)
     else:
@@ -4201,8 +4240,16 @@ async def update_persistent_player_display(
     # Reuse/edit existing chunks when they are valid in the target channel.
     existing_by_index = {int(row["chunk_index"]): row for row in old_rows if row["channel_id"] == channel.id}
     if old_rows and not await player_display_messages_exist(guild, old_rows):
-        extra_deleted, _ = await clear_persistent_player_display(guild, gs.server_guid)
+        extra_deleted, cleanup_failed = await clear_persistent_player_display(guild, gs.server_guid)
         deleted += extra_deleted
+        if cleanup_failed:
+            return {
+                "result": "cleanup_pending",
+                "posted": 0,
+                "deleted": deleted,
+                "edited": 0,
+                "failed": cleanup_failed,
+            }
         old_rows = []
         existing_by_index = {}
 
@@ -4222,8 +4269,13 @@ async def update_persistent_player_display(
 
         # Remove only excess old chunks when the roster shrinks.
         excess = [row for idx, row in existing_by_index.items() if idx >= len(rendered_chunks)]
-        extra_deleted, _ = await delete_player_message_rows(guild, excess)
+        extra_deleted, excess_failed = await delete_player_message_rows(guild, excess)
         deleted += extra_deleted
+        if excess_failed:
+            log.warning(
+                "Player display excess cleanup pending guild=%s server=%s failed=%s",
+                guild.id, gs.server_guid, excess_failed,
+            )
     except Exception as exc:
         log.error(
             "Player display in-place update failed guild=%s server=%s posted=%s edited=%s error=%s message=%r",
@@ -4232,26 +4284,29 @@ async def update_persistent_player_display(
         return {"result": "update_failed", "posted": posted, "deleted": deleted, "edited": edited}
 
     with SessionLocal.begin() as session:
-        session.execute(
-            delete(GuildServerPlayerMessage).where(
-                GuildServerPlayerMessage.guild_id == guild.id,
-                GuildServerPlayerMessage.server_guid == gs.server_guid,
-            )
-        )
+        # Upsert current chunks instead of deleting every tracking row. Any
+        # excess row whose Discord deletion failed must survive for retry.
         for chunk_index, message in authoritative:
-            session.add(
-                GuildServerPlayerMessage(
+            row = session.get(
+                GuildServerPlayerMessage,
+                (guild.id, gs.server_guid, chunk_index),
+            )
+            if row is None:
+                row = GuildServerPlayerMessage(
                     guild_id=guild.id,
-                    guild_name=guild.name,
                     server_guid=gs.server_guid,
-                    server_name=gs.display_name,
                     chunk_index=chunk_index,
                     channel_id=channel.id,
-                    channel_name=channel.name,
                     message_id=message.id,
                     content_hash=content_hash,
                 )
-            )
+                session.add(row)
+            row.guild_name = guild.name
+            row.server_name = gs.display_name
+            row.channel_id = channel.id
+            row.channel_name = channel.name
+            row.message_id = message.id
+            row.content_hash = content_hash
 
     PLAYER_DISPLAY_VALIDATED.add(key)
     log.debug(
