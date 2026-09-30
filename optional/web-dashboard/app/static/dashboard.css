@@ -14,3 +14,4 @@ main>.chart-card{margin-top:0}.chart-card .chart-wrap{height:430px}.chart-card+.
 .metric-stale{border-color:rgba(255,127,115,.35);background:linear-gradient(180deg,rgba(83,38,35,.32),rgba(14,20,26,.96))}.metric-stale .metric-icon,.metric-stale strong{color:#ff7f73}
 .metric-draining{border-color:rgba(255,122,26,.35);background:linear-gradient(180deg,rgba(84,47,20,.32),rgba(14,20,26,.96))}.metric-draining .metric-icon,.metric-draining strong{color:var(--orange)}
 .metric-leases{border-color:rgba(181,133,255,.35);background:linear-gradient(180deg,rgba(61,43,86,.32),rgba(14,20,26,.96))}.metric-leases .metric-icon,.metric-leases strong{color:#b585ff}
+.transaction-rate-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 6px}.transaction-rate-grid div{min-width:0}.transaction-rate-grid strong{font-size:1.15rem;margin:0}.transaction-rate-grid small{display:block;color:var(--muted);font-size:.68rem;margin-top:2px;white-space:nowrap}
