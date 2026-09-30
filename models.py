@@ -74,6 +74,17 @@ class GuildListenChannel(Base):
     channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
+class GuildLogChannel(Base):
+    __tablename__ = "guild_log_channels"
+    guild_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"),
+        primary_key=True, autoincrement=False
+    )
+    guild_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class BF4Server(Base):
     __tablename__ = "bf4_servers"
     server_guid: Mapped[str] = mapped_column(String(36), primary_key=True)
