@@ -1,0 +1,13 @@
+# Current BF4 Server Watcher production worker inventory.
+# One FQDN per line; blank lines and comments are ignored.
+# Membership is descriptive, not an architectural limit.
+# Runtime roles and Discord leadership are discovered dynamically.
+
+mak-01.bf4statusbot.com
+mak-02.bf4statusbot.com
+mak-03.bf4statusbot.com
+mak-04.bf4statusbot.com
+hnl-01.bf4statusbot.com
+hnl-02.bf4statusbot.com
+kah-01.bf4statusbot.com
+rnt-01.bf4statusbot.com
