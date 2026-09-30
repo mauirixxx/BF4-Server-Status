@@ -6,6 +6,7 @@
 - Restored semantic Cluster Health summary colors for healthy, warning, stale, draining, worker, and lease states.
 - Normalized the dashboard VERSION value to `0.5.6.1` so static assets receive a fresh cache-busting version after the presentation fix.
 - PostgreSQL infrastructure tables retain the v0.5.6 Online/Offline and PRIMARY/Replica presentation.
+- Expanded the PostgreSQL average transaction-rate tile to show the same measured rate as transactions/day, transactions/hour, and transactions/minute when `pg_stat_database.stats_reset` provides a valid measurement interval.
 
 ## v0.5.6
 
