@@ -58,7 +58,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.1.0"
+BOT_VERSION = "v3.1.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -8899,7 +8899,19 @@ async def setmaprole(
 
 @setmaprole.autocomplete("map_search")
 async def setmaprole_autocomplete(interaction, current):
-    return await autocomplete_db_call("setmaprole.map_search", all_map_choices, current)
+    started = time.perf_counter()
+    log.info(
+        "Autocomplete received command=setmaprole option=map_search guild=%s channel=%s user=%s current=%r",
+        getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None),
+        getattr(interaction.user, "id", None), current,
+    )
+    choices = await autocomplete_db_call("setmaprole.map_search", all_map_choices, current)
+    log.info(
+        "Autocomplete completed command=setmaprole option=map_search guild=%s choices=%s elapsed_ms=%.1f",
+        getattr(interaction.guild, "id", None), len(choices),
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return choices
 
 
 class EditMapRoleModal(discord.ui.Modal):
@@ -9027,10 +9039,21 @@ async def editmaprole(
 
 @editmaprole.autocomplete("map_name")
 async def editmaprole_autocomplete(interaction, current):
+    started = time.perf_counter()
+    log.info(
+        "Autocomplete received command=editmaprole option=map_name guild=%s channel=%s user=%s current=%r",
+        getattr(interaction.guild, "id", None), getattr(interaction.channel, "id", None),
+        getattr(interaction.user, "id", None), current,
+    )
     if not interaction.guild:
         return []
     rows = await autocomplete_db_call("editmaprole.map_name", configured_map_matches, interaction.guild.id, current or "")
-    return [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
+    choices = [app_commands.Choice(name=m.map_name[:100], value=m.map_key) for p, m in rows[:25]]
+    log.info(
+        "Autocomplete completed command=editmaprole option=map_name guild=%s choices=%s elapsed_ms=%.1f",
+        interaction.guild.id, len(choices), (time.perf_counter() - started) * 1000.0,
+    )
+    return choices
 
 
 @tree.command(name="delmaprole", description="Delete a configured map-role ping")
