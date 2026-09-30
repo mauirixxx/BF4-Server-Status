@@ -39,7 +39,9 @@ The caller can then request only `deploy-v<approved-version>`. Unknown versions,
 
 Before the production container is stopped, the deployer downloads the approved asset from the fixed `mauirixxx/BF4-Server-Status` GitHub repository, verifies its pinned SHA-256, rejects unsafe archive paths and mutable/cache content, extracts into a temporary staging directory, verifies required runtime files, and verifies the embedded `BOT_VERSION`.
 
-Only after those checks pass does it cross the write boundary. The node-local `.env` is fingerprinted and preserved, the application tree is replaced, a versioned Docker image is built locally, the worker container is recreated, and the deployment is accepted only if the expected image is running and the `.env` fingerprint is unchanged.
+The versioned Docker image is built from the validated staging tree while the existing worker is still running. Only after that build succeeds does the deployer cross the write boundary. Before doing so it snapshots the current application tree, `.env` fingerprint, container image reference, and immutable image ID. The application tree is then replaced and the worker recreated. The deployment is accepted only if the expected image is running and the `.env` fingerprint is unchanged.
+
+If replacement, container recreation, or post-start validation fails after the write boundary, the deployer automatically restores the previous application tree, retags the captured previous image ID to its prior image reference, recreates the prior worker, and verifies that it is running with the original `.env` fingerprint. A successful recovery reports `ROLLBACK PASS`; rollback failure escalates separately for operator intervention.
 
 `approved-releases` provides a read-only way to see what the installed wrapper will permit.
 

@@ -39,6 +39,7 @@ deploy_release()
     ZIP="${WORK}/${ASSET}"
     STAGE="${WORK}/stage"
     ENV_BACKUP="${WORK}/.env"
+    ROLLBACK_APP="${WORK}/rollback-app"
 
     cleanup()
     {
@@ -59,7 +60,11 @@ deploy_release()
     command -v unzip >/dev/null
 
     BEFORE_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+    OLD_IMAGE_REF="$("$DOCKER" inspect --format='{{.Config.Image}}' "$CONTAINER")"
+    OLD_IMAGE_ID="$("$DOCKER" inspect --format='{{.Image}}' "$CONTAINER")"
     cp -a "$APP/.env" "$ENV_BACKUP"
+    mkdir "$ROLLBACK_APP"
+    cp -a "$APP"/. "$ROLLBACK_APP"/
 
     echo "current_container:"
     "$DOCKER" inspect \
@@ -129,37 +134,109 @@ deploy_release()
     "$DOCKER" build --pull --tag "$IMAGE" "$STAGE"
     echo "image build: PASS"
 
+    rollback()
+    {
+        echo
+        echo "========== AUTOMATIC ROLLBACK =========="
+        echo "Restoring previous application tree and image ${OLD_IMAGE_REF}..."
+
+        "$DOCKER" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+        if ! find "$APP" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + \
+            || ! cp -a "$ROLLBACK_APP"/. "$APP"/ \
+            || ! "$DOCKER" tag "$OLD_IMAGE_ID" "$OLD_IMAGE_REF"
+        then
+            echo "ROLLBACK FAILED: could not restore previous application/image" >&2
+            return 1
+        fi
+
+        cd "$APP"
+        if "$DOCKER" compose \
+            -f docker-compose.yml \
+            -f docker-compose.worker-agent.yml \
+            up -d bf4-worker-agent
+        then
+            sleep 5
+            ROLLBACK_RUNNING="$("$DOCKER" inspect --format='{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+            ROLLBACK_IMAGE="$("$DOCKER" inspect --format='{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+            ROLLBACK_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+            if test "$ROLLBACK_RUNNING" = true \
+                && test "$ROLLBACK_IMAGE" = "$OLD_IMAGE_REF" \
+                && test "$ROLLBACK_ENV" = "$BEFORE_ENV"
+            then
+                echo "ROLLBACK PASS: previous worker restored and .env unchanged"
+                return 0
+            fi
+        fi
+
+        echo "ROLLBACK FAILED: operator intervention required" >&2
+        "$DOCKER" logs --tail 100 "$CONTAINER" 2>/dev/null || true
+        return 1
+    }
+
+    fail_after_write()
+    {
+        RC="$1"
+        shift
+        echo "FAIL: $*" >&2
+        if rollback; then
+            return "$RC"
+        fi
+        return 90
+    }
+
     echo
     echo "========== WRITE BOUNDARY =========="
     echo "Stopping ${CONTAINER}..."
-    "$DOCKER" stop "$CONTAINER"
+    if ! "$DOCKER" stop "$CONTAINER"; then
+        echo "FAIL: could not cleanly stop ${CONTAINER}; attempting to leave prior worker running" >&2
+        "$DOCKER" start "$CONTAINER" >/dev/null 2>&1 || true
+        return 39
+    fi
 
-    find "$APP" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf -- {} +
-    cp -a "$STAGE"/. "$APP"/
-    cp -a "$ENV_BACKUP" "$APP/.env"
+    if ! find "$APP" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf -- {} + \
+        || ! cp -a "$STAGE"/. "$APP"/ \
+        || ! cp -a "$ENV_BACKUP" "$APP/.env"
+    then
+        fail_after_write 40 "application tree replacement failed"
+        return $?
+    fi
 
-    AFTER_COPY_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
-    test "$AFTER_COPY_ENV" = "$BEFORE_ENV" || {
-        echo "FAIL: .env changed during release replacement"
-        return 40
-    }
+    if ! AFTER_COPY_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"; then
+        fail_after_write 41 "could not fingerprint preserved .env"
+        return $?
+    fi
+    if test "$AFTER_COPY_ENV" != "$BEFORE_ENV"; then
+        fail_after_write 41 ".env changed during release replacement"
+        return $?
+    fi
     echo ".env preservation after extraction: PASS"
 
-    "$DOCKER" rm "$CONTAINER"
+    if ! "$DOCKER" rm "$CONTAINER"; then
+        fail_after_write 42 "could not remove stopped production container"
+        return $?
+    fi
 
     echo
     echo "Starting v${VERSION} worker..."
     cd "$APP"
-    "$DOCKER" compose \
+    if ! "$DOCKER" compose \
         -f docker-compose.yml \
         -f docker-compose.worker-agent.yml \
         up -d bf4-worker-agent
+    then
+        fail_after_write 43 "could not create v${VERSION} worker"
+        return $?
+    fi
 
     sleep 12
 
-    RUNNING="$("$DOCKER" inspect --format='{{.State.Running}}' "$CONTAINER")"
-    RUN_IMAGE="$("$DOCKER" inspect --format='{{.Config.Image}}' "$CONTAINER")"
-    FINAL_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+    if ! RUNNING="$("$DOCKER" inspect --format='{{.State.Running}}' "$CONTAINER")" \
+        || ! RUN_IMAGE="$("$DOCKER" inspect --format='{{.Config.Image}}' "$CONTAINER")" \
+        || ! FINAL_ENV="$(sha256sum "$APP/.env" | awk '{print $1}')"
+    then
+        fail_after_write 49 "could not inspect deployed worker or .env"
+        return $?
+    fi
 
     echo
     echo "========== VALIDATION =========="
@@ -168,12 +245,18 @@ deploy_release()
     echo "env_after=${FINAL_ENV}"
 
     if test "$RUNNING" != true; then
-        echo "FAIL: v${VERSION} container is not running"
         "$DOCKER" logs --tail 100 "$CONTAINER" || true
-        return 50
+        fail_after_write 50 "v${VERSION} container is not running"
+        return $?
     fi
-    test "$RUN_IMAGE" = "$IMAGE" || { echo "FAIL: unexpected deployed image: ${RUN_IMAGE}"; return 51; }
-    test "$FINAL_ENV" = "$BEFORE_ENV" || { echo "FAIL: .env fingerprint changed"; return 52; }
+    if test "$RUN_IMAGE" != "$IMAGE"; then
+        fail_after_write 51 "unexpected deployed image: ${RUN_IMAGE}"
+        return $?
+    fi
+    if test "$FINAL_ENV" != "$BEFORE_ENV"; then
+        fail_after_write 52 ".env fingerprint changed"
+        return $?
+    fi
 
     echo
     echo "recent startup log:"

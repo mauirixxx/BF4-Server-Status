@@ -26,6 +26,11 @@ BUILD_LINE="$(grep -nF 'build --pull --tag "$IMAGE" "$STAGE"' "$WRAPPER" | cut -
 STOP_LINE="$(grep -nF 'stop "$CONTAINER"' "$WRAPPER" | cut -d: -f1)"
 test -n "$BUILD_LINE" && test -n "$STOP_LINE" || fail "build/stop boundary markers missing"
 test "$BUILD_LINE" -lt "$STOP_LINE" || fail "image build must complete before production stop"
+grep -Fq 'AUTOMATIC ROLLBACK' "$WRAPPER" || fail "automatic rollback missing"
+grep -Fq 'ROLLBACK PASS: previous worker restored and .env unchanged' "$WRAPPER" || fail "rollback validation missing"
+grep -Fq 'OLD_IMAGE_ID=' "$WRAPPER" || fail "previous image identity capture missing"
+grep -Fq 'ROLLBACK_APP=' "$WRAPPER" || fail "previous application-tree capture missing"
+grep -Fq 'return 90' "$WRAPPER" || fail "rollback-failure escalation missing"
 echo "PASS: static trust-boundary checks"
 
 # Commands that do not need Docker can be exercised directly by setting the
