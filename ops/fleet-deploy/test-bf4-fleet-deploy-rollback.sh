@@ -79,6 +79,10 @@ compose)
         echo 'INJECTED: new compose startup failure' >&2
         exit 1
     fi
+    if [[ -f \$S/fail-rollback ]]; then
+        echo 'INJECTED: rollback compose failure' >&2
+        exit 1
+    fi
     echo 'bf4-server-watcher:3.0.1-hf2' > "\$S/image"
     touch "\$S/running"
     echo 'FAKE ROLLBACK COMPOSE PASS' ;;
@@ -88,15 +92,23 @@ esac
 EOF
 chmod +x "$ROOT/bin/docker"
 
+if [[ ${TEST_FAIL_ROLLBACK:-0} == 1 ]]; then
+    touch "$ROOT/state/fail-rollback"
+fi
+
 set +e
 OUT="$(PATH="$ROOT/bin:/usr/bin:/bin" SSH_ORIGINAL_COMMAND=deploy-v3.1.1 bash "$ROOT/wrapper" 2>&1)"
 RC=$?
 set -e
 printf '%s\n' "$OUT"
 
-test "$RC" -eq 43 || { echo "FAIL: expected deployment rc=43, got $RC" >&2; exit 1; }
-grep -Fq 'INJECTED: new compose startup failure' <<<"$OUT"
-grep -Fq 'ROLLBACK PASS: previous worker restored and .env unchanged' <<<"$OUT"
+if [[ ${TEST_FAIL_ROLLBACK:-0} == 1 ]]; then
+    test "$RC" -eq 90 || { echo "FAIL: expected rollback-escalation rc=90, got $RC" >&2; exit 1; }
+    grep -Fq 'ROLLBACK FAILED: operator intervention required' <<<"$OUT"
+else
+    test "$RC" -eq 43 || { echo "FAIL: expected deployment rc=43, got $RC" >&2; exit 1; }
+    grep -Fq 'ROLLBACK PASS: previous worker restored and .env unchanged' <<<"$OUT"
+fi
 test -f "$ROOT/app/old.txt" || { echo 'FAIL: previous app tree not restored' >&2; exit 1; }
 test ! -f "$ROOT/app/new.txt" || { echo 'FAIL: failed release remained installed' >&2; exit 1; }
 test "$(sha256sum "$ROOT/app/.env" | awk '{print $1}')" = "$ENV_SHA" || {
@@ -107,7 +119,11 @@ test "$(cat "$ROOT/state/image")" = 'bf4-server-watcher:3.0.1-hf2' || {
     echo 'FAIL: previous image reference not restored' >&2
     exit 1
 }
-test -f "$ROOT/state/running" || { echo 'FAIL: previous worker not running' >&2; exit 1; }
-
-echo 'PASS: injected post-write startup failure restored previous app/image/.env/running worker'
+if [[ ${TEST_FAIL_ROLLBACK:-0} == 1 ]]; then
+    test ! -f "$ROOT/state/running" || { echo 'FAIL: worker unexpectedly running after rollback restart failure' >&2; exit 1; }
+    echo 'PASS: rollback failure escalated rc=90 after restoring app/image/.env'
+else
+    test -f "$ROOT/state/running" || { echo 'FAIL: previous worker not running' >&2; exit 1; }
+    echo 'PASS: injected post-write startup failure restored previous app/image/.env/running worker'
+fi
 echo 'ALL FLEET DEPLOYER ROLLBACK TESTS PASS'
