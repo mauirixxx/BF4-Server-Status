@@ -108,7 +108,26 @@ deploy_release()
         return 36
     }
 
+    # Both Compose definitions must select the same immutable image tag that
+    # this deployment is about to build. Catch stale release packaging before
+    # the production container is touched.
+    grep -Fq "image: bf4-server-watcher:${VERSION}" "$STAGE/docker-compose.yml" || {
+        echo "FAIL: docker-compose.yml does not select v${VERSION}"
+        return 37
+    }
+    grep -Fq "image: bf4-server-watcher:${VERSION}" "$STAGE/docker-compose.worker-agent.yml" || {
+        echo "FAIL: worker-agent compose file does not select v${VERSION}"
+        return 38
+    }
+
     echo "release contents: PASS"
+
+    # Build entirely from the validated staging tree while production is still
+    # running. A Docker/build failure therefore remains pre-write-boundary.
+    echo
+    echo "Building ${IMAGE} from validated staging tree..."
+    "$DOCKER" build --pull --tag "$IMAGE" "$STAGE"
+    echo "image build: PASS"
 
     echo
     echo "========== WRITE BOUNDARY =========="
@@ -125,11 +144,6 @@ deploy_release()
         return 40
     }
     echo ".env preservation after extraction: PASS"
-
-    echo
-    echo "Building ${IMAGE}..."
-    "$DOCKER" build --pull --tag "$IMAGE" "$APP"
-    echo "image build: PASS"
 
     "$DOCKER" rm "$CONTAINER"
 
