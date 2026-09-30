@@ -24,6 +24,8 @@ v3.1.0 expects the normal Alembic startup migration path. Revision `0020_v3_1_0_
 
 Do not remove the HF2 index before upgrading. Existing HF2 deployments should leave it in place and allow the v3.1.0 migration to adopt that physical schema state.
 
+Release validation on PostgreSQL 16.15 exercised both supported upgrade starting points in an isolated disposable cluster: a plain Alembic `0019` database and an `0019` database with `HF2_DB_INDEX.sql` already applied. Both advanced to `0020_v3_1_0_hf2_search` with exactly one `pg_trgm` GIN index. Re-running Alembic at head and re-running the HF2 SQL remained idempotent.
+
 ## Release artifacts
 
 The planned release assets are standard ZIP files:
