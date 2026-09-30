@@ -1,0 +1,51 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse, ssl, sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import prompt_secret, load_config, failure_domain_snapshot, current_primary, tcp_check
+from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim
+
+def connect(ip,user,password):
+    ctx=ssl._create_unverified_context()
+    return SmartConnect(host=ip,user=user,pwd=password,sslContext=ctx)
+
+def exact_vm(content,name):
+    view=content.viewManager.CreateContainerView(content.rootFolder,[vim.VirtualMachine],True)
+    try:
+        matches=[vm for vm in view.view if vm.name==name]
+    finally: view.Destroy()
+    if len(matches)!=1: raise RuntimeError(f'exact VM match count={len(matches)} for {name!r}')
+    return matches[0]
+
+def main():
+    ap=argparse.ArgumentParser(description='Read-only direct-ESXi fencing readiness check')
+    ap.add_argument('--target', help='DB node to validate; defaults to discovered primary')
+    args=ap.parse_args(); cfg=load_config(); esxi=cfg.get('esxi',{}); mappings=esxi.get('db_vm_map',{}); hosts=esxi.get('hosts',{})
+    print('='*68); print(' BF4 HA DIRECT ESXi FENCE READINESS'); print('='*68); print('MODE: READ ONLY'); print('NO VM POWER OR CONFIGURATION OPERATION WILL BE PERFORMED.'); print()
+    snap=failure_domain_snapshot(cfg); primary=current_primary(snap['db_states']); target=args.target or primary
+    if not target or target not in cfg.get('nodes',{}): print('NO-GO: no valid target DB node'); return 10
+    if target not in mappings: print(f'NO-GO: no direct ESXi mapping for {target}'); return 11
+    m=mappings[target]; hk=m['esxi_host']; h=hosts.get(hk)
+    if not h: print(f'NO-GO: mapped ESXi host {hk!r} missing'); return 11
+    ip=cfg['nodes'][target]['ip']; expected_vm=cfg['nodes'][target]['vm_name']
+    if m.get('vm_name') != expected_vm: print('NO-GO: mapping VM name disagrees with DB node vm_name'); return 11
+    print(f'Discovered primary : {primary or "(none)"}'); print(f'Target DB node     : {target} ({ip})'); print(f'Expected VM        : {expected_vm}'); print(f'Expected ESXi      : {hk} ({h["ip"]})'); print(f'Expected site      : {h.get("site","?")}'); print()
+    password=prompt_secret(f'ESXi {esxi.get("username","root")} password: '); si=None
+    try:
+        si=connect(h['ip'],esxi.get('username','root'),password); content=si.RetrieveContent(); host_view=content.viewManager.CreateContainerView(content.rootFolder,[vim.HostSystem],True)
+        try: hs=list(host_view.view)
+        finally: host_view.Destroy()
+        if len(hs)!=1: print(f'NO-GO: expected one ESXi HostSystem, got {len(hs)}'); return 12
+        actual_host=hs[0]; vm=exact_vm(content,expected_vm); runtime_host=vm.runtime.host.name if vm.runtime.host else '(none)'; power=str(vm.runtime.powerState)
+        print('Authentication     : PASS'); print(f'ESXi identity      : {actual_host.name}'); print(f'Host connection    : {actual_host.runtime.connectionState}'); print(f'Host power         : {actual_host.runtime.powerState}'); print(f'VM exact identity  : {vm.name} PASS'); print(f'VM runtime host    : {runtime_host}'); print(f'VM power           : {power}')
+        if runtime_host != actual_host.name: print('NO-GO: VM runtime host does not match directly connected ESXi host'); return 13
+        if power != 'poweredOn': print('NO-GO: fencing target is not poweredOn'); return 14
+        print(f'PostgreSQL TCP/5432: {"reachable" if tcp_check(ip,5432,timeout=3) else "unreachable"}')
+        print(); print('DIRECT ESXi FENCING READINESS: PASS'); print('A future execute-capable tool could fence this exact VM directly on this exact ESXi host.'); print('NO STATE WAS CHANGED.'); return 0
+    except Exception as e:
+        print(f'NO-GO: direct ESXi validation failed: {type(e).__name__}: {e}'); return 15
+    finally:
+        if si is not None: Disconnect(si)
+if __name__=='__main__': raise SystemExit(main())

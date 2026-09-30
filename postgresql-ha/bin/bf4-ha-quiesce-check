@@ -1,0 +1,105 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    ambiguous_worker_session_lines, banner, current_primary, failure_domain_snapshot, load_config,
+    parse_pipe_rows, psql, site_for_worker, ssh
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def main() -> int:
+    cfg = load_config()
+    snap = failure_domain_snapshot(cfg)
+    primary = current_primary(snap["db_states"])
+    if not primary:
+        banner("QUIESCE READINESS")
+        print("NO-GO: exactly one reachable primary was not discovered")
+        return 10
+
+    if snap["ambiguous_isolated_sites"]:
+        banner("QUIESCE READINESS")
+        print(
+            "NO-GO: ambiguous isolated sites: "
+            + ", ".join(sorted(snap["ambiguous_isolated_sites"]))
+        )
+        for line in ambiguous_worker_session_lines(
+            cfg, cfg["nodes"][primary]["ip"], snap["ambiguous_isolated_sites"]
+        ):
+            print(line)
+        print("Failover remains blocked until PostgreSQL detects those clients as dead.")
+        return 16
+
+    deferred = set(snap["deferred_workers"])
+    primary_ip = cfg["nodes"][primary]["ip"]
+
+    banner("SERVERWATCHER WORKERS")
+    running = []
+    failures = []
+
+    for name, meta in cfg["workers"].items():
+        site = site_for_worker(cfg, name)
+        rc, out, err = ssh(
+            meta["ip"],
+            f'docker ps --filter name=^{CONTAINER}$ '
+            '--format "{{.Names}}|{{.Status}}"',
+        )
+        if rc != 0:
+            if name in deferred:
+                print(
+                    f"{name:<8} {meta['ip']:<15} "
+                    f"DEFERRED ISOLATED-SAFE({site})"
+                )
+            else:
+                print(f"{name:<8} {meta['ip']:<15} SSH FAIL")
+                failures.append(name)
+        elif out.strip():
+            print(f"{name:<8} {meta['ip']:<15} RUNNING {out.strip()}")
+            running.append(name)
+        else:
+            print(f"{name:<8} {meta['ip']:<15} STOPPED")
+
+    banner(f"WRITER SESSIONS ON {primary}")
+    sql = """
+SELECT client_addr, state, count(*)
+FROM pg_stat_activity
+WHERE datname = 'bf4_serverwatcher'
+  AND backend_type = 'client backend'
+  AND usename = 'bf4_serverwatcher'
+GROUP BY client_addr, state
+ORDER BY client_addr, state;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        print(f"FAILED: {err or out}")
+        return 11
+    rows = parse_pipe_rows(out)
+    if rows:
+        for row in rows:
+            print(" | ".join(row))
+    else:
+        print("(0 writer sessions)")
+
+    banner("VERDICT")
+    if failures:
+        print("NO-GO: worker inspection failure outside safe isolated site")
+        return 16
+    if not running and not rows:
+        print("QUIESCED")
+        print(f"Deferred isolated workers: {len(deferred)}")
+        return 0
+
+    print("NOT QUIESCED")
+    if running:
+        print("Running reachable workers: " + ", ".join(running))
+    if rows:
+        print(f"Writer-session groups remaining: {len(rows)}")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

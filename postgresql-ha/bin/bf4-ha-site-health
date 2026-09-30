@@ -1,0 +1,51 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import banner,classify_site_isolation,current_primary,db_client_ips,dig_exact_a,discover_roles,load_config,ssh
+
+def main():
+    cfg=load_config(); states,_=discover_roles(cfg); primary=current_primary(states)
+    worker_reach={}
+    for name,meta in cfg['workers'].items():
+        rc,out,err=ssh(meta['ip'],'hostname'); worker_reach[name]=(rc==0)
+    record=cfg['dns'].get('service_record',cfg['service_dns']); dns_reach={}
+    for dns in cfg['dns']['verify_servers']:
+        rc,values,err=dig_exact_a(dns,record); dns_reach[dns]=(rc==0)
+    db_clients=set()
+    if primary:
+        rc,db_clients,err=db_client_ips(cfg['nodes'][primary]['ip'])
+        if rc!=0: db_clients=set()
+    isolated=[]; degraded=[]
+    banner('BF4 HA SITE HEALTH')
+    for code,site in cfg['sites'].items():
+        iso=classify_site_isolation(cfg,code,states,worker_reach,dns_reach)
+        failures=[]
+        for node in site.get('db_nodes',[]):
+            if not states.get(node,{}).get('reachable',False): failures.append('db:'+node)
+        for worker in site.get('workers',[]):
+            if not worker_reach.get(worker,False): failures.append('worker:'+worker)
+        for dns in site.get('dns_servers',[]):
+            if not dns_reach.get(dns,False): failures.append('dns:'+dns)
+        if iso: status='ISOLATED'; isolated.append(code)
+        elif failures: status='DEGRADED'; degraded.append(code)
+        else: status='HEALTHY'
+        print(f"{code:<4} {site['name']:<10} {status}")
+        for node in site.get('db_nodes',[]):
+            s=states.get(node,{})
+            print(f"      DB     {node:<12} " + (s.get('role','UNKNOWN') if s.get('reachable') else 'UNAVAILABLE'))
+        for worker in site.get('workers',[]):
+            ip=cfg['workers'][worker]['ip']; reachable=worker_reach.get(worker,False); session=ip in db_clients
+            print(f"      WORKER {worker:<12} {'REACHABLE' if reachable else 'UNAVAILABLE'} db_session={'yes' if session else 'no'}")
+        for dns in site.get('dns_servers',[]):
+            print(f"      DNS    {dns:<12} {'REACHABLE' if dns_reach.get(dns,False) else 'UNAVAILABLE'}")
+    banner('VERDICT')
+    if not primary: print('NO-GO: did not discover exactly one primary'); return 10
+    if isolated:
+        print('HEALTHY-DEGRADED'); print('Isolated sites: '+', '.join(isolated));
+        if degraded: print('Partially degraded sites: '+', '.join(degraded))
+        return 0
+    if degraded: print('DEGRADED'); print('Partially degraded sites: '+', '.join(degraded)); return 1
+    print('HEALTHY'); return 0
+if __name__=='__main__': raise SystemExit(main())

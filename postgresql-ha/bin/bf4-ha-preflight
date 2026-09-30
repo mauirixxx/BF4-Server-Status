@@ -1,0 +1,180 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse,os,stat,sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import banner,classify_site_isolation,current_primary,db_client_ips, db_client_session_rows,dig_exact_a,discover_roles,load_config,nsupdate_tsig_prereq,parse_pipe_rows,prompt_vcenter_password,psql,run,ssh,vcenter_validate_target,prompt_esxi_password,esxi_power_state
+
+
+
+def active_dns_servers(cfg):
+    return list(cfg['dns'].get('bind',{}).get('authoritative_servers',[]))
+
+def dns_name(cfg,ip):
+    return cfg.get('dns',{}).get('bind',{}).get('authoritative_names',{}).get(ip,ip)
+
+def validate_bind_backend(cfg,record,expected_ip):
+    dns=cfg['dns']; bind=dns.get('bind',{}); primary=bind.get('primary_ip'); key=bind.get('tsig_key_file'); zone=bind.get('expected_zone',dns.get('zone'))
+    banner('DNS BACKEND')
+    print('Active backend : bind-tsig')
+    print(f"BIND primary   : {primary}")
+    print(f"TSIG key       : {key}")
+    if not primary or not key or not zone:
+        return False,'BIND backend configuration incomplete'
+    try:
+        st=os.stat(key)
+    except OSError as exc:
+        return False,f'cannot stat TSIG key: {exc}'
+    mode=stat.S_IMODE(st.st_mode)
+    if st.st_uid!=0 or st.st_gid!=0 or mode!=0o600:
+        return False,f'TSIG key permissions invalid uid={st.st_uid} gid={st.st_gid} mode={mode:o}'
+    rc,out,err=nsupdate_tsig_prereq(primary,zone,record,expected_ip,key)
+    if rc!=0:
+        detail=err or out or f'nsupdate exit code {rc}'
+        print(f'TSIG auth      : FAIL ({detail})')
+        return False,f'TSIG authentication failed: {detail}'
+    print('TSIG auth      : PASS')
+    return True,''
+
+def fail(code,items):
+    banner('PREFLIGHT VERDICT'); print('NO-GO'); [print('  - '+x) for x in items]; print('\nNO ACTION WAS TAKEN.'); return code
+
+def site_for(cfg,key,name): return next((c for c,s in cfg['sites'].items() if name in s.get(key,[])),None)
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--candidate',required=True); ap.add_argument('--skip-vcenter',action='store_true'); ap.add_argument('--fencing-backend',choices=('auto','vcenter','direct-esxi'),default='auto'); a=ap.parse_args(); cfg=load_config()
+    if a.candidate not in cfg['nodes']: return fail(10,[f'unknown candidate {a.candidate!r}'])
+    banner('BF4 PostgreSQL HA Failover Preflight'); print('MODE: READ ONLY'); print(f'Candidate: {a.candidate}')
+    states,_=discover_roles(cfg); primary=current_primary(states); pc=sum(1 for s in states.values() if s.get('role')=='PRIMARY')
+    if pc!=1 or not primary: return fail(10,[f'expected exactly one reachable primary, found {pc}'])
+    cs=states.get(a.candidate,{})
+    if a.candidate==primary or not cs.get('reachable') or cs.get('role')!='STANDBY': return fail(10,['candidate is not a reachable standby'])
+    worker_reach={n:ssh(m['ip'],'hostname')[0]==0 for n,m in cfg['workers'].items()}; record=cfg['dns'].get('service_record',cfg['service_dns']); dns_servers=active_dns_servers(cfg); dns_reach={d:dig_exact_a(d,record)[0]==0 for d in dns_servers}; isolated={c for c in cfg['sites'] if classify_site_isolation(cfg,c,states,worker_reach,dns_reach)}
+    ps=site_for(cfg,'db_nodes',primary); csit=site_for(cfg,'db_nodes',a.candidate)
+    if ps in isolated: return fail(10,['current primary site classified isolated'])
+    if csit in isolated: return fail(10,['candidate site classified isolated'])
+    nodes=cfg['nodes']; pip=nodes[primary]['ip']; cip=nodes[a.candidate]['ip']; banner('TOPOLOGY'); print(f'Current primary : {primary} ({pip})'); print(f'Candidate       : {a.candidate} ({cip})'); print('Isolated sites  : '+(', '.join(sorted(isolated)) if isolated else 'none'))
+    backend=cfg['dns'].get('backend')
+    if backend!='bind-tsig':
+        return fail(15,[f"unsupported or missing DNS backend: {backend!r}; required 'bind-tsig'"])
+    ok,detail=validate_bind_backend(cfg,record,pip)
+    if not ok: return fail(15,[detail])
+    banner('SERVICE DNS'); reachable=0; errs=[]
+    for dns in dns_servers:
+        rc,vals,err=dig_exact_a(dns,record); site=site_for(cfg,'dns_servers',dns)
+        if rc==0:
+            reachable+=1; ok=vals==[pip]; label=dns_name(cfg,dns); print(f"{label:<12} {dns:<16} -> {','.join(vals) if vals else '(no answer)':<15} {'PASS' if ok else 'FAIL'}");
+            if not ok: errs.append(f'{dns}: wrong value')
+        elif site in isolated: print(f'{dns:<16} -> (unreachable)    ISOLATED-SITE({site})')
+        else: errs.append(f'{dns}: unreachable outside isolated site')
+    mind=int(cfg['degraded_mode']['minimum_reachable_dns_servers_for_cutover']);
+    if reachable<mind: errs.append(f'only {reachable} reachable DNS servers; minimum {mind}')
+    if errs: return fail(13,errs)
+    banner('CANDIDATE REPLICATION'); rc,out,err=psql(cip,"SELECT pg_is_wal_replay_paused(),pg_last_wal_receive_lsn(),pg_last_wal_replay_lsn();")
+    if rc!=0: return fail(11,['candidate query failed'])
+    p=out.split('|');
+    if len(p)<3 or p[0]!='f' or not p[1] or p[1]!=p[2]: return fail(12,['candidate replay not safely caught up'])
+    print(f'replay_paused = {p[0]}\nreceive_lsn   = {p[1]}\nreplay_lsn    = {p[2]}')
+    sql="SELECT client_addr,state,sync_state,sent_lsn,write_lsn,flush_lsn,replay_lsn,pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint FROM pg_stat_replication ORDER BY client_addr;"; rc,out,err=psql(pip,sql)
+    if rc!=0: return fail(11,['primary replication query failed'])
+    by={r[0]:r for r in parse_pipe_rows(out) if len(r)>=8}; r=by.get(cip)
+    if not r or r[1]!='streaming' or int(r[7])!=0: return fail(12,['candidate is not streaming at zero lag'])
+    print('primary sees candidate: state=streaming lag=0 bytes')
+    banner('SURVIVING STANDBYS'); serr=[]; good=0
+    lag_warn=int(cfg.get('health',{}).get('replication_lag_warn_bytes',1))
+    lag_bad=int(cfg.get('health',{}).get('replication_lag_degraded_bytes',1048576))
+    for name,meta in nodes.items():
+        if name in (primary,a.candidate): continue
+        site=site_for(cfg,'db_nodes',name); r=by.get(meta['ip'])
+        if r:
+            state=r[1]
+            try:
+                lag=int(r[7])
+            except ValueError:
+                serr.append(f'{name}: invalid replication lag {r[7]!r}')
+                print(f"{name:<12} state={state:<10} lag={r[7]} bytes FAIL")
+                continue
+            if state!='streaming':
+                serr.append(f'{name}: replication state={state}')
+                print(f"{name:<12} state={state:<10} lag={lag} bytes FAIL")
+                continue
+            if lag>=lag_bad:
+                serr.append(f'{name}: lag={lag} bytes exceeds degraded threshold={lag_bad}')
+                print(f"{name:<12} state={state:<10} lag={lag} bytes FAIL threshold={lag_bad}")
+                continue
+            good+=1
+            suffix=' WARN' if lag>=lag_warn else ''
+            print(f"{name:<12} state={state:<10} lag={lag} bytes{suffix}")
+        elif site in isolated:
+            print(f'{name:<12} ISOLATED-SITE({site}) deferred')
+        else:
+            serr.append(f'{name}: unavailable outside isolated-site policy')
+    mins=int(cfg['degraded_mode']['minimum_reachable_standbys_for_failover']);
+    if good<mins: serr.append(f'only {good} reachable surviving standbys; minimum {mins}')
+    if serr: return fail(12,serr)
+    banner('WORKER CONTROL PLANE'); rc,clients,err=db_client_ips(pip)
+    if rc!=0: return fail(16,['could not query worker DB sessions'])
+    src, session_rows, serr_detail = db_client_session_rows(pip)
+    session_detail = {}
+    if src == 0:
+        for row in session_rows:
+            if len(row) >= 3:
+                session_detail.setdefault(row[0], []).append((row[1], row[2]))
+    werr=[]
+    for name,meta in cfg['workers'].items():
+        site=site_for(cfg,'workers',name)
+        rc,out,err=ssh(
+            meta['ip'],
+            'docker ps --filter name=BF4_ServerWatcher_Agent '
+            '--format "{{.Names}}|{{.Status}}"'
+        )
+        has_db_session = meta['ip'] in clients
+
+        if rc==0 and out:
+            # Normal pre-quiesce state: worker is reachable and running.
+            print(f"{name:<8} {meta['ip']:<15} PASS running")
+        elif rc==0 and not out and not has_db_session:
+            # Normal post-quiesce state: host is reachable, the container is
+            # intentionally stopped, and the primary sees no worker session.
+            print(f"{name:<8} {meta['ip']:<15} PASS quiesced/no-db-session")
+        elif rc==0 and not out and has_db_session:
+            werr.append(
+                f'{name}: container stopped but PostgreSQL session still present'
+            )
+        elif site in isolated and not has_db_session:
+            print(
+                f"{name:<8} {meta['ip']:<15} "
+                f"ISOLATED-SITE({site}) no-db-session"
+            )
+        else:
+            detail = session_detail.get(meta['ip'], [])
+            if detail:
+                total = sum(int(count) for _state, count in detail)
+                states = ', '.join(f'{state}={count}' for state, count in detail)
+                werr.append(
+                    f'{name}: unsafe unreachable worker state; '
+                    f'PostgreSQL sessions={total} ({states})'
+                )
+            else:
+                werr.append(f'{name}: unsafe unreachable worker state')
+    if werr: return fail(16,werr)
+    fence_ready_label = None
+    if not a.skip_vcenter:
+        if a.fencing_backend in ('auto','vcenter'):
+            banner('VCENTER FENCING READINESS'); pw=prompt_vcenter_password(cfg['vcenter']['username']); ok,detail=vcenter_validate_target(cfg,primary,pw); print(detail)
+            if ok:
+                fence_ready_label='vCenter fencing readiness     : PASS'
+            elif a.fencing_backend == 'vcenter':
+                return fail(14,[detail])
+            else:
+                print('vCenter unavailable; checking guarded direct-ESXi fallback')
+        if a.fencing_backend == 'direct-esxi' or (a.fencing_backend == 'auto' and fence_ready_label is None):
+            banner('DIRECT ESXi FENCING READINESS'); epw=prompt_esxi_password(cfg.get('esxi',{}).get('username','root')); ok,power=esxi_power_state(cfg,primary,epw); print(f'{primary}: power={power}')
+            if not ok or power != 'poweredOn': return fail(14,[f'direct ESXi readiness failed: {power}'])
+            fence_ready_label='Direct ESXi fencing readiness : PASS'
+    banner('PREFLIGHT VERDICT'); print('GO — DEGRADED TOPOLOGY' if isolated else 'GO');
+    if isolated: print('Isolated sites: '+', '.join(sorted(isolated)))
+    print(f'\nVerified primary   : {primary}\nVerified candidate : {a.candidate}\nCandidate replay/lag          : PASS\nReachable survivor health     : PASS (streaming, below degraded lag threshold)\nIsolated-site policy          : PASS\nWorker safety                 : PASS\nDNS quorum / reachable state  : PASS');
+    if not a.skip_vcenter and fence_ready_label: print(fence_ready_label)
+    print('\nNO ACTION WAS TAKEN.'); return 0
+if __name__=='__main__': raise SystemExit(main())

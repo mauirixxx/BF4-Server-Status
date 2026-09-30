@@ -1,0 +1,292 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse, ipaddress, shlex, sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import Tee, load_config, log_path, parse_pipe_rows, psql, ssh
+
+
+def parse_conninfo(ci: str) -> dict[str, str]:
+    out = {}
+    for token in shlex.split(ci, posix=True):
+        if "=" in token:
+            k, v = token.split("=", 1)
+            out[k] = v
+    return out
+
+
+def address_matches(address: str, ip: str) -> bool:
+    if not address:
+        return False
+    if address.lower() == "all":
+        return True
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(address, strict=False)
+    except ValueError:
+        return False
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pre-failover read-only audit: verify that a reachable standby is suitable for promotion and that the CURRENT primary could later be reseeded/rejoined")
+    ap.add_argument("--candidate", dest="candidate", help="DEPRECATED name for --promotion-candidate")
+    ap.add_argument("--promotion-candidate", dest="promotion_candidate", help="reachable standby intended for promotion")
+    args = ap.parse_args()
+    if args.candidate and args.promotion_candidate:
+        ap.error("use only one of --candidate or --promotion-candidate")
+    args.candidate = args.promotion_candidate or args.candidate
+    if not args.candidate:
+        ap.error("--promotion-candidate is required")
+    cfg = load_config()
+    log = Tee(log_path("rejoin-readiness"))
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA REJOIN READINESS")
+        log.line("=" * 68)
+        log.line("MODE: READ ONLY")
+        log.line()
+
+        if args.candidate not in cfg["nodes"]:
+            log.line(f"NO-GO: unknown candidate {args.candidate!r}")
+            return 10
+
+        roles = {}
+        for name, meta in cfg["nodes"].items():
+            rc, out, err = psql(meta["ip"], "SELECT pg_is_in_recovery();")
+            if rc == 0:
+                roles[name] = "STANDBY" if out.strip() == "t" else "PRIMARY"
+
+        primaries = [n for n, role in roles.items() if role == "PRIMARY"]
+        if len(primaries) != 1:
+            log.line(f"NO-GO: expected exactly one reachable primary, found {len(primaries)}")
+            return 10
+
+        old = primaries[0]
+        if old == args.candidate or roles.get(args.candidate) != "STANDBY":
+            log.line("NO-GO: candidate is not a distinct reachable standby")
+            return 10
+
+        old_ip = cfg["nodes"][old]["ip"]
+        cand_ip = cfg["nodes"][args.candidate]["ip"]
+        log.line(f"Would-be former primary : {old} ({old_ip})")
+        log.line(f"Promotion candidate      : {args.candidate} ({cand_ip})")
+
+        rc, out, err = psql(
+            cand_ip,
+            "SELECT current_setting('primary_conninfo', true), "
+            "current_setting('primary_slot_name', true);",
+        )
+        if rc != 0:
+            log.line(f"NO-GO: candidate replication config query failed: {err or out}")
+            return 11
+
+        parts = out.split("|", 1)
+        if len(parts) != 2 or not parts[0].strip():
+            log.line("NO-GO: candidate has no usable primary_conninfo")
+            return 14
+
+        ci = parse_conninfo(parts[0])
+        repl_user = ci.get("user")
+        repl_port = ci.get("port", "5432")
+        if not repl_user:
+            log.line("NO-GO: could not discover replication user")
+            return 14
+
+        log.line(f"Replication user         : {repl_user}")
+        log.line(f"Future rejoin slot       : {cfg['nodes'][old]['slot']}")
+        log.line()
+
+        probe = r'''\
+echo "host=$(hostname)"
+if [ -x /usr/lib/postgresql/16/bin/pg_basebackup ]; then
+  echo "pgbasebackup_present=yes"
+  echo "pgbasebackup_version=$(/usr/lib/postgresql/16/bin/pg_basebackup --version)"
+else
+  echo "pgbasebackup_present=no"
+fi
+
+echo "meta_unit=$(systemctl is-enabled postgresql.service 2>/dev/null || true)"
+echo "cluster_unit=$(systemctl is-enabled postgresql@16-main.service 2>/dev/null || true)"
+STARTCONF=$(awk '!/^[[:space:]]*#/ && NF {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print; exit}' /etc/postgresql/16/main/start.conf 2>/dev/null)
+echo "startconf=${STARTCONF:-missing}"
+H=$(getent passwd postgres | cut -d: -f6)
+echo "postgres_home=${H:-missing}"
+if [ -n "$H" ] && [ -e "$H/.pgpass" ]; then
+  echo "pgpass_exists=yes"
+  [ -r "$H/.pgpass" ] && echo "pgpass_readable=yes" || echo "pgpass_readable=no"
+  echo "pgpass_owner=$(stat -c '%U:%G' "$H/.pgpass" 2>/dev/null || echo unknown)"
+  echo "pgpass_mode=$(stat -c '%a' "$H/.pgpass" 2>/dev/null || echo unknown)"
+else
+  echo "pgpass_exists=no"
+  echo "pgpass_readable=no"
+  echo "pgpass_owner=missing"
+  echo "pgpass_mode=missing"
+fi
+PGDATA=/var/lib/postgresql/16/main
+if [ -d "$PGDATA" ]; then
+  echo "pgdata_exists=yes"
+  echo "pgdata_bytes=$(du -sb "$PGDATA" | awk '{print $1}')"
+  echo "free_bytes=$(df -PB1 "$PGDATA" | awk 'NR==2 {print $4}')"
+else
+  echo "pgdata_exists=no"
+  echo "pgdata_bytes=0"
+  echo "free_bytes=0"
+fi
+'''
+        rc, out, err = ssh(old_ip, probe, timeout=25)
+        if rc != 0:
+            log.line(f"NO-GO: readiness probe transport failed: {err or out}")
+            return 14
+
+        vals = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip()
+
+        log.line("Would-be former-primary host:")
+        for key in (
+            "host", "pgbasebackup_present", "pgbasebackup_version",
+            "meta_unit", "cluster_unit", "startconf", "postgres_home",
+            "pgpass_exists", "pgpass_readable", "pgpass_owner", "pgpass_mode",
+            "pgdata_exists", "pgdata_bytes", "free_bytes",
+        ):
+            log.line(f"  {key:<22}: {vals.get(key, '?')}")
+
+        failures = []
+        if vals.get("host") != old:
+            failures.append(f"SSH identity mismatch: expected {old}, got {vals.get('host', '?')}")
+        if vals.get("pgbasebackup_present") != "yes":
+            failures.append("pg_basebackup is not installed at the expected path")
+        if vals.get("startconf") != "auto":
+            failures.append(f"start.conf is {vals.get('startconf', '?')!r}, expected 'auto'")
+        if vals.get("pgpass_exists") != "yes":
+            failures.append("postgres .pgpass is missing")
+        elif vals.get("pgpass_readable") != "yes":
+            failures.append("postgres .pgpass is not readable")
+        if vals.get("pgpass_owner") != "postgres:postgres":
+            failures.append(f"postgres .pgpass owner is {vals.get('pgpass_owner', '?')}, expected postgres:postgres")
+        if vals.get("pgpass_mode") not in ("600", "0600"):
+            failures.append(f"postgres .pgpass mode is {vals.get('pgpass_mode', '?')}, expected 0600")
+
+        if vals.get("pgdata_exists") != "yes":
+            failures.append("PGDATA is missing")
+        else:
+            try:
+                size = int(vals["pgdata_bytes"])
+                free = int(vals["free_bytes"])
+                required = size + 1024**3
+                log.line(f"  {'required_free':<22}: {required}")
+                if free < required:
+                    failures.append("insufficient disk headroom for preserved PGDATA + reseed")
+            except (KeyError, ValueError):
+                failures.append("could not parse PGDATA/free-space values")
+
+        # Verify a matching protected .pgpass entry exists for the candidate.
+        # This confirms the entry shape without printing or validating its password.
+        if not any("pgpass" in f.lower() for f in failures):
+            probe_code = (
+                "from pathlib import Path\n"
+                "p=Path('/var/lib/postgresql/.pgpass')\n"
+                f"target_host={cand_ip!r}\n"
+                f"target_port={repl_port!r}\n"
+                f"target_user={repl_user!r}\n"
+                "matched=False\n"
+                "for line in p.read_text().splitlines():\n"
+                "    if not line or line.startswith('#'):\n"
+                "        continue\n"
+                "    parts=line.split(':',4)\n"
+                "    if len(parts)!=5:\n"
+                "        continue\n"
+                "    host,port,db,user,password=parts\n"
+                "    if host in (target_host,'*') and port in (target_port,'*') and user in (target_user,'*'):\n"
+                "        matched=True\n"
+                "        break\n"
+                "print('match=yes' if matched else 'match=no')\n"
+            )
+            pgpass_probe = (
+                "sudo -u postgres python3 -c " + shlex.quote(probe_code)
+            )
+            rc, pout, perr = ssh(old_ip, pgpass_probe, timeout=15)
+            if rc != 0 or "match=yes" not in pout:
+                failures.append(
+                    "postgres .pgpass has no matching candidate host/port/replication-user entry"
+                )
+            else:
+                log.line("Matching .pgpass entry      : PASS")
+        else:
+            log.line("Matching .pgpass entry      : NOT TESTED")
+
+        # Validate the HBA path pg_basebackup actually uses: physical replication.
+        # Do not require a normal SQL login to database=postgres for bf4_replication.
+        hba_sql = """
+SELECT
+    line_number,
+    type,
+    array_to_string(database, ','),
+    array_to_string(user_name, ','),
+    COALESCE(address, ''),
+    auth_method,
+    COALESCE(error, '')
+FROM pg_hba_file_rules
+ORDER BY line_number;
+"""
+        rc, hout, herr = psql(cand_ip, hba_sql)
+        hba_ok = False
+        hba_detail = ""
+        if rc == 0:
+            for row in parse_pipe_rows(hout):
+                if len(row) < 7:
+                    continue
+                line_no, htype, dbs, users, address, auth, error = row[:7]
+                db_list = {x.strip() for x in dbs.split(",") if x.strip()}
+                user_list = {x.strip() for x in users.split(",") if x.strip()}
+                if error:
+                    continue
+                if "replication" not in db_list:
+                    continue
+                if repl_user not in user_list and "all" not in user_list:
+                    continue
+                if address_matches(address, old_ip):
+                    hba_ok = True
+                    hba_detail = (
+                        f"line={line_no} type={htype} address={address} auth={auth}"
+                    )
+                    break
+
+        if hba_ok:
+            log.line(f"Candidate replication HBA : PASS ({hba_detail})")
+        else:
+            failures.append(
+                f"candidate pg_hba.conf has no physical-replication rule for "
+                f"{repl_user} from {old_ip}"
+            )
+
+        rc, out, err = psql(
+            cand_ip,
+            "SELECT pg_is_in_recovery(), pg_is_wal_replay_paused(), "
+            "pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();",
+        )
+        p = out.split("|") if rc == 0 else []
+        if len(p) < 4 or p[0] != "t" or p[1] != "f" or not p[2] or p[2] != p[3]:
+            failures.append("candidate replay state is not ready: " + (err or out))
+        else:
+            log.line("Candidate standby state     : PASS")
+
+        log.line()
+        log.line("READINESS VERDICT")
+        if failures:
+            log.line("NO-GO")
+            for f in failures:
+                log.line(f"  - {f}")
+            log.line()
+            log.line("NO ACTION WAS TAKEN.")
+            return 14
+
+        log.line("GO")
+        log.line("NO ACTION WAS TAKEN.")
+        return 0
+    finally:
+        log.close()
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,137 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+
+import os
+import stat
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    Tee, dig_exact_a, load_config, log_path, nsupdate_tsig_prereq, run
+)
+
+
+def soa_serial(server: str, zone: str):
+    rc, out, err = run(
+        ["dig", "+time=2", "+tries=1", f"@{server}", zone, "SOA", "+short"],
+        timeout=5,
+    )
+    if rc != 0:
+        return False, "", err or out
+    parts = out.strip().split()
+    if len(parts) < 3:
+        return False, "", f"unexpected SOA output: {out!r}"
+    return True, parts[2], ""
+
+
+def main():
+    cfg = load_config()
+    log = Tee(log_path("bind-check"))
+    try:
+        dns = cfg["dns"]
+        bind = dns.get("bind", {})
+        record = bind.get("service_record", dns["service_record"])
+        zone = bind.get("expected_zone", dns["zone"])
+        primary = bind.get("primary_ip")
+        servers = bind.get("authoritative_servers", [])
+        key_file = bind.get("tsig_key_file")
+
+        log.line("=" * 68)
+        log.line(" BF4 HA BIND BACKEND CHECK")
+        log.line("=" * 68)
+        log.line("MODE: READ ONLY / AUTHENTICATION PREREQUISITE ONLY")
+        log.line()
+        backend = dns.get("backend")
+        log.line(f"Configured active HA DNS backend : {backend}")
+        log.line(f"Staged BIND primary              : {primary}")
+        log.line(f"Service record                   : {record}")
+        log.line(f"TSIG key                         : {key_file}")
+        log.line()
+
+        if backend != "bind-tsig":
+            log.line(
+                f"NO-GO: unsupported or missing DNS backend: {backend!r}; "
+                "required 'bind-tsig'"
+            )
+            return 14
+
+        if not primary or not servers or not key_file:
+            log.line("NO-GO: BIND backend configuration is incomplete")
+            return 14
+
+        try:
+            st = os.stat(key_file)
+        except OSError as exc:
+            log.line(f"NO-GO: cannot stat TSIG key: {exc}")
+            return 14
+
+        mode = stat.S_IMODE(st.st_mode)
+        if st.st_uid != 0 or st.st_gid != 0 or mode != 0o600:
+            log.line(
+                f"NO-GO: TSIG key must be root:root 0600 "
+                f"(uid={st.st_uid} gid={st.st_gid} mode={mode:o})"
+            )
+            return 14
+        log.line("TSIG key permissions             : PASS root:root 0600")
+
+        expected = None
+        serial = None
+        log.line()
+        log.line("Authoritative BIND cluster:")
+        for server in servers:
+            rc, values, err = dig_exact_a(server, record)
+            if rc != 0 or len(values) != 1:
+                log.line(f"  {server:<16} FAIL A lookup: {err or values}")
+                return 13
+            ok, this_serial, err = soa_serial(server, zone)
+            if not ok:
+                log.line(f"  {server:<16} FAIL SOA: {err}")
+                return 13
+            if expected is None:
+                expected = values
+                serial = this_serial
+            if values != expected or this_serial != serial:
+                log.line(
+                    f"  {server:<16} FAIL inconsistent "
+                    f"A={values} serial={this_serial}"
+                )
+                return 13
+            log.line(
+                f"  {server:<16} PASS A={values[0]} serial={this_serial}"
+            )
+
+        rc, out, err = nsupdate_tsig_prereq(
+            primary, zone, record, expected[0], key_file
+        )
+        log.line()
+        log.line("Signed prerequisite-only authentication:")
+        if out:
+            for line in out.splitlines():
+                log.line(f"  stdout: {line}")
+        if err:
+            for line in err.splitlines():
+                log.line(f"  stderr: {line}")
+        log.line(f"  nsupdate exit code: {rc}")
+        if rc != 0:
+            log.line("NO-GO: controller cannot authenticate to staged BIND backend")
+            return 15
+
+        rc2, after, err2 = dig_exact_a(primary, record)
+        if rc2 != 0 or after != expected:
+            log.line("NO-GO: service record changed unexpectedly")
+            return 13
+
+        log.line()
+        log.line("VERDICT: GO")
+        log.line("BIND authoritative cluster is internally consistent.")
+        log.line("Controller TSIG authentication works without changing the record.")
+        log.line(f"Log: {log.path}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,15 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse,json,sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import journal_effective_for_operation,load_config
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--operation',required=True); a=ap.parse_args(); cfg=load_config()
+    try: eff=journal_effective_for_operation(cfg,a.operation)
+    except Exception as exc: print(f'NO-GO: {exc}',file=sys.stderr); return 5
+    if not eff: return 4
+    p,s=eff
+    print(json.dumps({'operation_id':a.operation,'revision':int(s['revision']),'current_controller':s.get('current_controller'),'journal_phase':s.get('journal_phase'),'sha256':__import__('hashlib').sha256((json.dumps(s,indent=2,sort_keys=True)+'\n').encode()).hexdigest(),'path':str(p)},sort_keys=True)); return 0
+if __name__=='__main__': raise SystemExit(main())

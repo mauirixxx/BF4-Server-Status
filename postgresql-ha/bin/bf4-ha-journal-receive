@@ -1,0 +1,27 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import argparse,json,os,sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import atomic_write_json,journal_recovery_path,load_config,read_json_file,validate_journal_semantics
+
+def die(msg,code): print(f'NO-GO: {msg}',file=sys.stderr); raise SystemExit(code)
+def main():
+    argparse.ArgumentParser(description='Receive one HA journal JSON document on stdin as a non-active recovery copy').parse_args()
+    cfg=load_config(); raw=sys.stdin.read()
+    if not raw.strip(): die('no journal JSON received on stdin',10)
+    try: st=json.loads(raw); validate_journal_semantics(st)
+    except Exception as exc: die(f'invalid journal: {exc}',10)
+    if int(st.get('schema_version',0)) < 3: die('recovery transport requires schema_version >= 3',11)
+    op=st['operation_id']; owner=st['current_controller']; rev=int(st['revision'])
+    if owner not in cfg.get('controllers',{}): die(f'unknown current_controller {owner!r}',13)
+    dest=journal_recovery_path(cfg,op); dest.parent.mkdir(parents=True,exist_ok=True); os.chmod(dest.parent,0o700)
+    if dest.exists():
+        old=read_json_file(dest); oldrev=int(old.get('revision',0))
+        if old.get('operation_id') != op: die('existing recovery copy operation mismatch',15)
+        if rev < oldrev: die(f'stale revision {rev}; existing revision is {oldrev}',16)
+        if rev == oldrev:
+            if old == st: print(f'OK unchanged operation={op} revision={rev}'); return 0
+            die(f'conflicting payload for existing revision {rev}',17)
+    atomic_write_json(dest,st,mode=0o600); print(f'OK stored operation={op} revision={rev} owner={owner}'); return 0
+if __name__=='__main__': raise SystemExit(main())

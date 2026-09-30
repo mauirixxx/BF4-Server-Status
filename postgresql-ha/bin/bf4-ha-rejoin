@@ -1,0 +1,738 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import shlex
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee, atomic_write_json, journal_commit_or_die, journal_advance, journal_assert_owned, journal_effective_active, load_config, log_path, parse_pipe_rows,
+    prompt_vcenter_password, psql, read_json_file, ssh, tcp_check,
+    vcenter_power_state, vcenter_poweron_and_verify, fence_backend_power_state, prompt_fence_backend_password, esxi_poweron_and_verify,
+)
+
+
+def parse_conninfo(conninfo: str) -> dict[str, str]:
+    out = {}
+    for token in shlex.split(conninfo, posix=True):
+        if "=" in token:
+            k, v = token.split("=", 1)
+            out[k] = v
+    return out
+
+
+def discover_replication_template(cfg, new_primary: str, old_primary: str, deferred: set[str]):
+    for name, meta in cfg["nodes"].items():
+        if name in (new_primary, old_primary) or name in deferred:
+            continue
+        sql = "SELECT current_setting('primary_conninfo', true), current_setting('primary_slot_name', true);"
+        rc, out, err = psql(meta["ip"], sql)
+        if rc != 0:
+            continue
+        parts = out.split("|", 1)
+        if len(parts) == 2 and parts[0].strip():
+            ci = parse_conninfo(parts[0])
+            if ci.get("user"):
+                return name, ci, parts[1].strip()
+    return None, {}, ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Guarded former-primary PostgreSQL rejoin/reseed")
+    ap.add_argument("--execute", action="store_true", help="Perform maintenance boot and pg_basebackup reseed")
+    ap.add_argument("--expect-old-primary", help="Required with --execute")
+    ap.add_argument("--expect-new-primary", help="Required with --execute")
+    ap.add_argument("--ssh-timeout", type=int, default=120)
+    ap.add_argument("--replication-timeout", type=int, default=120)
+    args = ap.parse_args()
+
+    cfg = load_config()
+    state_file = Path(cfg["state"]["fence_file"])
+    log = Tee(log_path("rejoin"))
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA FORMER-PRIMARY REJOIN")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line()
+
+        if not state_file.exists():
+            log.line(f"NO-GO: HA handoff state is missing: {state_file}")
+            log.line("A rejoin requires a completed live failover handoff.")
+            return 14
+        try:
+            effective = journal_effective_active(cfg)
+            if not effective:
+                raise RuntimeError("no effective active HA journal")
+            _effective_path, state = effective
+            journal_assert_owned(state)
+        except Exception as exc:
+            log.line(f"NO-GO: cannot read HA handoff state: {exc}")
+            return 14
+
+        for flag in ("promotion_completed", "reparent_completed", "dns_completed", "postcheck_completed"):
+            if not state.get(flag):
+                log.line(f"NO-GO: {flag} is not true")
+                return 10
+        if state.get("rejoin_completed"):
+            log.line("NO-GO: rejoin_completed is already true")
+            return 10
+
+        old = state.get("old_primary")
+        old_ip = state.get("old_primary_ip")
+        new = state.get("new_primary")
+        new_ip = state.get("new_primary_ip")
+        if not all((old, old_ip, new, new_ip)):
+            log.line("NO-GO: handoff is missing old/new primary identity")
+            return 14
+
+        log.line(f"Former primary : {old} ({old_ip})")
+        log.line(f"Current primary: {new} ({new_ip})")
+        log.line()
+
+        # The new primary must still be the writable primary.
+        rc, out, err = psql(new_ip, "SELECT pg_is_in_recovery(), current_setting('transaction_read_only');")
+        if rc != 0 or out.strip() != "f|off":
+            log.line(f"NO-GO: current-primary verification failed ({err or out})")
+            return 11
+        log.line("Current primary role/writability : PASS")
+
+        # Former-primary state may be:
+        #   poweredOff -> normal maintenance boot path (requires durable v0.10.9 guard)
+        #   poweredOn  -> interrupted maintenance-boot recovery, allowed ONLY when
+        #                 PostgreSQL is already stopped/masked and TCP/5432 is down.
+        password = prompt_fence_backend_password(cfg, state)
+        ok, power = fence_backend_power_state(cfg, state, old, password)
+        if not ok:
+            log.line(f"NO-GO: former-primary fence-backend check failed: {power}")
+            return 14
+        log.line(f"Former-primary fence state     : {power}")
+
+        # Recovery after a completed reseed/start whose final journal checkpoint
+        # was lost with the controller. Never reseed a proven streaming standby twice.
+        if power == "poweredOn" and tcp_check(old_ip, 5432, timeout=2):
+            rrc, rout, rerr = psql(old_ip, "SELECT pg_is_in_recovery();")
+            slot = cfg["nodes"][old]["slot"]
+            prc, pout, perr = psql(new_ip, f"SELECT state, slot_name FROM pg_stat_replication WHERE client_addr = '{old_ip}' LIMIT 1;")
+            rows = parse_pipe_rows(pout) if prc == 0 else []
+            if rrc == 0 and rout.strip() == "t" and rows and rows[0][0] == "streaming" and len(rows[0]) > 1 and rows[0][1] == slot:
+                log.line("RECOVERY: former primary is already a verified streaming standby; skipping duplicate reseed.")
+                if not args.execute:
+                    log.line("DRY RUN: would reconcile rejoin-completed; no state changed.")
+                    return 0
+                required = f"RECONCILE REJOIN {old} TO {new}"
+                if not confirm_exact(required): return 20
+                state["rejoin_completed"] = True
+                state["rejoin_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+                state["rejoined_node"] = old
+                state["rejoin_method"] = "recovered-existing-streaming-standby"
+                state["rejoin_source_primary"] = new
+                state["rejoin_slot"] = slot
+                journal_advance(state, "rejoin-completed")
+                journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+                log.line("REJOIN RECOVERY CHECKPOINT: PASS")
+                return 0
+            log.line("NO-GO: former primary is powered on with PostgreSQL reachable but is not a proven expected streaming standby.")
+            return 30
+
+        guard = state.get("old_primary_postgresql_boot_guard")
+        log.line(f"Recorded PostgreSQL boot guard   : {guard or 'MISSING'}")
+
+        durable_guard = "startconf-disabled-plus-dual-mask-before-fence"
+        legacy_guard = "meta-and-cluster-masked-before-fence"
+
+        if power == "poweredOff":
+            if guard != durable_guard:
+                log.line(
+                    "NO-GO: powered-off former primary lacks the durable v0.10.9 "
+                    "start.conf=disabled boot interlock."
+                )
+                log.line(
+                    "Do not power it on automatically from this state; an older "
+                    "mask-only guard has already proven non-persistent across boot."
+                )
+                return 10
+            if tcp_check(old_ip, 5432, timeout=2):
+                log.line("NO-GO: former primary unexpectedly answers TCP/5432")
+                return 30
+            maintenance_mode = "POWERON"
+        elif power == "poweredOn":
+            # There are two legitimate powered-on recovery states:
+            #
+            #   1. Pre-reseed maintenance recovery.  PostgreSQL must still be
+            #      stopped/masked with TCP/5432 down.
+            #
+            #   2. Post-basebackup startup recovery.  Once completion of the
+            #      basebackup is durably journaled, a controller may die after
+            #      start.conf was restored and/or the units were unmasked but
+            #      before PostgreSQL became a proven streaming standby.
+            #
+            # The second state does NOT weaken the ordinary maintenance guard.
+            # It only selects the post-basebackup recovery path.  The existing
+            # completed-reseed identity/filesystem checks below must still prove
+            # that the recorded PGDATA/source/slot are safe to reuse.
+            completed_basebackup = (
+                state.get("rejoin_basebackup_completed") is True
+                and bool(state.get("rejoin_basebackup_pgdata"))
+                and bool(state.get("rejoin_basebackup_source_primary"))
+                and bool(state.get("rejoin_basebackup_slot"))
+            )
+
+            rc, out, err = ssh(
+                old_ip,
+                "printf 'meta='; systemctl is-enabled postgresql.service 2>/dev/null || true; "
+                "printf 'cluster='; systemctl is-enabled postgresql@16-main.service 2>/dev/null || true; "
+                "printf 'active='; systemctl is-active postgresql@16-main.service 2>/dev/null || true",
+                timeout=10,
+            )
+
+            if completed_basebackup:
+                if rc != 0 or tcp_check(old_ip, 5432, timeout=2):
+                    log.line(
+                        "NO-GO: interrupted post-basebackup startup state could not "
+                        "be safely established."
+                    )
+                    return 30
+                if guard not in (legacy_guard, durable_guard):
+                    log.line("NO-GO: handoff does not contain a recognized pre-fence guard.")
+                    return 10
+                maintenance_mode = "RECOVER-POST-BASEBACKUP"
+                log.line(
+                    "Interrupted post-basebackup startup : SAFE TO VALIDATE/RECOVER"
+                )
+            else:
+                # Ordinary interrupted maintenance boot remains strict.
+                if (
+                    rc != 0
+                    or "meta=masked" not in out
+                    or "cluster=masked" not in out
+                    or tcp_check(old_ip, 5432, timeout=2)
+                ):
+                    log.line(
+                        "NO-GO: powered-on former primary is not in a safe stopped/masked "
+                        "maintenance state."
+                    )
+                    return 30
+                if guard not in (legacy_guard, durable_guard):
+                    log.line("NO-GO: handoff does not contain a recognized pre-fence guard.")
+                    return 10
+                maintenance_mode = "RECOVER-POWERED-ON"
+                log.line("Interrupted maintenance state     : SAFE TO RECOVER")
+        else:
+            log.line(f"NO-GO: unsupported former-primary power state: {power}")
+            return 10
+
+        deferred = set(state.get("deferred_db_nodes", []))
+        template_node, conninfo, _ = discover_replication_template(cfg, new, old, deferred)
+        repl_user = conninfo.get("user")
+        repl_port = conninfo.get("port", "5432")
+        if not repl_user:
+            log.line("NO-GO: could not discover replication user from a surviving standby")
+            return 14
+        log.line(f"Replication template             : {template_node}")
+        log.line(f"Replication user                 : {repl_user}")
+        log.line(f"Replication port                 : {repl_port}")
+
+        slot = cfg["nodes"][old]["slot"]
+        rc, out, err = psql(new_ip, f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}';")
+        if rc != 0:
+            log.line(f"NO-GO: slot query failed: {err or out}")
+            return 11
+        slot_exists = out.strip() == "1"
+        log.line(f"Former-primary target slot       : {slot} ({'exists' if slot_exists else 'will create'})")
+
+        # This cluster's known former primary is not rewind-eligible; make the
+        # decision from durable pre-failover facts rather than guessing.
+        log.line("Rejoin method                    : pg_basebackup reseed")
+        log.line("Reason                           : safe full reseed; no rewind assumption")
+
+        if not args.execute:
+            expectation_errors = []
+            if args.expect_old_primary is not None and args.expect_old_primary != old:
+                expectation_errors.append(f"--expect-old-primary must equal {old}")
+            if args.expect_new_primary is not None and args.expect_new_primary != new:
+                expectation_errors.append(f"--expect-new-primary must equal {new}")
+            if expectation_errors:
+                for error in expectation_errors:
+                    log.line(f"NO-GO: {error}")
+                log.line("NO ACTION WAS TAKEN.")
+                return 10
+
+            log.line()
+            log.line("DRY RUN RESULT: PASS")
+            if maintenance_mode == "POWERON":
+                log.line("WOULD: maintenance-boot the fenced former primary under durable boot interlock")
+            else:
+                log.line("WOULD: recover the already-powered-on former primary in safe maintenance state")
+            log.line("WOULD: enforce start.conf=disabled + both systemd units masked + TCP/5432 down")
+            log.line("WOULD: verify local .pgpass through physical replication IDENTIFY_SYSTEM")
+            log.line("WOULD: replace PGDATA with pg_basebackup -R using the former-primary slot")
+            log.line("WOULD: unmask/start PostgreSQL only after standby configuration exists")
+            log.line("WOULD: require streaming replication to the current primary")
+            log.line("NO ACTION WAS TAKEN.")
+            return 0
+
+        if args.expect_old_primary != old or args.expect_new_primary != new:
+            log.line(
+                "NO-GO: live execution requires exact expectations: "
+                f"--expect-old-primary {old} --expect-new-primary {new}"
+            )
+            return 20
+        required = f"RESEED {old} FROM {new}"
+        if not confirm_exact(required):
+            return 20
+
+        if maintenance_mode == "POWERON":
+            if state.get("fencing_backend", "vcenter") == "direct-esxi":
+                ok, detail = esxi_poweron_and_verify(cfg, old, password, timeout=120)
+            else:
+                ok, detail = vcenter_poweron_and_verify(cfg, old, password, timeout=120)
+            if not ok:
+                log.line(f"FAIL: maintenance boot failed: {detail}")
+                return 14
+            log.line("Maintenance boot                  : PASS")
+
+            deadline = time.time() + args.ssh_timeout
+            while time.time() < deadline:
+                rc, _, _ = ssh(old_ip, "true", timeout=5)
+                if rc == 0:
+                    break
+                time.sleep(2)
+            else:
+                log.line("FAIL: former primary did not become reachable by SSH")
+                return 14
+        else:
+            log.line("Maintenance boot                  : already powered on / recovery mode")
+
+        # Establish (or upgrade to) the durable maintenance guard before any
+        # credential test or PGDATA operation.
+        establish_guard = (
+            "set -e; "
+            "START=/etc/postgresql/16/main/start.conf; "
+            "printf 'disabled\\n' > \"$START\"; chmod 644 \"$START\"; "
+            "systemctl stop postgresql@16-main.service postgresql.service 2>/dev/null || true; "
+            "systemctl mask postgresql.service postgresql@16-main.service; "
+            "printf 'startconf='; "
+            "awk '!/^[[:space:]]*#/ && NF {gsub(/^[[:space:]]+|[[:space:]]+$/,\"\"); print; exit}' \"$START\"; "
+            "printf 'meta='; systemctl is-enabled postgresql.service 2>/dev/null || true; "
+            "printf 'cluster='; systemctl is-enabled postgresql@16-main.service 2>/dev/null || true; "
+            "printf 'active='; systemctl is-active postgresql@16-main.service 2>/dev/null || true"
+        )
+        rc, out, err = ssh(old_ip, establish_guard, timeout=30)
+        if (
+            rc != 0
+            or "startconf=disabled" not in out
+            or "meta=masked" not in out
+            or "cluster=masked" not in out
+            or tcp_check(old_ip, 5432, timeout=2)
+        ):
+            log.line(
+                "FAIL: durable PostgreSQL maintenance guard could not be established "
+                f"({out or err})"
+            )
+            return 30
+
+        # Upgrade the handoff proof in-place after live verification.
+        state["old_primary_postgresql_boot_guard"] = durable_guard
+        state["old_primary_boot_guard_upgraded_at_utc"] = datetime.now(timezone.utc).isoformat()
+        journal_advance(state, "rejoin-guard-established")
+        journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+
+        log.line(
+            "Maintenance PostgreSQL guard      : PASS "
+            "(start.conf=disabled + meta/cluster masked + TCP/5432 down)"
+        )
+
+        # Refuse to destroy data unless the local postgres account already has
+        # a usable password file.  v0.10.0 never transports credentials.
+        check = (
+            "set -e; H=$(getent passwd postgres | cut -d: -f6); "
+            "test -n \"$H\"; test -r \"$H/.pgpass\"; "
+            "stat -c '%a' \"$H/.pgpass\""
+        )
+        rc, out, err = ssh(old_ip, check)
+        if rc != 0 or out.strip() not in ("600", "0600"):
+            log.line("NO-GO: postgres .pgpass is missing/unreadable or not mode 0600")
+            log.line("No PGDATA changes were made.")
+            return 14
+        log.line("Local replication credential file: PASS (.pgpass mode 0600)")
+
+        # Verify the ACTUAL physical-replication credential/HBA path before
+        # touching PGDATA.  A normal SQL login to database=postgres is the
+        # wrong test for pg_basebackup and can be intentionally denied by HBA.
+        #
+        # PostgreSQL's replication protocol supports IDENTIFY_SYSTEM through
+        # psql when the libpq connection uses replication=true.
+        conninfo_test = (
+            f"host={new_ip} "
+            f"port={repl_port} "
+            f"user={repl_user} "
+            "dbname=replication "
+            "replication=true"
+        )
+        verify_cmd = (
+            "sudo -u postgres psql -X "
+            f"{shlex.quote(conninfo_test)} "
+            "-At -F '|' -v ON_ERROR_STOP=1 "
+            "-c 'IDENTIFY_SYSTEM;'"
+        )
+        rc, out, err = ssh(old_ip, verify_cmd, timeout=15)
+        ident = out.strip().split("|") if rc == 0 else []
+        if (
+            rc != 0
+            or len(ident) < 3
+            or not ident[0]
+            or not ident[1]
+            or not ident[2]
+        ):
+            log.line(
+                "NO-GO: physical replication credential/HBA test failed "
+                f"({err or out})"
+            )
+            log.line("No PGDATA changes were made.")
+            return 14
+
+        log.line(
+            "Physical replication credential test: PASS "
+            f"(systemid={ident[0]} timeline={ident[1]} lsn={ident[2]})"
+        )
+
+        if not slot_exists:
+            rc, out, err = psql(new_ip, f"SELECT pg_create_physical_replication_slot('{slot}');")
+            if rc != 0:
+                log.line(f"FAIL: could not create physical slot {slot}: {err or out}")
+                return 11
+            log.line(f"Physical slot creation            : PASS ({slot})")
+
+        # Discover PGDATA from the stopped cluster's standard Debian config.
+        rc, pgdata, err = ssh(old_ip, "sudo -u postgres psql --version >/dev/null 2>&1; readlink -f /var/lib/postgresql/16/main")
+        if rc != 0 or not pgdata.strip().startswith("/var/lib/postgresql/"):
+            log.line(f"NO-GO: could not establish expected PGDATA ({err or pgdata})")
+            return 14
+        pgdata = pgdata.strip()
+
+        # H-011: persist the identity of the ORIGINAL former-primary PGDATA
+        # before crossing the destructive rename boundary. On retry, never
+        # relabel a partial reseed as the old database.
+        recorded_pgdata = state.get("rejoin_pgdata")
+        recorded_backup = state.get("rejoin_old_pgdata_backup")
+        if recorded_pgdata or recorded_backup:
+            if recorded_pgdata != pgdata or not recorded_backup:
+                log.line("NO-GO: recorded rejoin PGDATA identity is incomplete or does not match discovered PGDATA")
+                return 14
+            backup = recorded_backup
+            log.line("Rejoin reseed checkpoint          : RECOVERY (using recorded original-PGDATA identity)")
+        else:
+            backup = f"{pgdata}.pre-rejoin-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            state["rejoin_pgdata"] = pgdata
+            state["rejoin_old_pgdata_backup"] = backup
+            state["rejoin_reseed_prepared_at_utc"] = datetime.now(timezone.utc).isoformat()
+            journal_advance(state, "rejoin-reseed-prepared")
+            journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+            log.line("Rejoin reseed checkpoint          : PASS (original-PGDATA identity durable)")
+
+        log.line(f"PGDATA                            : {pgdata}")
+        log.line(f"Original PGDATA safety rename     : {backup}")
+
+        # H-012: the remote host writes this operation-specific completion
+        # marker only after pg_basebackup exits successfully.  It closes the
+        # acknowledgement gap where the remote copy completed but the
+        # controller died before it could journal that success.
+        completion_marker = f"{backup}.basebackup-complete"
+        completion_token = f"{state.get('operation_id')}|{pgdata}|{backup}|{new}|{slot}"
+
+        # H-012: a successful pg_basebackup has its own durable boundary.
+        # If recovery begins from that boundary, canonical PGDATA is a proven
+        # completed reseed and must not be moved aside or copied again.
+        # The current journal phase may legitimately have advanced through
+        # rejoin-guard-established on a recovery invocation.  The durable
+        # completion evidence itself is therefore authoritative here; the
+        # recorded PGDATA/source/slot identities and filesystem reality are
+        # validated immediately below before the completed reseed is reused.
+        basebackup_completed = (
+            state.get("rejoin_basebackup_completed") is True
+        )
+        if basebackup_completed:
+            if (
+                state.get("rejoin_basebackup_pgdata") != pgdata
+                or state.get("rejoin_basebackup_source_primary") != new
+                or state.get("rejoin_basebackup_slot") != slot
+            ):
+                log.line("NO-GO: completed basebackup checkpoint identity does not match this rejoin")
+                return 14
+            log.line("Rejoin basebackup checkpoint      : RECOVERY (completed canonical PGDATA will be reused)")
+
+        # Reconcile filesystem reality against the durable identity. The recorded
+        # backup is the one and only original former-primary PGDATA.
+        inspect = (
+            f"test -d {shlex.quote(pgdata)} && printf 'pgdata=present\\n' || printf 'pgdata=absent\\n'; "
+            f"test -d {shlex.quote(backup)} && printf 'backup=present\\n' || printf 'backup=absent\\n'; "
+            f"if test -f {shlex.quote(completion_marker)}; then "
+            f"printf 'marker=present\\nmarker_token='; cat {shlex.quote(completion_marker)}; "
+            "else printf 'marker=absent\\n'; fi"
+        )
+        rc, fsout, fserr = ssh(old_ip, inspect, timeout=15)
+        if rc != 0:
+            log.line(f"NO-GO: could not inspect rejoin PGDATA paths ({fserr or fsout})")
+            return 14
+        pgdata_present = "pgdata=present" in fsout
+        backup_present = "backup=present" in fsout
+        marker_present = "marker=present" in fsout
+        marker_token = ""
+        for line in fsout.splitlines():
+            if line.startswith("marker_token="):
+                marker_token = line.split("=", 1)[1]
+                break
+        if not pgdata_present and not backup_present:
+            log.line("NO-GO: neither PGDATA nor the recorded original-PGDATA backup exists")
+            return 30
+
+        # H-018: once destructive rejoin history exists, the durable original-
+        # backup pathname cannot silently change. If the recorded path is absent
+        # but a sibling pre-rejoin directory exists, journal and filesystem
+        # history disagree; fail closed before any further PGDATA mutation.
+        if not backup_present:
+            parent = str(Path(pgdata).parent)
+            prefix = Path(pgdata).name + ".pre-rejoin-"
+            rc_alt, altout, alterr = ssh(
+                old_ip,
+                f"find {shlex.quote(parent)} -maxdepth 1 -mindepth 1 -type d "
+                f"-name {shlex.quote(prefix + '*')} -print",
+                timeout=15,
+            )
+            if rc_alt != 0:
+                log.line(f"NO-GO: could not reconcile original-PGDATA backup identity ({alterr or altout})")
+                return 14
+            alternate_backups = [line.strip() for line in altout.splitlines() if line.strip()]
+
+            # H-018B: pre-rejoin directories from older, already-completed HA
+            # operations are legitimate history.  Only siblings created at or
+            # after THIS rejoin's durable prepare boundary can contradict the
+            # recorded original-backup identity.  Malformed/unparseable sibling
+            # names remain suspicious and fail closed.
+            prepared_at = state.get("rejoin_reseed_prepared_at_utc")
+            try:
+                prepared_cutoff = datetime.fromisoformat(prepared_at).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            except (TypeError, ValueError):
+                prepared_cutoff = None
+
+            conflicting_backups = []
+            for alternate in alternate_backups:
+                name = Path(alternate).name
+                suffix = name[len(prefix):] if name.startswith(prefix) else ""
+                try:
+                    datetime.strptime(suffix, "%Y%m%dT%H%M%SZ")
+                    valid_timestamp = True
+                except ValueError:
+                    valid_timestamp = False
+                if prepared_cutoff is None or not valid_timestamp or suffix >= prepared_cutoff:
+                    conflicting_backups.append(alternate)
+
+            if conflicting_backups:
+                log.line("NO-GO: recorded original-PGDATA backup identity disagrees with current-operation filesystem history")
+                return 30
+
+        # H-015D: once both controller and remote durable evidence exist,
+        # they must agree. A missing marker can be tolerated after the
+        # controller checkpoint is durable, but a contradictory marker is
+        # evidence of stale/tampered/ambiguous remote state and must fail closed.
+        if basebackup_completed and marker_present and marker_token != completion_token:
+            log.line("NO-GO: durable basebackup checkpoint contradicts remote completion marker identity")
+            return 30
+
+        # H-012 recovery: remote completion is stronger evidence than a
+        # missing controller acknowledgement.  Adopt it only when BOTH
+        # filesystem identities exist and the operation-specific marker
+        # tied to the durable original-backup identity is present.
+        if not basebackup_completed and marker_present:
+            if marker_token != completion_token:
+                log.line("NO-GO: remote basebackup completion marker identity does not match this rejoin")
+                return 30
+            if not pgdata_present or not backup_present:
+                log.line("NO-GO: remote basebackup completion marker does not match rejoin identity/filesystem reality")
+                return 30
+            state["rejoin_basebackup_completed"] = True
+            state["rejoin_basebackup_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+            state["rejoin_basebackup_pgdata"] = pgdata
+            state["rejoin_basebackup_source_primary"] = new
+            state["rejoin_basebackup_slot"] = slot
+            journal_advance(state, "rejoin-basebackup-completed")
+            journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+            basebackup_completed = True
+            log.line("Rejoin basebackup checkpoint      : RECOVERED (remote completion marker adopted)")
+
+        # Give the operator a rough idea of how much data is about to be copied.
+        rc_size, source_bytes, _ = ssh(
+            new_ip,
+            "du -sb /var/lib/postgresql/16/main 2>/dev/null | awk '{print $1}'",
+            timeout=15,
+        )
+        if rc_size == 0 and source_bytes.strip().isdigit():
+            gib = int(source_bytes.strip()) / (1024 ** 3)
+            log.line(f"Source PGDATA size (approx.)       : {gib:.2f} GiB")
+
+        if basebackup_completed:
+            if not pgdata_present or not backup_present:
+                log.line("NO-GO: completed basebackup checkpoint does not match filesystem reality")
+                return 30
+            reseed = None
+            log.line("pg_basebackup                     : REUSED (durably completed by prior invocation)")
+        else:
+            if backup_present:
+                # A prior attempt already crossed the original-PGDATA rename. Preserve
+                # a partial destination under a diagnostic name, never as the old DB.
+                failed = f"{pgdata}.failed-reseed-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                prepare_destination = (
+                    f"if test -d {shlex.quote(pgdata)}; then mv {shlex.quote(pgdata)} {shlex.quote(failed)}; fi; "
+                    f"install -d -o postgres -g postgres -m 700 {shlex.quote(pgdata)}; "
+                )
+                log.line(f"Interrupted reseed recovery       : original backup already exists; partial destination -> {failed}")
+            else:
+                # First destructive crossing: the backup identity is already durable.
+                prepare_destination = (
+                    f"mv {shlex.quote(pgdata)} {shlex.quote(backup)}; "
+                    f"install -d -o postgres -g postgres -m 700 {shlex.quote(pgdata)}; "
+                )
+
+            reseed = (
+                "set -euo pipefail; "
+                f"systemctl stop postgresql.service 2>/dev/null || true; "
+                + prepare_destination
+                + f"sudo -u postgres pg_basebackup -h {shlex.quote(new_ip)} -p {shlex.quote(repl_port)} "
+                f"-U {shlex.quote(repl_user)} -D {shlex.quote(pgdata)} -X stream -R -S {shlex.quote(slot)} -P; "
+                f"printf '%s\\n' {shlex.quote(completion_token)} > {shlex.quote(completion_marker + '.tmp')}; "
+                f"mv {shlex.quote(completion_marker + '.tmp')} {shlex.quote(completion_marker)}"
+            )
+
+            log.line("pg_basebackup                     : STARTED")
+            log.line("Backup progress                   : monitoring PostgreSQL checkpoint/stream state")
+        if reseed is not None:
+            started = time.time()
+            last_report = 0.0
+            last_phase = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(ssh, old_ip, reseed, 1800)
+                while not future.done():
+                    now = time.time()
+                    progress_sql = (
+                        "SELECT phase, COALESCE(backup_total,0), COALESCE(backup_streamed,0) "
+                        "FROM pg_stat_progress_basebackup "
+                        f"WHERE pid IN (SELECT pid FROM pg_stat_activity WHERE application_name='pg_basebackup' AND client_addr='{old_ip}') "
+                        "LIMIT 1;"
+                    )
+                    prc, pout, _ = psql(new_ip, progress_sql, timeout=10)
+                    rows = parse_pipe_rows(pout) if prc == 0 else []
+                    phase = rows[0][0] if rows else "starting / awaiting progress row"
+                    total = int(rows[0][1]) if rows and rows[0][1].isdigit() else 0
+                    streamed = int(rows[0][2]) if rows and rows[0][2].isdigit() else 0
+    
+                    # Report immediately on phase changes and at least every 30 seconds.
+                    if phase != last_phase or now - last_report >= 30:
+                        drc, dout, _ = ssh(
+                            old_ip,
+                            f"du -sb {shlex.quote(pgdata)} 2>/dev/null | awk '{{print $1}}'",
+                            timeout=10,
+                        )
+                        dest = int(dout.strip()) if drc == 0 and dout.strip().isdigit() else 0
+                        elapsed = int(now - started)
+                        if phase == "waiting for checkpoint to finish":
+                            log.line(
+                                f"Backup progress                   : waiting for primary checkpoint "
+                                f"({elapsed}s elapsed; destination {dest / (1024 ** 2):.1f} MiB)"
+                            )
+                        elif total > 0:
+                            pct = min(100.0, (streamed / total) * 100.0)
+                            log.line(
+                                f"Backup progress                   : {phase}; {pct:.1f}% "
+                                f"({streamed / (1024 ** 3):.2f}/{total / (1024 ** 3):.2f} GiB; {elapsed}s elapsed)"
+                            )
+                        else:
+                            log.line(
+                                f"Backup progress                   : {phase}; "
+                                f"destination {dest / (1024 ** 2):.1f} MiB; {elapsed}s elapsed"
+                            )
+                        last_phase = phase
+                        last_report = now
+                    time.sleep(5)
+                rc, out, err = future.result()
+
+        if reseed is not None:
+            if rc != 0:
+                log.line(f"FAIL: pg_basebackup failed: {err or out}")
+                log.line(f"Old PGDATA remains preserved at: {backup}")
+                return 40
+            log.line("pg_basebackup                     : PASS")
+
+            # H-012 durable boundary: from this point onward canonical PGDATA
+            # is a completed basebackup and recovery must reuse it.
+            state["rejoin_basebackup_completed"] = True
+            state["rejoin_basebackup_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+            state["rejoin_basebackup_pgdata"] = pgdata
+            state["rejoin_basebackup_source_primary"] = new
+            state["rejoin_basebackup_slot"] = slot
+            journal_advance(state, "rejoin-basebackup-completed")
+            journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+            log.line("Rejoin basebackup checkpoint      : PASS (completed PGDATA durable)")
+
+        start = (
+            "set -e; "
+            "START=/etc/postgresql/16/main/start.conf; "
+            "printf 'auto\\n' > \"$START\"; chmod 644 \"$START\"; "
+            "systemctl unmask postgresql.service postgresql@16-main.service; "
+            "systemctl enable postgresql.service >/dev/null 2>&1 || true; "
+            "systemctl start postgresql@16-main.service; "
+            "printf 'startconf='; "
+            "awk '!/^[[:space:]]*#/ && NF {gsub(/^[[:space:]]+|[[:space:]]+$/,\"\"); print; exit}' \"$START\"; "
+            "printf 'active='; systemctl is-active postgresql@16-main.service"
+        )
+        rc, out, err = ssh(old_ip, start, timeout=60)
+        if rc != 0 or "startconf=auto" not in out or "active=active" not in out:
+            log.line(f"FAIL: could not start rejoined standby: {err or out}")
+            return 41
+
+        deadline = time.time() + args.replication_timeout
+        last = ""
+        while time.time() < deadline:
+            rc, out, err = psql(new_ip, f"SELECT state, sync_state, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint,-1) FROM pg_stat_replication WHERE client_addr = '{old_ip}';")
+            last = out or err
+            rows = parse_pipe_rows(out) if rc == 0 else []
+            if rows and rows[0][0] == "streaming" and int(rows[0][2]) <= int(cfg.get("health", {}).get("replication_lag_degraded_bytes", 1048576)):
+                break
+            time.sleep(2)
+        else:
+            log.line(f"FAIL: rejoined standby did not reach acceptable streaming state ({last})")
+            return 42
+
+        rc, out, err = psql(old_ip, "SELECT pg_is_in_recovery(), pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();")
+        if rc != 0 or not out.startswith("t|"):
+            log.line(f"FAIL: former primary is not verified as standby ({err or out})")
+            return 42
+
+        state["rejoin_completed"] = True
+        state["rejoin_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["rejoined_node"] = old
+        state["rejoin_method"] = "pg_basebackup"
+        state["rejoin_source_primary"] = new
+        state["rejoin_slot"] = slot
+        state["rejoin_old_pgdata_backup"] = backup
+        journal_advance(state, "rejoin-completed")
+        journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+
+        log.line()
+        log.line("REJOIN COMPLETE")
+        log.line(f"Former primary {old} is now a streaming standby of {new}.")
+        log.line(f"Preserved old PGDATA: {backup}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

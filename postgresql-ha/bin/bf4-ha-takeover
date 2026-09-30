@@ -1,0 +1,86 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+import argparse,json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import (confirm_exact,controller_identity,current_primary,dig_exact_a,discover_roles,
+    fence_backend_power_state,journal_commit_or_die,journal_effective_for_operation,journal_is_terminal,
+    load_config,prompt_fence_backend_password,read_json_file,ssh,tcp_check,validate_journal_semantics)
+
+def guard_proven(ip):
+    cmd=("START=/etc/postgresql/16/main/start.conf; printf 'startconf='; awk '!/^[[:space:]]*#/ && NF {gsub(/^[[:space:]]+|[[:space:]]+$/,\"\"); print; exit}' $START; "
+         "printf 'meta='; systemctl is-enabled postgresql.service || true; printf 'cluster='; systemctl is-enabled postgresql@16-main.service || true; "
+         "printf 'listen='; if ss -lnt | awk '{print $4}' | grep -Eq '(^|:)(5432)$'; then echo yes; else echo no; fi")
+    rc,out,err=ssh(ip,cmd,timeout=15)
+    return rc==0 and 'startconf=disabled' in out and 'meta=masked' in out and 'cluster=masked' in out and 'listen=no' in out, out or err
+
+def main():
+    ap=argparse.ArgumentParser(description='Explicitly assume ownership of an interrupted BF4 HA transaction'); ap.add_argument('--operation',required=True); ap.add_argument('--from-file'); ap.add_argument('--execute',action='store_true'); a=ap.parse_args(); cfg=load_config(); target=Path(cfg['state']['fence_file']); here=controller_identity()
+    try:
+        if a.from_file:
+            source=Path(a.from_file); st=read_json_file(source); validate_journal_semantics(st)
+        else:
+            eff=journal_effective_for_operation(cfg,a.operation)
+            if not eff: print(f'NO-GO: no valid local journal for {a.operation}'); return 10
+            source,st=eff
+    except Exception as exc: print(f'NO-GO: journal selection/validation failed: {exc}'); return 10
+    if st.get('operation_id') != a.operation: print('NO-GO: operation ID mismatch'); return 12
+    if journal_is_terminal(st): print(f"NO-GO: operation is already complete (phase={st.get('journal_phase')})"); return 19
+    owner=st.get('current_controller'); old=st.get('old_primary'); candidate=st.get('candidate')
+    print('='*68); print(' BF4 HA EXPLICIT CONTROLLER TAKEOVER'); print('='*68); print(f'Operation: {a.operation} rev={st.get("revision")} owner={owner} -> {here} phase={st.get("journal_phase")}')
+    if owner==here: print('NO-GO: this controller already owns the transaction'); return 13
+    local_rev=int(st['revision']); newer=[]; peer_seen=[]
+    for name,meta in cfg.get('controllers',{}).items():
+        if name==here: continue
+        rc,out,err=ssh(meta['ip'],f'/opt/bf4-ha/bin/bf4-ha-journal-export --operation {a.operation}',timeout=8)
+        if rc: continue
+        try: info=json.loads(out); rev=int(info.get('revision',0))
+        except Exception: continue
+        peer_seen.append((name,rev,info.get('current_controller')))
+        if rev>local_rev: newer.append((name,rev,info.get('current_controller')))
+    print('Peer journal views:',peer_seen or '(none)')
+    if newer: print('NO-GO: reachable controller has newer journal revision:',newer); return 18
+    if old not in cfg.get('nodes',{}) or candidate not in cfg.get('nodes',{}): print('NO-GO: journal DB identities not in config'); return 14
+    states,problems=discover_roles(cfg)
+    primaries=sorted(name for name,info in states.items() if info.get('role')=='PRIMARY')
+    if problems: print('Role-discovery warnings:',problems)
+    if len(primaries)>1: print('NO-GO: multiple reachable PostgreSQL primaries; split-brain/ambiguous topology:',primaries); return 24
+    primary=primaries[0] if len(primaries)==1 else None; print('Observed primary:',primary or '(none reachable)')
+    # Global topology invariant: a sole positively observed primary that is
+    # neither the journaled old primary nor the promotion candidate is never
+    # a legitimate recovery state.  Check this before credential prompts or
+    # any phase-specific continuation.  The old primary remains allowable
+    # here because fence-prepared legitimately observes it before mutation.
+    if primary not in (None,old,candidate): print('NO-GO: unexpected reachable primary during takeover:',primary); return 23
+    pw=prompt_fence_backend_password(cfg,st); ok,power=fence_backend_power_state(cfg,st,old,pw); old_tcp=tcp_check(cfg['nodes'][old]['ip'],5432,timeout=3); print('Old-primary power:',power); print('Old-primary 5432:','REACHABLE' if old_tcp else 'unreachable')
+    phase=st.get('journal_phase'); reconcile=None
+    if st.get('fence_completed'):
+        if not ok or power!='poweredOff' or old_tcp: print('NO-GO: completed fence contradicts external reality'); return 20
+    elif phase=='fence-prepared':
+        if ok and power=='poweredOn' and old_tcp and primary==old:
+            print('RECOVERY STATE: prepared/unmutated; ownership may transfer for explicit fence --resume.')
+        elif ok and power=='poweredOn' and not old_tcp:
+            gp,detail=guard_proven(cfg['nodes'][old]['ip'])
+            if not gp: print('NO-GO: prepared journal has dead DB TCP but boot guard cannot be proven:',detail); return 21
+            reconcile='fence-guard-established'; print('RECOVERY STATE: guard proven but checkpoint missing; reconcile forward.')
+        else: print('NO-GO: fence-prepared external reality is ambiguous/unsafe'); return 21
+    elif phase=='fence-guard-established':
+        if old_tcp: print('NO-GO: guarded journal contradicts reachable PostgreSQL TCP'); return 21
+        if ok and power=='poweredOn':
+            gp,detail=guard_proven(cfg['nodes'][old]['ip'])
+            if not gp: print('NO-GO: guard checkpoint cannot be independently verified:',detail); return 21
+            print('RECOVERY STATE: guarded/powered-on; ownership may transfer for explicit fence --resume.')
+        elif ok and power=='poweredOff': reconcile='fence-completed-recovered'; print('RECOVERY STATE: power-off completed; reconcile forward.')
+        else: print('NO-GO: guarded fence power reality unavailable/ambiguous'); return 21
+    else:
+        if st.get('promotion_completed') and primary!=candidate: print('NO-GO: promotion journal disagrees with observed primary'); return 22
+        if not st.get('promotion_completed') and primary not in (None,candidate): print('NO-GO: unexpected reachable primary during takeover'); return 23
+    if not a.execute: print('DRY RUN: takeover permitted; no journal changed.'); return 0
+    required=f'TAKE OVER {a.operation} FROM {owner} ON {here}'
+    if not confirm_exact(required): print('ABORTED'); return 30
+    if reconcile=='fence-guard-established': st['old_primary_postgresql_boot_guard']='startconf-disabled-plus-dual-mask-before-fence'; st['journal_phase']='fence-guard-established'
+    elif reconcile=='fence-completed-recovered': st['fence_completed']=True; st['fence_power_state_verified']='poweredOff'; st['old_primary_tcp_5432_verified_unreachable']=True; st['journal_phase']='fence-completed-recovered'
+    st['previous_controller']=owner; st['current_controller']=here; st['takeover_count']=int(st.get('takeover_count',0))+1; st['revision']=int(st['revision'])+1; st['updated_at_utc']=datetime.now(timezone.utc).isoformat(); st['last_takeover_at_utc']=st['updated_at_utc']
+    journal_commit_or_die(target,st,cfg,require_recovery=True); print(f"TAKEOVER COMPLETE: owner={here} revision={st['revision']} journal={target}"); return 0
+if __name__=='__main__': raise SystemExit(main())

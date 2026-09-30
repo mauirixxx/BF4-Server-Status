@@ -1,0 +1,489 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee, atomic_write_json, journal_commit_or_die, controller_identity, current_primary, dig_exact_a, journal_advance, journal_initialize, assert_new_operation_allowed, journal_effective_for_operation, journal_assert_owned,
+    failure_domain_snapshot, load_config, log_path, parse_pipe_rows,
+    prompt_vcenter_password, psql, site_for_dns,
+    site_for_worker, ssh, tcp_check, vcenter_poweroff_and_verify,
+    vcenter_target_info, prompt_esxi_password, esxi_power_state, esxi_poweroff_and_verify
+)
+
+CONTAINER = "BF4_ServerWatcher_Agent"
+
+
+def candidate_local_ready(ip):
+    sql = """
+SELECT pg_is_in_recovery(), pg_is_wal_replay_paused(),
+       pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    p = out.split("|")
+    if len(p) < 4:
+        return False, {}, f"unexpected candidate output: {out!r}"
+    d = dict(in_recovery=p[0], replay_paused=p[1],
+             receive_lsn=p[2], replay_lsn=p[3])
+    ok = p[0] == "t" and p[1] == "f" and p[2] and p[2] == p[3]
+    return ok, d, "" if ok else "candidate replay is not caught up/unpaused"
+
+
+def candidate_primary_view(primary_ip, candidate_ip):
+    sql = """
+SELECT client_addr, state, sync_state, sent_lsn, write_lsn,
+       flush_lsn, replay_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint
+FROM pg_stat_replication
+WHERE client_addr IS NOT NULL;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        return False, None, err or out
+    rows = parse_pipe_rows(out)
+    row = next((r for r in rows if len(r) >= 8 and r[0] == candidate_ip), None)
+    if not row:
+        return False, None, "candidate missing from pg_stat_replication"
+    try:
+        lag = int(row[7])
+    except ValueError:
+        return False, row, "invalid lag"
+    return row[1] == "streaming" and lag == 0, row, ""
+
+
+def writer_rows(primary_ip):
+    sql = """
+SELECT client_addr, state, count(*)
+FROM pg_stat_activity
+WHERE datname='bf4_serverwatcher'
+  AND backend_type='client backend'
+  AND usename='bf4_serverwatcher'
+GROUP BY client_addr, state
+ORDER BY client_addr, state;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    return rc, parse_pipe_rows(out) if rc == 0 else [], err or out
+
+
+def quiesce_state(cfg, snap, primary_ip):
+    deferred = set(snap["deferred_workers"])
+    running = []
+    errors = []
+
+    for name, meta in cfg["workers"].items():
+        rc, out, err = ssh(
+            meta["ip"],
+            f'docker ps --filter name=^{CONTAINER}$ '
+            '--format "{{.Names}}|{{.Status}}"',
+        )
+        if rc != 0:
+            if name not in deferred:
+                errors.append(f"{name}: inspection failed ({err or out})")
+        elif out.strip():
+            running.append(name)
+
+    rc, rows, err = writer_rows(primary_ip)
+    if rc != 0:
+        errors.append(f"writer-session query failed: {err}")
+
+    return not running and not rows and not errors, running, rows, errors
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--candidate")
+    ap.add_argument("--resume", metavar="OPERATION", help="resume this existing fencing transaction instead of creating a new one")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--expect-primary")
+    ap.add_argument("--tcp-timeout", type=float, default=3.0)
+    ap.add_argument("--fencing-backend", choices=("auto", "vcenter", "direct-esxi"), default="auto", help="fencing path; auto prefers vCenter and falls back to direct ESXi only after vCenter readiness fails")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("fence"))
+    state_file = Path(cfg["state"]["fence_file"])
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA DATABASE FENCE")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line()
+
+        resume_state = None
+        if args.resume:
+            effective = journal_effective_for_operation(cfg, args.resume)
+            if not effective:
+                log.line(f"NO-GO: no valid local journal for resume operation {args.resume}")
+                return 10
+            _resume_path, resume_state = effective
+            try:
+                journal_assert_owned(resume_state)
+            except Exception as exc:
+                log.line(f"NO-GO: {exc}")
+                return 10
+            if resume_state.get("journal_phase") not in ("fence-prepared", "fence-guard-established"):
+                log.line(f"NO-GO: operation phase {resume_state.get('journal_phase')} is not resumable by fence")
+                return 10
+        else:
+            try:
+                assert_new_operation_allowed(cfg)
+            except Exception as exc:
+                log.line(f"NO-GO: {exc}")
+                return 10
+
+        snap = failure_domain_snapshot(cfg)
+        if snap["ambiguous_isolated_sites"]:
+            log.line(
+                "NO-GO: ambiguous isolated sites: "
+                + ", ".join(sorted(snap["ambiguous_isolated_sites"]))
+            )
+            return 16
+
+        states = snap["db_states"]
+        primary = current_primary(states)
+        if not primary and resume_state and resume_state.get("journal_phase") == "fence-guard-established":
+            primary = resume_state.get("old_primary")
+        if not primary:
+            log.line("NO-GO: expected exactly one reachable primary (or guarded resume old-primary identity)")
+            return 10
+        if resume_state and primary != resume_state.get("old_primary"):
+            log.line(f"NO-GO: resume old-primary identity mismatch: observed/selected={primary} journal={resume_state.get('old_primary')}")
+            return 10
+
+        # Fail fast on an expected-primary mismatch before DNS, quiesce, candidate,
+        # or fencing-backend credential/readiness work.  Keep the later check as
+        # a second safety assertion immediately before the execute path.
+        if args.execute:
+            if args.expect_primary != primary:
+                log.line(f"NO-GO: --expect-primary must exactly equal {primary}")
+                return 20
+        elif args.expect_primary is not None and args.expect_primary != primary:
+            log.line(f"NO-GO: --expect-primary must exactly equal {primary}")
+            log.line("NO ACTION WAS TAKEN.")
+            return 10
+
+        primary_ip = cfg["nodes"][primary]["ip"]
+        candidate = resume_state.get("candidate") if resume_state else args.candidate
+        if args.resume and args.candidate and args.candidate != candidate:
+            log.line(f"NO-GO: --candidate {args.candidate} disagrees with journal candidate {candidate}")
+            return 20
+        if not candidate or candidate not in cfg["nodes"] or candidate == primary:
+            if args.execute:
+                log.line("NO-GO: --execute requires a distinct valid --candidate")
+                return 20
+        if candidate:
+            cs = states.get(candidate, {})
+            if cs.get("role") != "STANDBY":
+                log.line("NO-GO: candidate is not a reachable standby")
+                return 10
+
+        # Any unavailable DB node outside a SAFE isolated site is a blocker.
+        # The sole exception is the journaled old primary during an exact
+        # fence-guard-established resume: that host is expected to be down
+        # after the fencing action and is proven separately below by TCP and
+        # fencing-backend power-state checks.  No other unavailable DB node
+        # is exempted.
+        deferred_db = set(snap["deferred_db_nodes"])
+        guarded_resume_old = (
+            resume_state.get("old_primary")
+            if resume_state and resume_state.get("journal_phase") == "fence-guard-established"
+            else None
+        )
+        for name, state in states.items():
+            if (
+                not state.get("postgresql")
+                and name not in deferred_db
+                and name != guarded_resume_old
+            ):
+                log.line(
+                    f"NO-GO: {name} is unavailable outside SAFE isolated-site policy"
+                )
+                return 11
+
+        log.line(f"Discovered primary : {primary} ({primary_ip})")
+        if candidate:
+            log.line(
+                f"Candidate          : {candidate} "
+                f"({cfg['nodes'][candidate]['ip']})"
+            )
+        log.line(
+            "Safe isolated sites : "
+            + (
+                ", ".join(sorted(snap["safe_isolated_sites"]))
+                if snap["safe_isolated_sites"] else "none"
+            )
+        )
+
+        # Reachable DNS must still identify the old primary. SAFE isolated DNS may be deferred.
+        log.line()
+        log.line("Service DNS:")
+        reachable_dns = 0
+        for dns in cfg["dns"]["verify_servers"]:
+            rc, values, err = dig_exact_a(dns, cfg["service_dns"])
+            site = site_for_dns(cfg, dns)
+            if rc == 0:
+                reachable_dns += 1
+                ok = values == [primary_ip]
+                log.line(
+                    f"  {dns:<16} -> "
+                    f"{','.join(values) if values else '(no answer)':<15} "
+                    f"{'PASS' if ok else 'FAIL'}"
+                )
+                if not ok:
+                    return 13
+            elif site in snap["safe_isolated_sites"]:
+                log.line(f"  {dns:<16} -> DEFERRED ISOLATED-SAFE({site})")
+            else:
+                log.line(f"  {dns:<16} -> FAIL unreachable")
+                return 13
+
+        min_dns = int(
+            cfg.get("degraded_mode", {}).get(
+                "minimum_reachable_dns_servers_for_cutover", 2
+            )
+        )
+        if reachable_dns < min_dns:
+            log.line(f"NO-GO: reachable DNS={reachable_dns}, minimum={min_dns}")
+            return 13
+
+        primary_tcp_now = tcp_check(primary_ip, 5432, timeout=args.tcp_timeout)
+        if not (resume_state and resume_state.get("journal_phase") == "fence-guard-established") and not primary_tcp_now:
+            log.line("NO-GO: current primary TCP/5432 is unavailable before fence")
+            return 11
+        if resume_state and resume_state.get("journal_phase") == "fence-guard-established" and primary_tcp_now:
+            log.line("NO-GO: guarded journal contradicts reality: old primary TCP/5432 is reachable")
+            return 11
+
+        guarded_resume = bool(resume_state and resume_state.get("journal_phase") == "fence-guard-established")
+        if guarded_resume:
+            q_ok, running, writers, errors = True, [], [], []
+        else:
+            q_ok, running, writers, errors = quiesce_state(cfg, snap, primary_ip)
+        log.line()
+        log.line("Quiesce state:")
+        log.line(
+            "  running reachable workers: "
+            + (", ".join(running) if running else "none")
+        )
+        log.line(f"  writer-session groups     : {len(writers)}")
+        log.line(
+            "  deferred isolated workers : "
+            + (
+                ", ".join(snap["deferred_workers"])
+                if snap["deferred_workers"] else "none"
+            )
+        )
+        if errors:
+            for e in errors:
+                log.line(f"  ERROR: {e}")
+        log.line(f"  verdict                   : {'QUIESCED' if q_ok else 'NOT QUIESCED'}")
+
+        candidate_record = None
+        if guarded_resume:
+            candidate_record = {
+                "candidate": candidate, "candidate_ip": cfg["nodes"][candidate]["ip"],
+                "candidate_receive_lsn": resume_state.get("candidate_receive_lsn_before_fence"),
+                "candidate_replay_lsn": resume_state.get("candidate_replay_lsn_before_fence"),
+                "candidate_primary_view_replay_lsn": resume_state.get("candidate_primary_view_replay_lsn_before_fence"),
+                "candidate_primary_view_lag_bytes": resume_state.get("candidate_lag_bytes_before_fence", 0),
+            }
+        elif candidate:
+            candidate_ip = cfg["nodes"][candidate]["ip"]
+            local_ok, local, local_err = candidate_local_ready(candidate_ip)
+            view_ok, row, view_err = candidate_primary_view(primary_ip, candidate_ip)
+            log.line()
+            log.line("Candidate final readiness:")
+            log.line(f"  in_recovery   : {local.get('in_recovery', '?')}")
+            log.line(f"  replay_paused : {local.get('replay_paused', '?')}")
+            log.line(f"  receive_lsn   : {local.get('receive_lsn', '?')}")
+            log.line(f"  replay_lsn    : {local.get('replay_lsn', '?')}")
+            if row:
+                log.line(f"  primary view  : state={row[1]} lag={row[7]} bytes")
+            if local_ok and view_ok:
+                candidate_record = {
+                    "candidate": candidate,
+                    "candidate_ip": candidate_ip,
+                    "candidate_receive_lsn": local["receive_lsn"],
+                    "candidate_replay_lsn": local["replay_lsn"],
+                    "candidate_primary_view_replay_lsn": row[6],
+                    "candidate_primary_view_lag_bytes": int(row[7]),
+                }
+                log.line("  Verdict       : PASS")
+            else:
+                log.line(f"  Verdict       : FAIL {local_err or view_err}")
+
+        log.line()
+        requested_backend = args.fencing_backend
+        fencing_backend = None
+        fence_password = None
+        if requested_backend in ("auto", "vcenter"):
+            vc_password = prompt_vcenter_password(cfg["vcenter"]["username"])
+            ok, info = vcenter_target_info(cfg, primary, vc_password)
+            allowed_power = {"poweredOn", "poweredOff"} if resume_state else {"poweredOn"}
+            if ok and info["power_state"] in allowed_power:
+                fencing_backend = "vcenter"
+                fence_password = vc_password
+                log.line(f"vCenter target: {info['vm_name']} | ESXi={info['actual_esxi']} | power={info['power_state']} | PowerOff={info['poweroff']}")
+            elif requested_backend == "vcenter":
+                log.line(f"NO-GO: vCenter fencing readiness failed: {info}")
+                return 14
+            else:
+                log.line(f"vCenter fencing path: UNAVAILABLE ({info})")
+        if requested_backend == "direct-esxi" or (requested_backend == "auto" and fencing_backend is None):
+            esxi_password = prompt_esxi_password(cfg.get("esxi", {}).get("username", "root"))
+            ok, power = esxi_power_state(cfg, primary, esxi_password)
+            allowed_power = {"poweredOn", "poweredOff"} if resume_state else {"poweredOn"}
+            if not ok or power not in allowed_power:
+                log.line(f"NO-GO: direct ESXi fencing readiness failed: {power}")
+                return 14
+            fencing_backend = "direct-esxi"
+            fence_password = esxi_password
+            mapping = cfg["esxi"]["db_vm_map"][primary]
+            host = cfg["esxi"]["hosts"][mapping["esxi_host"]]
+            log.line("DIRECT ESXi FALLBACK READY")
+            log.line(f"  VM            : {mapping['vm_name']}")
+            log.line(f"  Expected ESXi : {mapping['esxi_host']} ({host['ip']})")
+            log.line(f"  VM power      : {power}")
+
+        if not args.execute and args.expect_primary is not None and args.expect_primary != primary:
+            log.line(f"NO-GO: --expect-primary must exactly equal {primary}")
+            log.line("NO ACTION WAS TAKEN.")
+            return 10
+
+        if not args.execute:
+            log.line()
+            log.line("DRY RUN RESULT: PASS")
+            log.line(f"WOULD FENCE {primary}")
+            if not q_ok:
+                log.line("EXECUTION BLOCKER: workload is not quiesced.")
+            if not candidate_record:
+                log.line("EXECUTION BLOCKER: candidate final readiness not proven.")
+            if snap["safe_isolated_sites"]:
+                log.line(
+                    "DEGRADED MODE: would record deferred sites/nodes/workers/DNS "
+                    "in the fence handoff."
+                )
+            log.line("NO ACTION WAS TAKEN.")
+            return 0
+
+        if args.expect_primary != primary:
+            log.line(
+                f"NO-GO: --expect-primary must exactly equal {primary}"
+            )
+            return 20
+        if not q_ok:
+            return 16
+        if not candidate_record:
+            return 12
+
+        if fencing_backend == "direct-esxi":
+            host_key = cfg["esxi"]["db_vm_map"][primary]["esxi_host"]
+            required = (f"RESUME DIRECT ESXI FENCE {primary} ON {host_key} FOR {candidate}" if resume_state else f"DIRECT ESXI FENCE {primary} ON {host_key} FOR {candidate}")
+        else:
+            required = (f"RESUME FENCE {primary} FOR {candidate}" if resume_state else f"FENCE {primary} FOR {candidate}")
+        if not confirm_exact(required):
+            return 20
+
+        if resume_state:
+            state = resume_state
+        else:
+            state = {
+                "old_primary": primary, "old_primary_ip": primary_ip,
+                "old_primary_vm": cfg["nodes"][primary]["vm_name"], "old_primary_esxi": cfg["nodes"][primary]["esxi"],
+                "candidate": candidate, "candidate_ip": candidate_record["candidate_ip"],
+                "candidate_receive_lsn_before_fence": candidate_record["candidate_receive_lsn"],
+                "candidate_replay_lsn_before_fence": candidate_record["candidate_replay_lsn"],
+                "candidate_primary_view_replay_lsn_before_fence": candidate_record["candidate_primary_view_replay_lsn"],
+                "candidate_lag_bytes_before_fence": candidate_record["candidate_primary_view_lag_bytes"],
+                "fencing_backend": fencing_backend, "fence_completed": False, "fence_power_state_verified": None,
+                "old_primary_tcp_5432_verified_unreachable": False, "old_primary_postgresql_boot_guard": None,
+                "safe_isolated_sites_at_fence": sorted(snap["safe_isolated_sites"]), "deferred_sites": sorted(snap["safe_isolated_sites"]),
+                "deferred_db_nodes": snap["deferred_db_nodes"], "deferred_workers": snap["deferred_workers"], "deferred_dns_servers": snap["deferred_dns_servers"],
+                "promotion_completed": False, "reparent_completed": False, "dns_completed": False, "postcheck_completed": False, "rejoin_completed": False,
+            }
+            journal_initialize(state, phase="fence-prepared")
+            journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+            log.line(f"Prepared HA operation: {state['operation_id']} revision={state['revision']} owner={state['current_controller']}")
+
+        if state.get("journal_phase") == "fence-prepared":
+            # Revalidate immediately before the first mutation, especially on resume.
+            local_ok, local, local_err = candidate_local_ready(cfg["nodes"][candidate]["ip"])
+            view_ok, row, view_err = candidate_primary_view(primary_ip, cfg["nodes"][candidate]["ip"])
+            q2_ok, r2, w2, e2 = quiesce_state(cfg, snap, primary_ip)
+            if not local_ok or not view_ok or not q2_ok:
+                log.line(f"NO-GO: pre-mutation barrier failed: candidate={local_err or view_err or 'PASS'} quiesce={'PASS' if q2_ok else 'FAIL'}")
+                return 16
+            guard_cmd = (
+                "set -e; START=/etc/postgresql/16/main/start.conf; STAMP=$(date -u +%Y%m%dT%H%M%SZ); "
+                "cp -a \"$START\" \"${START}.pre-bf4-ha-${STAMP}\"; printf 'disabled\\n' > \"$START\"; chmod 644 \"$START\"; "
+                "systemctl stop postgresql@16-main.service postgresql.service 2>/dev/null || true; "
+                "systemctl mask postgresql.service postgresql@16-main.service; "
+                "printf 'startconf='; awk '!/^[[:space:]]*#/ && NF {gsub(/^[[:space:]]+|[[:space:]]+$/,\"\"); print; exit}' \"$START\"; "
+                "printf 'meta='; systemctl is-enabled postgresql.service || true; printf 'cluster='; systemctl is-enabled postgresql@16-main.service || true; "
+                "printf 'active='; systemctl is-active postgresql@16-main.service || true; printf 'listen='; if ss -lnt | awk '{print $4}' | grep -Eq '(^|:)(5432)$'; then echo yes; else echo no; fi"
+            )
+            mrc,mout,merr=ssh(primary_ip,guard_cmd,timeout=45)
+            if mrc != 0 or "startconf=disabled" not in mout or "meta=masked" not in mout or "cluster=masked" not in mout or "listen=no" not in mout:
+                log.line(f"FAIL: could not establish durable PostgreSQL boot guard ({merr or mout})"); return 14
+            state["old_primary_postgresql_boot_guard"]="startconf-disabled-plus-dual-mask-before-fence"
+            state["old_primary_boot_guard_verified_at_utc"]=datetime.now(timezone.utc).isoformat()
+            journal_advance(state,"fence-guard-established")
+            journal_commit_or_die(state_file,state,cfg,require_recovery=True)
+            log.line("PostgreSQL boot guard: PASS and durably checkpointed")
+
+        # If a prior controller's power-off completed but its journal update did not, reconcile forward.
+        from bf4_ha.common import fence_backend_power_state
+        pok,power=fence_backend_power_state(cfg,state,primary,fence_password)
+        if pok and power == "poweredOff" and not tcp_check(primary_ip,5432,timeout=args.tcp_timeout):
+            state["fence_completed"]=True; state["fence_power_state_verified"]="poweredOff"; state["old_primary_tcp_5432_verified_unreachable"]=True
+            journal_advance(state,"fence-completed-recovered"); journal_commit_or_die(state_file,state,cfg,require_recovery=True)
+            log.line("RECOVERY: power-off already completed; reconciled forward without duplicate power-off")
+            return 0
+
+        if fencing_backend == "direct-esxi":
+            ok, detail = esxi_poweroff_and_verify(cfg, primary, fence_password, timeout=120)
+        else:
+            ok, detail = vcenter_poweroff_and_verify(cfg, primary, fence_password, timeout=120)
+        if not ok:
+            log.line(f"FAIL: {detail}")
+            return 14
+
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if not tcp_check(primary_ip, 5432, timeout=args.tcp_timeout):
+                break
+            time.sleep(1)
+        else:
+            log.line("FAIL: old primary remains reachable on TCP/5432")
+            return 30
+
+        state["fence_completed"] = True
+        state["fence_power_state_verified"] = "poweredOff"
+        state["vcenter_power_state_verified"] = "poweredOff" if fencing_backend == "vcenter" else None
+        state["esxi_power_state_verified"] = "poweredOff" if fencing_backend == "direct-esxi" else None
+        state["old_primary_esxi_host"] = cfg.get("esxi", {}).get("db_vm_map", {}).get(primary, {}).get("esxi_host")
+        state["old_primary_esxi_ip"] = cfg.get("esxi", {}).get("hosts", {}).get(state.get("old_primary_esxi_host", ""), {}).get("ip")
+        state["old_primary_tcp_5432_verified_unreachable"] = True
+        journal_advance(state, "fence-completed")
+        journal_commit_or_die(state_file, state, cfg, require_recovery=True)
+
+        log.line()
+        log.line("FENCE VERIFIED")
+        log.line(f"Deferred sites  : {state['deferred_sites'] or 'none'}")
+        log.line(f"Handoff state   : {state_file}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

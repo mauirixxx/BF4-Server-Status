@@ -1,0 +1,154 @@
+{
+  "service_dns": "db.example.com",
+  "dns": {
+    "verify_servers": [
+      "10.0.10.53",
+      "10.0.10.54",
+      "10.0.20.53"
+    ],
+    "zone": "example.com.",
+    "service_record": "db.example.com.",
+    "ttl": 60,
+    "convergence_timeout_seconds": 900,
+    "convergence_poll_seconds": 5,
+    "backend": "bind-tsig",
+    "bind": {
+      "primary_name": "dns-01",
+      "primary_ip": "10.0.10.53",
+      "authoritative_servers": [
+        "10.0.10.53",
+        "10.0.10.54",
+        "10.0.20.53"
+      ],
+      "tsig_key_file": "/etc/bf4-ha/keys/bf4-ha-db-update.key",
+      "tsig_key_name": "bf4-ha-db-update",
+      "expected_zone": "example.com.",
+      "service_record": "db.example.com.",
+      "authoritative_names": {
+        "10.0.10.53": "dns-01",
+        "10.0.10.54": "dns-02",
+        "10.0.20.53": "dns-03"
+      }
+    }
+  },
+  "vcenter": {
+    "server": "10.0.10.10",
+    "username": "bf4-ha-fence@example.local"
+  },
+  "nodes": {
+    "sitea-db-01": {
+      "ip": "10.0.10.21",
+      "slot": "sitea_db_01",
+      "vm_name": "bf4 db sitea-db-01",
+      "esxi": "10.0.10.11"
+    },
+    "sitea-db-02": {
+      "ip": "10.0.10.22",
+      "slot": "sitea_db_02",
+      "vm_name": "bf4 db sitea-db-02",
+      "esxi": "10.0.10.12"
+    },
+    "siteb-db-01": {
+      "ip": "10.0.20.21",
+      "slot": "siteb_db_01",
+      "vm_name": "bf4 db siteb-db-01",
+      "esxi": "10.0.20.11"
+    }
+  },
+  "workers": {
+    "sitea-worker-01": {
+      "ip": "10.0.10.31"
+    },
+    "siteb-worker-01": {
+      "ip": "10.0.20.31"
+    }
+  },
+  "health": {
+    "replication_lag_warn_bytes": 1,
+    "replication_lag_degraded_bytes": 1048576
+  },
+  "state": {
+    "dir": "/opt/bf4-ha/state",
+    "fence_file": "/opt/bf4-ha/state/fence.json",
+    "minimum_recovery_copies": 2
+  },
+  "sites": {
+    "sitea": {
+      "name": "Site A",
+      "db_nodes": [
+        "sitea-db-01",
+        "sitea-db-02"
+      ],
+      "workers": [
+        "sitea-worker-01"
+      ],
+      "dns_servers": [
+        "10.0.10.53",
+        "10.0.10.54"
+      ]
+    },
+    "siteb": {
+      "name": "Site B",
+      "db_nodes": [
+        "siteb-db-01"
+      ],
+      "workers": [
+        "siteb-worker-01"
+      ],
+      "dns_servers": [
+        "10.0.20.53"
+      ]
+    }
+  },
+  "degraded_mode": {
+    "allow_isolated_noncritical_sites": true,
+    "require_no_worker_db_session_for_isolated_worker": true,
+    "minimum_reachable_standbys_for_failover": 2,
+    "minimum_reachable_dns_servers_for_cutover": 2
+  },
+  "esxi": {
+    "username": "root",
+    "hosts": {
+      "sitea-esxi-01": {
+        "name": "sitea-esxi-01.example.local",
+        "ip": "10.0.10.11",
+        "site": "sitea"
+      },
+      "sitea-esxi-02": {
+        "name": "sitea-esxi-02.example.local",
+        "ip": "10.0.10.12",
+        "site": "sitea"
+      },
+      "siteb-esxi-01": {
+        "name": "siteb-esxi-01.example.local",
+        "ip": "10.0.20.11",
+        "site": "siteb"
+      }
+    },
+    "db_vm_map": {
+      "sitea-db-01": {
+        "esxi_host": "sitea-esxi-01",
+        "vm_name": "bf4 db sitea-db-01"
+      },
+      "sitea-db-02": {
+        "esxi_host": "sitea-esxi-02",
+        "vm_name": "bf4 db sitea-db-02"
+      },
+      "siteb-db-01": {
+        "esxi_host": "siteb-esxi-01",
+        "vm_name": "bf4 db siteb-db-01"
+      }
+    }
+  },
+  "controllers": {
+    "sitea-controller-01": {
+      "ip": "10.0.10.41"
+    },
+    "sitea-controller-02": {
+      "ip": "10.0.10.42"
+    },
+    "siteb-controller-01": {
+      "ip": "10.0.20.41"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import banner, current_primary, failure_domain_snapshot, load_config, parse_pipe_rows, psql
+
+EXPECTED = {
+    'tcp_keepalives_idle': '60',
+    'tcp_keepalives_interval': '15',
+    'tcp_keepalives_count': '4',
+    'client_connection_check_interval': '30s',
+}
+
+def main():
+    cfg=load_config(); snap=failure_domain_snapshot(cfg); primary=current_primary(snap['db_states'])
+    banner('BF4 HA SERVERWATCHER DEAD-PEER CHECK')
+    print('MODE: READ ONLY')
+    if not primary:
+        print('NO-GO: exactly one reachable primary was not discovered'); return 10
+    ip=cfg['nodes'][primary]['ip']; print(f'Primary : {primary} ({ip})'); print('Role    : bf4_serverwatcher'); print()
+    sql="SELECT rolconfig FROM pg_roles WHERE rolname='bf4_serverwatcher';"
+    rc,out,err=psql(ip,sql)
+    if rc!=0:
+        print('FAIL: could not query role configuration:', err or out); return 11
+    rows=parse_pipe_rows(out); raw=rows[0][0] if rows and rows[0] else ''
+    print('Configured role defaults:'); print(' ', raw or '(none)'); print()
+    missing=[]
+    for k,v in EXPECTED.items():
+        token=f'{k}={v}'
+        ok=token in raw
+        print(f'  {k:<34} expected={v:<5} {"PASS" if ok else "MISSING"}')
+        if not ok: missing.append(token)
+    print()
+    if missing:
+        print('VERDICT: NOT CONFIGURED')
+        print('Existing sessions are intentionally untouched by this check.')
+        return 2
+    print('VERDICT: PASS')
+    print('New bf4_serverwatcher connections inherit bounded dead-peer detection.')
+    print('Target keepalive failure window: approximately 120 seconds after keepalive idle begins.')
+    print('Existing sessions must reconnect before the new role defaults apply to them.')
+    return 0
+
+if __name__=='__main__': raise SystemExit(main())

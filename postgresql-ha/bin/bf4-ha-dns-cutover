@@ -1,0 +1,490 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from bf4_ha.common import (
+    confirm_exact,
+    Tee, atomic_write_json, journal_commit_or_die, journal_advance, journal_assert_owned, journal_effective_active, dig_exact_a, load_config, log_path, nsupdate_tsig,
+    nsupdate_tsig_prereq,
+    parse_pipe_rows, prompt_vcenter_password, psql, read_json_file, run,
+    tcp_check, vcenter_power_state, fence_backend_power_state, prompt_fence_backend_password,
+)
+
+
+def primary_state(ip):
+    sql = """
+SELECT pg_is_in_recovery(),
+       current_setting('transaction_read_only'),
+       current_setting('default_transaction_read_only'),
+       pg_current_wal_lsn();
+"""
+    rc, out, err = psql(ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    parts = out.split("|")
+    if len(parts) < 4:
+        return False, {}, f"unexpected primary-state output: {out!r}"
+    return True, {
+        "in_recovery": parts[0],
+        "transaction_read_only": parts[1],
+        "default_transaction_read_only": parts[2],
+        "wal_lsn": parts[3],
+    }, ""
+
+
+def replication_view(primary_ip):
+    sql = """
+SELECT client_addr, state, sync_state, sent_lsn, write_lsn, flush_lsn,
+       replay_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint
+FROM pg_stat_replication
+ORDER BY client_addr;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    view = {}
+    for row in parse_pipe_rows(out):
+        if len(row) >= 8:
+            view[row[0]] = {
+                "state": row[1], "sync_state": row[2], "sent_lsn": row[3],
+                "write_lsn": row[4], "flush_lsn": row[5],
+                "replay_lsn": row[6], "lag_bytes": row[7],
+            }
+    return True, view, ""
+
+
+def slot_view(primary_ip):
+    sql = """
+SELECT slot_name, slot_type, active, restart_lsn, wal_status
+FROM pg_replication_slots
+ORDER BY slot_name;
+"""
+    rc, out, err = psql(primary_ip, sql)
+    if rc != 0:
+        return False, {}, err or out
+    slots = {}
+    for row in parse_pipe_rows(out):
+        if len(row) >= 5:
+            slots[row[0]] = {
+                "slot_type": row[1], "active": row[2],
+                "restart_lsn": row[3], "wal_status": row[4],
+            }
+    return True, slots, ""
+
+
+
+def dns_name(cfg, ip):
+    return (
+        cfg.get("dns", {})
+        .get("bind", {})
+        .get("authoritative_names", {})
+        .get(ip, ip)
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Guarded secure DNS cutover after verified promotion/reparent.")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--expect-primary")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    log = Tee(log_path("dns-cutover"))
+    fence_file = Path(cfg["state"]["fence_file"])
+    dns_cfg = cfg["dns"]
+
+    try:
+        log.line("=" * 68)
+        log.line(" BF4 HA DNS CUTOVER")
+        log.line("=" * 68)
+        log.line(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
+        log.line()
+
+        if not fence_file.exists():
+            log.line(f"NO-GO: HA handoff state is missing: {fence_file}")
+            return 14
+        try:
+            effective = journal_effective_active(cfg)
+            if not effective:
+                raise RuntimeError("no effective active HA journal")
+            _effective_path, state = effective
+
+            journal_assert_owned(state)
+        except Exception as exc:
+            log.line(f"NO-GO: cannot read HA handoff state: {exc}")
+            return 14
+        if not state.get("promotion_completed"):
+            log.line("NO-GO: promotion_completed is not true"); return 10
+        if not state.get("reparent_completed"):
+            log.line("NO-GO: reparent_completed is not true"); return 10
+        if state.get("dns_completed"):
+            log.line("NO-GO: dns_completed is already true"); return 10
+
+        old_primary = state.get("old_primary")
+        old_primary_ip = state.get("old_primary_ip")
+        new_primary = state.get("new_primary")
+        new_primary_ip = state.get("new_primary_ip")
+        if not all([old_primary, old_primary_ip, new_primary, new_primary_ip]):
+            log.line("NO-GO: HA handoff state is incomplete"); return 14
+        if not args.execute and args.expect_primary is not None and args.expect_primary != new_primary:
+            log.line(f"NO-GO: --expect-primary must equal {new_primary}")
+            log.line("NO ACTION WAS TAKEN.")
+            return 10
+        if args.execute and args.expect_primary != new_primary:
+            log.line(f"NO-GO: live execution requires --expect-primary {new_primary}"); return 20
+
+        log.line("HA handoff:")
+        log.line(f"  old primary : {old_primary} ({old_primary_ip})")
+        log.line(f"  new primary : {new_primary} ({new_primary_ip})")
+        log.line()
+
+        ok, pstate, err = primary_state(new_primary_ip)
+        if not ok:
+            log.line(f"NO-GO: new-primary query failed: {err}"); return 11
+        if (pstate["in_recovery"] != "f" or pstate["transaction_read_only"] != "off" or
+                pstate["default_transaction_read_only"] != "off"):
+            log.line("NO-GO: recorded new primary is not writable"); return 10
+        if not tcp_check(new_primary_ip, 5432, timeout=3.0):
+            log.line("NO-GO: new primary TCP/5432 is unreachable"); return 11
+
+        password = prompt_fence_backend_password(cfg, state)
+        ok, power = fence_backend_power_state(cfg, state, old_primary, password)
+        if not ok:
+            log.line(f"NO-GO: old-primary fence-backend check failed: {power}"); return 14
+        log.line(f"Old-primary fence state: {power}")
+        if power != "poweredOff":
+            log.line("NO-GO: old primary is no longer poweredOff"); return 14
+        if tcp_check(old_primary_ip, 5432, timeout=3.0):
+            log.line("NO-GO: old primary TCP/5432 is reachable"); return 30
+        log.line("Old-primary TCP/5432: unreachable")
+
+        survivors = state.get("survivors", {})
+        ok, repl, err = replication_view(new_primary_ip)
+        if not ok:
+            log.line(f"NO-GO: replication view failed: {err}"); return 11
+        ok, slots, err = slot_view(new_primary_ip)
+        if not ok:
+            log.line(f"NO-GO: slot view failed: {err}"); return 11
+
+        log.line(); log.line("Survivor replication:")
+        for name, meta in survivors.items():
+            row, slot = repl.get(meta["ip"]), slots.get(meta["slot"])
+            if not row or row["state"] != "streaming":
+                log.line(f"  {name:<12} FAIL: not streaming"); return 11
+            try: lag = int(row["lag_bytes"])
+            except ValueError:
+                log.line(f"  {name:<12} FAIL: invalid lag"); return 12
+            if lag != 0:
+                log.line(f"  {name:<12} FAIL: lag={lag} bytes"); return 12
+            if not slot or slot["slot_type"] != "physical" or slot["active"] != "t":
+                log.line(f"  {name:<12} FAIL: slot {meta['slot']} not active physical"); return 11
+            log.line(f"  {name:<12} streaming lag=0 slot={meta['slot']} active=t")
+
+        backend = dns_cfg.get("backend")
+        record, zone = dns_cfg["service_record"], dns_cfg["zone"]
+        ttl = int(dns_cfg["ttl"])
+
+        if backend != "bind-tsig":
+            log.line(
+                f"NO-GO: unsupported or missing DNS backend: {backend!r}; "
+                "required 'bind-tsig'"
+            )
+            return 15
+
+        bind_cfg = dns_cfg.get("bind", {})
+        update_server = bind_cfg.get("primary_ip")
+        auth_ip = update_server
+        bind_authoritative = bind_cfg.get("authoritative_servers", [])
+        resolver_servers = list(bind_authoritative)
+        tsig_key_file = bind_cfg.get("tsig_key_file")
+        log.line(); log.line("DNS backend: BIND / TSIG")
+        if not update_server or not bind_authoritative or not tsig_key_file:
+            log.line("  FAIL: BIND backend configuration incomplete")
+            return 15
+        try:
+            import os, stat
+            st = os.stat(tsig_key_file)
+            mode = stat.S_IMODE(st.st_mode)
+        except OSError as exc:
+            log.line(f"  FAIL: cannot read TSIG key metadata: {exc}")
+            return 15
+        if st.st_uid != 0 or st.st_gid != 0 or mode != 0o600:
+            log.line("  FAIL: TSIG key must be root:root 0600")
+            return 15
+        log.line(f"  Primary authoritative: {update_server}")
+        log.line(f"  TSIG key: {tsig_key_file} PASS")
+        convergence_timeout = int(dns_cfg["convergence_timeout_seconds"])
+        poll = int(dns_cfg["convergence_poll_seconds"])
+
+        # Determine the authoritative state first.  AD/GSS-TSIG may apply an
+        # update even when nsupdate returns a TSIG verification failure, so the
+        # authoritative value is the source of truth for recovery.
+        arc, auth_values, aerr = dig_exact_a(auth_ip, record)
+        if arc != 0:
+            log.line(f"NO-GO: authoritative DNS query failed: {aerr}")
+            return 13
+
+        if len(auth_values) != 1:
+            log.line(
+                "NO-GO: BIND authoritative service record must have exactly "
+                f"one A value before TSIG authentication: {auth_values}"
+            )
+            return 13
+        trc, tout, terr = nsupdate_tsig_prereq(
+            update_server, zone, record, auth_values[0], tsig_key_file
+        )
+        if trc != 0:
+            detail = terr or tout or f"nsupdate exit code {trc}"
+            log.line(f"  TSIG auth: FAIL ({detail})")
+            return 15
+        log.line("  TSIG auth: PASS (signed prerequisite-only; no DNS change)")
+
+        auth_is_old = auth_values == [old_primary_ip]
+        auth_is_new = auth_values == [new_primary_ip]
+        if not (auth_is_old or auth_is_new):
+            log.line(
+                "NO-GO: authoritative DNS is neither the fenced old primary "
+                f"nor the promoted new primary: {auth_values}"
+            )
+            return 13
+
+        log.line(); log.line("Pre-cutover resolver state:")
+        resolver_state = {}
+        for dns in resolver_servers:
+            rc, values, err = dig_exact_a(dns, record)
+            resolver_state[dns] = values if rc == 0 else []
+            if rc != 0:
+                label = "UNREACHABLE"
+            elif values == [old_primary_ip]:
+                label = "OLD"
+            elif values == [new_primary_ip]:
+                label = "NEW"
+            else:
+                label = "UNEXPECTED"
+            name = dns_name(cfg, dns)
+            log.line(
+                f"  {name:<12} {dns:<16} -> "
+                f"{','.join(values) if values else '(no answer)':<15} {label}"
+            )
+
+        if auth_is_old:
+            bad = [
+                dns for dns, values in resolver_state.items()
+                if values != [old_primary_ip]
+            ]
+            if bad:
+                log.line(
+                    "NO-GO: authoritative DNS still points to the old primary "
+                    "but resolver state is mixed/unexpected."
+                )
+                return 13
+            mode = "WRITE"
+        else:
+            # Authoritative value already equals the promoted primary.  This is
+            # an idempotent recovery path for the known AD GSS-TSIG case where
+            # nsupdate applied the change but returned nonzero while verifying
+            # the signed response.
+            unexpected = [
+                dns for dns, values in resolver_state.items()
+                if values not in ([old_primary_ip], [new_primary_ip])
+            ]
+            if unexpected:
+                log.line(
+                    "NO-GO: authoritative DNS is new but one or more resolvers "
+                    "returned an unexpected value."
+                )
+                return 13
+            mode = "CONVERGENCE-RECOVERY"
+
+        log.line()
+        log.line(f"DNS operation mode: {mode}")
+        log.line(
+            f"Authoritative state: {auth_ip} -> "
+            f"{new_primary_ip if auth_is_new else old_primary_ip}"
+        )
+
+        if not args.execute:
+            log.line(); log.line("DRY RUN RESULT: PASS")
+            if mode == "WRITE":
+                log.line(
+                    f"WOULD UPDATE {record} -> {new_primary_ip} using {update_server} backend={backend}"
+                )
+                log.line(
+                    "WOULD TREAT nonzero nsupdate as AMBIGUOUS and verify "
+                    "authoritative DNS before deciding success/failure."
+                )
+            else:
+                log.line(
+                    "WOULD NOT SEND ANOTHER UPDATE: authoritative DNS already "
+                    f"equals {new_primary_ip}."
+                )
+                log.line(
+                    "WOULD WAIT FOR ALL CONFIGURED RESOLVERS TO CONVERGE, THEN "
+                    "MARK DNS CUTOVER COMPLETE."
+                )
+            log.line("NO ACTION WAS TAKEN.")
+            log.line(f"Log: {log.path}")
+            return 0
+
+        required = f"DNS CUTOVER {record.rstrip('.')} TO {new_primary_ip}"
+        log.line(); log.line("DNS WRITE BOUNDARY"); log.line(f"Required confirmation: {required}")
+        if not confirm_exact(required, "Type confirmation exactly: "):
+            log.line("CANCELLED: confirmation did not match."); return 20
+
+        nsupdate_rc = None
+        nsupdate_ambiguous = False
+
+        if mode == "WRITE":
+            log.line(); log.line("Submitting BIND TSIG nsupdate...")
+            rc, out, err = nsupdate_tsig(
+                update_server, zone, record, ttl, new_primary_ip,
+                tsig_key_file
+            )
+            nsupdate_rc = rc
+            if out:
+                log.line("nsupdate stdout:")
+                for line in out.splitlines():
+                    log.line(f"  {line}")
+            if err:
+                log.line("nsupdate stderr:")
+                for line in err.splitlines():
+                    log.line(f"  {line}")
+            log.line(f"nsupdate exit code: {rc}")
+
+            # A nonzero return is AMBIGUOUS, not automatically success or
+            # failure. The authoritative value decides whether the update
+            # actually landed. We never ignore the exit code; it is recorded
+            # in the handoff state.
+            if rc != 0:
+                nsupdate_ambiguous = True
+                log.line(
+                    "WARNING: nsupdate returned nonzero; checking authoritative "
+                    "DNS before deciding outcome."
+                )
+
+            deadline = time.time() + 30
+            auth_ok = False
+            while time.time() < deadline:
+                qrc, values, err2 = dig_exact_a(auth_ip, record)
+                if qrc == 0 and values == [new_primary_ip]:
+                    auth_ok = True
+                    break
+                time.sleep(1)
+
+            if not auth_ok:
+                log.line(
+                    f"FAIL: authoritative DNS did not become exactly {new_primary_ip}"
+                )
+                return 13
+
+            if rc != 0:
+                log.line(
+                    "AMBIGUOUS NSUPDATE RESOLVED AS SUCCESS: authoritative "
+                    "server contains the requested value."
+                )
+            log.line(
+                f"Authoritative verification: {auth_ip} -> {new_primary_ip} PASS"
+            )
+        else:
+            log.line()
+            log.line(
+                "Authoritative DNS already contains requested target; "
+                "skipping duplicate nsupdate."
+            )
+            log.line(
+                f"Authoritative verification: {auth_ip} -> {new_primary_ip} PASS"
+            )
+
+        if backend == "bind-tsig":
+            log.line("Waiting for BIND authoritative convergence...")
+            deadline = time.time() + min(convergence_timeout, 120)
+            bind_last = {}
+            while time.time() < deadline:
+                all_bind_ok = True
+                for dns in bind_authoritative:
+                    rc, values, err2 = dig_exact_a(dns, record)
+                    bind_last[dns] = values
+                    if rc != 0 or values != [new_primary_ip]:
+                        all_bind_ok = False
+                if all_bind_ok:
+                    break
+                time.sleep(poll)
+            else:
+                log.line("FAIL: BIND authoritative convergence timed out")
+                for dns in bind_authoritative:
+                    vals = bind_last.get(dns, [])
+                    log.line(
+                        f"  {dns:<16} -> "
+                        f"{','.join(vals) if vals else '(no answer)'}"
+                    )
+                return 13
+            for dns in bind_authoritative:
+                log.line(f"  {dns:<16} -> {new_primary_ip} PASS")
+
+        log.line("Waiting for resolver convergence...")
+        deadline = time.time() + convergence_timeout
+        last = {}
+        while time.time() < deadline:
+            all_ok = True
+            for dns in resolver_servers:
+                rc, values, err2 = dig_exact_a(dns, record)
+                last[dns] = values
+                if rc != 0 or values != [new_primary_ip]: all_ok = False
+            if all_ok: break
+            time.sleep(poll)
+        else:
+            log.line(f"FAIL: resolver convergence timed out after {convergence_timeout}s")
+            for dns in resolver_servers:
+                vals = last.get(dns, [])
+                log.line(f"  {dns:<16} -> {','.join(vals) if vals else '(no answer)'}")
+            return 13
+        for dns in resolver_servers:
+            name = dns_name(cfg, dns)
+            log.line(f"  {name:<12} {dns:<16} -> {new_primary_ip} PASS")
+
+        state["dns_completed"] = True
+        state["dns_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        state["service_dns"] = record.rstrip('.')
+        state["service_dns_ip"] = new_primary_ip
+        state["dns_cutover_mode"] = mode
+        state["dns_backend"] = backend
+        state["dns_authoritative_verified"] = True
+        state["dns_resolver_convergence_verified"] = True
+        if nsupdate_rc is not None:
+            state["dns_nsupdate_exit_code"] = nsupdate_rc
+            state["dns_nsupdate_ambiguous"] = bool(nsupdate_ambiguous)
+        else:
+            state["dns_nsupdate_exit_code"] = None
+            state["dns_nsupdate_ambiguous"] = False
+            state["dns_recovered_from_authoritative_state"] = True
+        journal_advance(state, "dns-completed")
+        journal_commit_or_die(fence_file, state, cfg, require_recovery=True)
+
+        log.line(); log.line("DNS CUTOVER VERIFIED")
+        log.line(f"{record.rstrip('.')} -> {new_primary_ip}")
+        if nsupdate_rc is None:
+            log.line("nsupdate                : skipped (authoritative target already set)")
+        else:
+            log.line(f"nsupdate exit code      : {nsupdate_rc}")
+            if nsupdate_ambiguous:
+                log.line("nsupdate result         : ambiguous, resolved by authoritative verification")
+        log.line("authoritative verification: PASS")
+        log.line("resolver convergence      : PASS")
+        log.line(f"Updated handoff state     : {fence_file}")
+        log.line("THIS TOOL DOES NOT RESUME WORKERS OR REJOIN THE FENCED FORMER PRIMARY.")
+        log.line(f"Log: {log.path}")
+        return 0
+    finally:
+        log.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,31 @@
+BF4 HA v3.1.0
+Release date: 2026-09-29
+Validated runtime source: BF4_HA_v3.1.0-alpha4-candidate12-20260929.tar.gz
+Validated source SHA256: 8f7bc2d407f7bcce1ffbe7de4a53d41e31b1aaeb7de613763bdfc0d65ab462df
+Purpose: semi-automatic PostgreSQL HA with strong fencing and fail-closed recovery.
+
+Release provenance:
+- Runtime code is promoted from Candidate12 with no functional code changes.
+- Candidate12 incorporates Alpha4 hardening H-001 through H-018B and production-discovered recovery fixes.
+- Production mutable state, recovery journals, logs, credentials, TSIG key material, and PostgreSQL password files are not packaged.
+
+Offline validation:
+- Candidate12 real-executable crash/recovery/adversarial matrix: 124/124 PASS.
+- Candidate12 runtime/H-018B harness py_compile: PASS.
+- Guarded fence resume regression and unrelated-unavailable-DB negative control: PASS.
+- Completed-basebackup acknowledgement/startup recovery and marker-identity negative controls: PASS.
+
+Live production validation (operation 20260929T093707Z-dcc3880a):
+- Quiesced 8/8 ServerWatcher workers and verified zero application writer sessions.
+- Fenced mak-db-01 and recovered an interrupted fence acknowledgement without duplicate power-off.
+- Promoted mak-db-02 and verified it as the sole writable primary.
+- Reparented hnl-db-01, kah-db-01, and rnt-db-01 with active physical slots and streaming replication.
+- Cut db.bf4statusbot.com to 192.168.10.78 with authoritative and resolver convergence on all four BIND servers.
+- Guardedly resumed 8/8 workers and completed post-cutover verification.
+- Rejoined mak-db-01 by full pg_basebackup reseed and verified streaming standby state.
+- Final journal: revision 12, phase rejoin-completed.
+- Final topology: mak-db-02 primary; four streaming standbys; all four sites available; 8/8 workers running.
+
+Release packaging rule:
+- Runtime archive contains only BUILD-INFO.txt, bin/, lib/, and config/cluster.json.
+- Documentation and validation history are shipped separately.

@@ -1,0 +1,124 @@
+#!/opt/bf4-ha-venv/bin/python
+from __future__ import annotations
+from pathlib import Path
+import  ssl, sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from bf4_ha.common import prompt_secret, banner, load_config
+
+
+def connect(host, username, password):
+    from pyVim.connect import SmartConnect
+    return SmartConnect(host=host, user=username, pwd=password,
+                        sslContext=ssl._create_unverified_context())
+
+
+def main():
+    cfg = load_config()
+    esxi = cfg.get("esxi", {})
+    hosts = esxi.get("hosts", {})
+    mappings = esxi.get("db_vm_map", {})
+    username = esxi.get("username", "root")
+
+    banner("BF4 HA DIRECT ESXi READ-ONLY CHECK")
+    print("NO POWER OR CONFIGURATION OPERATIONS WILL BE PERFORMED.")
+    print(f"Configured hosts : {len(hosts)}")
+    print(f"DB VM mappings   : {len(mappings)}")
+
+    expected_nodes = set(cfg.get("nodes", {}))
+    if set(mappings) != expected_nodes:
+        missing = sorted(expected_nodes - set(mappings))
+        extra = sorted(set(mappings) - expected_nodes)
+        print("\nCONFIGURATION ERROR")
+        if missing: print("Missing DB mappings: " + ", ".join(missing))
+        if extra: print("Unknown DB mappings: " + ", ".join(extra))
+        return 2
+
+    password = prompt_secret(f"ESXi {username} password: ")
+    failures = []
+    seen_nodes = set()
+
+    try:
+        from pyVim.connect import Disconnect
+        from pyVmomi import vim
+    except Exception as exc:
+        print(f"FAIL: pyVmomi unavailable: {exc}")
+        return 2
+
+    for key, meta in hosts.items():
+        ip = meta["ip"]
+        site = meta["site"]
+        expected_name = meta["name"]
+        banner(f"{key} ({ip}) — site={site}")
+        si = None
+        try:
+            si = connect(ip, username, password)
+            content = si.RetrieveContent()
+            host_view = content.viewManager.CreateContainerView(
+                content.rootFolder, [vim.HostSystem], True)
+            try:
+                host_matches = list(host_view.view)
+            finally:
+                host_view.Destroy()
+            if len(host_matches) != 1:
+                raise RuntimeError(f"expected one ESXi HostSystem, found {len(host_matches)}")
+            h = host_matches[0]
+            actual_name = h.name
+            print("Authentication : PASS")
+            print(f"ESXi name      : {actual_name}")
+            print(f"Connection     : {h.runtime.connectionState}")
+            print(f"Power state    : {h.runtime.powerState}")
+            print(f"Version        : {h.config.product.version}")
+            print(f"Build          : {h.config.product.build}")
+            if actual_name != expected_name:
+                raise RuntimeError(f"host identity mismatch: expected {expected_name}, got {actual_name}")
+
+            vm_view = content.viewManager.CreateContainerView(
+                content.rootFolder, [vim.VirtualMachine], True)
+            try:
+                vms = list(vm_view.view)
+            finally:
+                vm_view.Destroy()
+
+            expected_here = [(node, m) for node, m in mappings.items()
+                             if m["esxi_host"] == key]
+            print(f"\nConfigured BF4 DB VMs on this host ({len(expected_here)}):")
+            for node, mapping in expected_here:
+                node_cfg = cfg["nodes"][node]
+                expected_vm = mapping["vm_name"]
+                if node_cfg.get("vm_name") != expected_vm:
+                    raise RuntimeError(
+                        f"{node}: mapping vm_name={expected_vm!r} differs from nodes vm_name={node_cfg.get('vm_name')!r}")
+                matches = [vm for vm in vms if vm.name == expected_vm]
+                if len(matches) != 1:
+                    raise RuntimeError(f"{node}: expected exactly one VM {expected_vm!r}, found {len(matches)}")
+                vm = matches[0]
+                runtime_host = vm.runtime.host.name if vm.runtime.host else "(none)"
+                if runtime_host != expected_name:
+                    raise RuntimeError(f"{node}: runtime host mismatch: expected {expected_name}, got {runtime_host}")
+                print(f"  {node:<12} vm={vm.name:<24} power={str(vm.runtime.powerState):<12} PASS")
+                seen_nodes.add(node)
+            print("\nRESULT         : PASS")
+        except Exception as exc:
+            failures.append(f"{key} ({ip}): {type(exc).__name__}: {exc}")
+            print(f"RESULT         : FAIL — {type(exc).__name__}: {exc}")
+        finally:
+            if si is not None:
+                try: Disconnect(si)
+                except Exception: pass
+
+    missing_seen = sorted(expected_nodes - seen_nodes)
+    if missing_seen:
+        failures.append("DB VM mappings not successfully verified: " + ", ".join(missing_seen))
+
+    banner("FINAL RESULT")
+    if failures:
+        print(f"FAIL: {len(failures)} problem(s)")
+        for x in failures: print("  - " + x)
+        print("NO STATE WAS CHANGED.")
+        return 1
+    print(f"PASS: {len(hosts)}/{len(hosts)} ESXi hosts authenticated; {len(seen_nodes)}/{len(expected_nodes)} DB VM mappings verified.")
+    print("NO STATE WAS CHANGED.")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
