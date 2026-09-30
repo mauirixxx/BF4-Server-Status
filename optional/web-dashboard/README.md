@@ -95,7 +95,7 @@ Likewise, dashboard failures must not affect Keeper polling, Discord leadership,
 
 ## Version
 
-Dashboard baseline included here: **v0.5.5-phase2**.
+Dashboard baseline included here: **v0.5.6-phase2**.
 
 ## Optional infrastructure panel (v0.5.6)
 
