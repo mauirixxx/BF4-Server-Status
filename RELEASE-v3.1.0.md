@@ -18,6 +18,12 @@ The `postgresql-ha/` directory contains the separately usable semi-automatic HA 
 
 The HA runtime was production-validated on 2026-09-29 through quiesce, fencing/recovery, promotion, survivor reparenting, BIND/TSIG DNS cutover, guarded worker resume, and full former-primary reseed/rejoin. See `postgresql-ha/README.md` and its validation documents.
 
+## Upgrade from v3.0.1+hf2
+
+v3.1.0 expects the normal Alembic startup migration path. Revision `0020_v3_1_0_hf2_search` deliberately uses `CREATE EXTENSION IF NOT EXISTS` and `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, so a database that already received `HF2_DB_INDEX.sql` keeps the existing extension/index while Alembic advances from `0019_v3_0_1_presence_health` to the canonical v3.1.0 head.
+
+Do not remove the HF2 index before upgrading. Existing HF2 deployments should leave it in place and allow the v3.1.0 migration to adopt that physical schema state.
+
 ## Release artifacts
 
 The planned release assets are standard ZIP files:
