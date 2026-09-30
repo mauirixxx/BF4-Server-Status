@@ -7,10 +7,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import get_settings
+from .database_facts import get_database_facts
 from .db import close_pool, open_pool
 from .repository import (
     get_cluster_health,
-    get_database_facts,
     get_database_nodes,
     get_dns_nodes,
     get_leadership,

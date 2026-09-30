@@ -39,6 +39,15 @@ upsert_cursor AS (INSERT INTO dashboard_stats(stat_key,stat_value,updated_at) SE
 INSERT INTO dashboard_stats(stat_key,stat_value,updated_at) SELECT 'player_personas_observed',COUNT(*)::bigint,NOW() FROM dashboard_observed_personas ON CONFLICT(stat_key) DO UPDATE SET stat_value=EXCLUDED.stat_value,updated_at=EXCLUDED.updated_at RETURNING stat_value
 """
 
+TRANSACTION_SAMPLE_SQL="""
+INSERT INTO dashboard_transaction_samples(sampled_at, transactions)
+SELECT %(sampled_at)s, (xact_commit + xact_rollback)::bigint
+FROM pg_stat_database
+WHERE datname = current_database()
+ON CONFLICT(sampled_at) DO UPDATE SET transactions=EXCLUDED.transactions
+RETURNING transactions
+"""
+
 def sample_bucket_time():
     now=datetime.now(timezone.utc); minute=now.minute-(now.minute%5); return now.replace(minute=minute,second=0,microsecond=0)
 
@@ -47,8 +56,8 @@ def main():
     if not database_url: raise SystemExit("SAMPLER_DATABASE_URL is required")
     sampled_at=sample_bucket_time()
     with psycopg.connect(database_url) as conn:
-        conn.execute(f"SET statement_timeout = '{settings.db_statement_timeout_ms}ms'"); persona_row=conn.execute(PERSONA_STATS_SQL).fetchone(); rows=conn.execute(SAMPLE_SQL,{"strict_seconds":settings.snapshot_fresh_seconds,"adaptive_seconds":settings.snapshot_adaptive_seconds,"sampled_at":sampled_at}).fetchall(); conn.commit()
+        conn.execute(f"SET statement_timeout = '{settings.db_statement_timeout_ms}ms'"); persona_row=conn.execute(PERSONA_STATS_SQL).fetchone(); rows=conn.execute(SAMPLE_SQL,{"strict_seconds":settings.snapshot_fresh_seconds,"adaptive_seconds":settings.snapshot_adaptive_seconds,"sampled_at":sampled_at}).fetchall(); tx_row=conn.execute(TRANSACTION_SAMPLE_SQL,{"sampled_at":sampled_at}).fetchone(); conn.commit()
     summary=", ".join(f"{platform}={adaptive_players} adaptive players ({adaptive_fresh}/{servers} usable; strict={strict_players} players {strict_fresh}/{servers})" for platform,strict_players,strict_fresh,adaptive_players,adaptive_fresh,servers in rows)
-    persona_count=int(persona_row[0]) if persona_row else 0; print(f"sampled_at={sampled_at.isoformat()} personas={persona_count} {summary}")
+    persona_count=int(persona_row[0]) if persona_row else 0; tx_count=int(tx_row[0]) if tx_row else 0; print(f"sampled_at={sampled_at.isoformat()} personas={persona_count} transactions={tx_count} {summary}")
 
 if __name__=="__main__": main()
