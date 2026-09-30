@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Any
 from datetime import datetime, timezone
 import logging
+import socket
 import psycopg
 from . import queries
 from .config import get_settings
@@ -92,3 +93,50 @@ def get_population_history(range_name="24h"):
         point={"sampled_at":row["sampled_at"].isoformat(),"players":int(row.get("display_player_count") or 0),"raw_players":int(row.get("display_player_count") or 0),"server_count":int(row.get("server_count") or 0),"snapshot_count":int(row.get("snapshot_count") or 0),"usable_snapshot_count":int(row.get("display_snapshot_count") or 0),"fresh_snapshot_count":int(row.get("strict_snapshot_count") or 0),"strict_players":int(row.get("strict_player_count") or 0),"adaptive_players":int(ap) if ap is not None else None,"adaptive_snapshot_count":int(ass) if ass is not None else None,"coverage_pct":float(cov) if isinstance(cov,Decimal) else cov,"strict_coverage_pct":float(strict) if isinstance(strict,Decimal) else strict,"population_mode":row.get("population_mode") or "strict","adaptive_samples":int(row.get("adaptive_samples") or 0),"total_samples":int(row.get("total_samples") or 0)}; platforms.setdefault(row["platform"],[]).append(point)
     started_at=started.get("collection_started_at") if started else None; adaptive_started_at=started.get("adaptive_started_at") if started else None
     return {"available":True,"range":range_name,"bucket":bucket,"collection_started_at":started_at.isoformat() if started_at else None,"adaptive_started_at":adaptive_started_at.isoformat() if adaptive_started_at else None,"smoothing_samples":3 if range_name=="24h" else 1,"series":[{"platform":p,"points":platforms.get(p,[])} for p in ("PC","Xbox","PlayStation")]}
+
+def _configured_nodes(value):
+    result=[]
+    for item in (value or "").split(","):
+        item=item.strip()
+        if not item: continue
+        label,sep,host=item.partition("=")
+        host=(host if sep else label).strip(); label=(label if sep else host).strip()
+        if host: result.append((label,host))
+    return result
+
+def get_database_nodes():
+    nodes=[]
+    for label,host in _configured_nodes(settings.database_nodes):
+        item={"label":label,"host":host,"online":False,"role":"unknown"}
+        try:
+            with psycopg.connect(settings.database_url, host=host, connect_timeout=max(1,int(settings.infrastructure_probe_timeout_seconds)), autocommit=True, row_factory=psycopg.rows.dict_row) as conn:
+                row=conn.execute("SELECT pg_is_in_recovery() AS recovery").fetchone()
+                item["online"]=True; item["role"]="replica" if row and row["recovery"] else "primary"
+        except Exception as exc:
+            logger.info("Database node probe failed for %s: %s",label,type(exc).__name__)
+        nodes.append(item)
+    return nodes
+
+def get_dns_nodes():
+    nodes=[]
+    timeout=float(settings.infrastructure_probe_timeout_seconds)
+    for label,host in _configured_nodes(settings.dns_nodes):
+        online=False
+        try:
+            with socket.create_connection((host,53),timeout=timeout): online=True
+        except OSError: pass
+        nodes.append({"label":label,"host":host,"online":online})
+    return nodes
+
+def get_database_facts():
+    try:
+        with db_connection() as conn:
+            row=conn.execute("""SELECT pg_database_size(current_database()) AS size_bytes, d.xact_commit+d.xact_rollback AS transactions, d.stats_reset FROM pg_stat_database d WHERE d.datname=current_database()""").fetchone()
+        if not row: return {"available":False}
+        size=int(row["size_bytes"] or 0); tx=int(row["transactions"] or 0); reset=row.get("stats_reset"); per_day=None
+        if reset:
+            days=max((datetime.now(timezone.utc)-reset).total_seconds()/86400,1/86400)
+            per_day=round(tx/days)
+        return {"available":True,"size_bytes":size,"size_text":f"{size/(1024**3):.2f} GiB" if size>=1024**3 else f"{size/(1024**2):.1f} MiB","transactions":tx,"transactions_per_day":per_day,"stats_reset":reset}
+    except Exception as exc:
+        logger.info("Database facts unavailable: %s",type(exc).__name__); return {"available":False}
