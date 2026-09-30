@@ -46,6 +46,7 @@ from models import (
     Guild,
     GuildAnnouncementChannel,
     GuildListenChannel,
+    GuildLogChannel,
     GuildMapRolePing,
     GuildPlayerWatch,
     GuildPlayerWatchAlert,
@@ -1056,6 +1057,57 @@ def current_user_name(user):
     return getattr(user, "display_name", None) or getattr(user, "name", None)
 
 
+def command_audit_discord_text(row: CommandAudit) -> str:
+    status = "✅ SUCCESS" if row.success else "⛔ FAILURE"
+    lines = [
+        f"**Command audit — {status}**",
+        f"Command: `/{row.command_name.replace('.', ' ')}`" if row.command_type == "slash" else f"Command: `{row.command_name}`",
+        f"User: **{row.user_name or 'Unknown'}** (`{row.user_id or 'unknown'}`)",
+        f"Used in: **#{row.channel_name or 'unknown'}** (`{row.channel_id or 'unknown'}`)",
+        f"Result: `{row.result_code or ('ok' if row.success else 'failed')}`",
+        f"Duration: `{row.duration_ms or 0} ms`",
+    ]
+    if row.target_type or row.target_id or row.target_name:
+        target = row.target_name or row.target_id or "unknown"
+        lines.append(f"Target: `{row.target_type or 'item'}` — **{target}**")
+    return "\n".join(lines)[:1900]
+
+
+async def deliver_command_audit_to_discord(row: CommandAudit):
+    if row.guild_id is None:
+        return
+    try:
+        with SessionLocal() as session:
+            channel_ids = list(session.scalars(
+                select(GuildLogChannel.channel_id).where(
+                    GuildLogChannel.guild_id == int(row.guild_id)
+                )
+            ).all())
+        if not channel_ids:
+            return
+        text_value = command_audit_discord_text(row)
+        for channel_id in channel_ids:
+            channel = client.get_channel(int(channel_id))
+            if not isinstance(channel, discord.TextChannel):
+                log.warning(
+                    "Command audit Discord channel unavailable guild=%s channel=%s",
+                    row.guild_id, channel_id,
+                )
+                continue
+            try:
+                await channel.send(text_value, suppress_embeds=True)
+            except Exception as exc:
+                log.warning(
+                    "Command audit Discord delivery failed guild=%s channel=%s error=%s message=%r",
+                    row.guild_id, channel_id, type(exc).__name__, str(exc),
+                )
+    except Exception as exc:
+        log.warning(
+            "Command audit Discord fanout failed guild=%s error=%s message=%r",
+            row.guild_id, type(exc).__name__, str(exc),
+        )
+
+
 def audit_command(
     *,
     guild,
@@ -1101,6 +1153,11 @@ def audit_command(
             getattr(guild, "id", None), getattr(channel, "id", None),
             getattr(user, "id", None), command_name, result_code, duration_ms
         )
+        try:
+            asyncio.get_running_loop().create_task(deliver_command_audit_to_discord(row))
+        except RuntimeError:
+            # Non-Discord/offline callers still retain the canonical DB audit.
+            pass
     except Exception as exc:
         log.error(
             "Command audit write failed guild=%s user=%s command=%s error=%s message=%r",
@@ -1204,6 +1261,16 @@ def refresh_guild_readable_snapshots(discord_guild: discord.Guild):
             )
         ).all()
         for row in listen_rows:
+            row.guild_name = discord_guild.name
+            channel = discord_guild.get_channel(int(row.channel_id))
+            row.channel_name = channel.name if channel is not None else None
+
+        log_rows = session.scalars(
+            select(GuildLogChannel).where(
+                GuildLogChannel.guild_id == discord_guild.id
+            )
+        ).all()
+        for row in log_rows:
             row.guild_name = discord_guild.name
             channel = discord_guild.get_channel(int(row.channel_id))
             row.channel_name = channel.name if channel is not None else None
@@ -1374,6 +1441,67 @@ def listen_channel_ids(guild_id: int) -> set[int]:
         ).all())
 
 
+def log_channel_ids(guild_id: int) -> set[int]:
+    with SessionLocal() as session:
+        return set(session.scalars(
+            select(GuildLogChannel.channel_id).where(GuildLogChannel.guild_id == guild_id)
+        ).all())
+
+
+def configured_log_channels(guild_id: int):
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(GuildLogChannel)
+            .where(GuildLogChannel.guild_id == guild_id)
+            .order_by(GuildLogChannel.channel_name, GuildLogChannel.channel_id)
+        ).all()
+        return [
+            {"channel_id": int(row.channel_id), "channel_name": row.channel_name}
+            for row in rows
+        ]
+
+
+def log_channel_add_choices(interaction: discord.Interaction, current: str):
+    if interaction.guild is None:
+        return []
+    configured = log_channel_ids(interaction.guild.id)
+    needle = (current or "").strip().casefold()
+    choices = []
+    for channel in sorted(interaction.guild.text_channels, key=lambda item: item.name.casefold()):
+        if channel.id in configured:
+            continue
+        if needle and needle not in channel.name.casefold() and needle not in str(channel.id):
+            continue
+        choices.append(app_commands.Choice(name=f"#{channel.name}"[:100], value=str(channel.id)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def log_channel_remove_choices(interaction: discord.Interaction, current: str):
+    if interaction.guild is None:
+        return []
+    needle = (current or "").strip().casefold()
+    choices = []
+    for row in configured_log_channels(interaction.guild.id):
+        channel = interaction.guild.get_channel(row["channel_id"])
+        name = channel.name if isinstance(channel, discord.TextChannel) else (row["channel_name"] or str(row["channel_id"]))
+        if needle and needle not in name.casefold() and needle not in str(row["channel_id"]):
+            continue
+        choices.append(app_commands.Choice(name=f"#{name}"[:100], value=str(row["channel_id"])))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+async def logschannel_add_autocomplete(interaction: discord.Interaction, current: str):
+    return log_channel_add_choices(interaction, current)
+
+
+async def logschannel_remove_autocomplete(interaction: discord.Interaction, current: str):
+    return log_channel_remove_choices(interaction, current)
+
+
 def announcement_channel_ids(guild_id: int) -> set[int]:
     with SessionLocal() as session:
         return set(session.scalars(
@@ -1488,6 +1616,7 @@ def management_channel_allowed(interaction_or_message):
         return False
     allowed = set(listen_channel_ids(guild.id))
     allowed.update(announcement_channel_ids(guild.id))
+    allowed.update(log_channel_ids(guild.id))
     settings = get_settings(guild.id)
     watched_channel_id = int(settings.watched_player_channel_id or 0)
     if watched_channel_id:
@@ -8665,6 +8794,80 @@ async def playerhistory_player_autocomplete(interaction, current):
     return await autocomplete_db_call("playerhistory.player", player_name_choices, interaction.guild.id, current) if interaction.guild else []
 
 
+logschannel_group = app_commands.Group(
+    name="logschannel",
+    description="Manage Discord destinations for command audit logs",
+)
+
+
+@logschannel_group.command(name="add", description="Add a Discord channel for command audit logs")
+@app_commands.describe(channel="Choose an available text channel")
+@app_commands.autocomplete(channel=logschannel_add_autocomplete)
+async def logschannel_add(interaction: discord.Interaction, channel: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    try:
+        channel_id = int(channel)
+    except (TypeError, ValueError):
+        channel_id = 0
+    target = interaction.guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(target, discord.TextChannel):
+        await interaction.followup.send("⛔ Choose one of this server's available text channels.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="logschannel.add", command_type="slash", success=False, started=started, result_code="invalid_channel", target_type="channel", target_id=channel)
+        return
+    bot_member = interaction.guild.me
+    perms = target.permissions_for(bot_member) if bot_member is not None else None
+    missing = []
+    if perms is None or not perms.view_channel:
+        missing.append("View Channel")
+    if perms is None or not perms.send_messages:
+        missing.append("Send Messages")
+    if missing:
+        await interaction.followup.send(f"⛔ ServerWatcher is missing required permissions in **#{target.name}**: {', '.join(missing)}.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="logschannel.add", command_type="slash", success=False, started=started, result_code="missing_channel_permissions", target_type="channel", target_id=target.id, target_name=target.name, metadata={"missing_permissions": missing})
+        return
+    with SessionLocal.begin() as session:
+        existing = session.get(GuildLogChannel, (interaction.guild.id, target.id))
+        if existing is None:
+            session.add(GuildLogChannel(guild_id=interaction.guild.id, guild_name=interaction.guild.name, channel_id=target.id, channel_name=target.name))
+            added = True
+        else:
+            existing.guild_name = interaction.guild.name
+            existing.channel_name = target.name
+            added = False
+    await interaction.followup.send(f"{'✅ Added' if added else 'ℹ️ Already configured'} **#{target.name}** {'as a command-log channel.' if added else 'for command logs.'}", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="logschannel.add", command_type="slash", success=True, started=started, result_code="added" if added else "already_configured", target_type="channel", target_id=target.id, target_name=target.name)
+
+
+@logschannel_group.command(name="remove", description="Remove a configured command audit log channel")
+@app_commands.describe(channel="Choose a currently configured log channel")
+@app_commands.autocomplete(channel=logschannel_remove_autocomplete)
+async def logschannel_remove(interaction: discord.Interaction, channel: str):
+    started = time.perf_counter()
+    if not await prepare_management(interaction):
+        return
+    try:
+        channel_id = int(channel)
+    except (TypeError, ValueError):
+        channel_id = 0
+    rows = {row["channel_id"]: row for row in configured_log_channels(interaction.guild.id)}
+    row = rows.get(channel_id)
+    if row is None:
+        await interaction.followup.send("⛔ Choose one of the currently configured command-log channels.", ephemeral=True)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="logschannel.remove", command_type="slash", success=False, started=started, result_code="not_configured", target_type="channel", target_id=channel)
+        return
+    target = interaction.guild.get_channel(channel_id)
+    target_name = target.name if isinstance(target, discord.TextChannel) else (row["channel_name"] or str(channel_id))
+    with SessionLocal.begin() as session:
+        session.execute(delete(GuildLogChannel).where(GuildLogChannel.guild_id == interaction.guild.id, GuildLogChannel.channel_id == channel_id))
+    await interaction.followup.send(f"✅ Removed **#{target_name}** from command audit logging.", ephemeral=True)
+    audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="logschannel.remove", command_type="slash", success=True, started=started, result_code="removed", target_type="channel", target_id=channel_id, target_name=target_name)
+
+
+tree.add_command(logschannel_group)
+
+
 @tree.command(name="addlistenchannel", description="Add one listen channel")
 @app_commands.describe(channel="Text channel to allow regular user commands in")
 async def addlistenchannel(
@@ -9487,6 +9690,7 @@ def help_messages(member: discord.Member):
         "`/watchplayer`, `/unwatchplayer`, `/watchedplayers` — manage watched-player join alerts.",
         "`/playerhistory` — search recent player sessions or export ALL as ZIP/CSV.",
         "`/addlistenchannel`, `/dellistenchannel` — manage user command channels.",
+        "`/logschannel add|remove` — mirror the existing database command audit into selected Discord channels.",
         "`/setmanagementrole`, `/setstatusrole` — manage role thresholds.",
         "`/setmaprole`, `/editmaprole`, `/delmaprole` — manage map role pings.",
         "",
