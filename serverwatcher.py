@@ -3749,13 +3749,16 @@ async def delete_discord_message(guild_id, channel_id, message_id):
         return False
 
 
-def active_map_role_line(guild_id: int, map_key: str | None):
+def active_map_role_line(guild_id: int, map_key: str | None, player_count: int = 0):
     """Return the configured role mention/message for this guild/map, if enabled."""
     if not map_key:
         return None, None
     with SessionLocal() as session:
         ping = session.get(GuildMapRolePing, (guild_id, map_key))
         if not ping or not ping.role_id:
+            return None, None
+        # A threshold of X means suppress the ping at X players or fewer.
+        if int(player_count or 0) <= int(ping.min_players or 0):
             return None, None
         return f"<@&{ping.role_id}> {ping.message}", int(ping.role_id)
 
@@ -3792,6 +3795,7 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         role_line, role_id = active_map_role_line(
             guild_id,
             status.get("map_key"),
+            int(status.get("players") or 0),
         )
         sent = await channel.send(
             build_map_announcement(
@@ -8686,6 +8690,7 @@ async def setstatusrole(interaction: discord.Interaction, role: discord.Role | N
     role="Discord role to ping",
     message="Optional custom map-live message",
     disable="Disable the map ping by setting role ID to 0",
+    min_players="Do not ping when the server has this many players or fewer (0-64)",
 )
 async def setmaprole(
     interaction: discord.Interaction,
@@ -8693,6 +8698,7 @@ async def setmaprole(
     role: discord.Role | None = None,
     message: str | None = None,
     disable: bool = False,
+    min_players: app_commands.Range[int, 0, 64] = 0,
 ):
     started = time.perf_counter()
     if not await prepare_management(interaction):
@@ -8739,6 +8745,7 @@ async def setmaprole(
                     role_id=role_id,
                     role_name=(role.name if role and role_id else None),
                     message=text,
+                    min_players=int(min_players),
                 )
             )
         else:
@@ -8747,12 +8754,16 @@ async def setmaprole(
             ping.role_id = role_id
             ping.role_name = role.name if role and role_id else None
             ping.message = text
+            ping.min_players = int(min_players)
 
     warning = map_role_self_service_warning(interaction.guild, role_id)
     if get_settings(interaction.guild.id).roles_channel_id:
         await reconcile_role_panel(interaction.guild)
 
-    response = f"✅ Map role updated for **{map_row.map_name}**."
+    response = (
+        f"✅ Map role updated for **{map_row.map_name}**. "
+        f"Role ping requires **more than {int(min_players)} players**."
+    )
     if warning:
         response += (
             f"\n⚠️ **Self-service warning:** {warning}. "
@@ -8780,9 +8791,10 @@ async def setmaprole_autocomplete(interaction, current):
 
 
 class EditMapRoleModal(discord.ui.Modal):
-    def __init__(self, guild_id, map_key, map_name, role_id, current_message):
+    def __init__(self, guild_id, map_key, map_name, role_id, current_message, min_players=None):
         super().__init__(title=f"Edit map role — {map_name}"[:45])
         self.guild_id, self.map_key, self.map_name, self.role_id = guild_id, map_key, map_name, role_id
+        self.min_players = min_players
         self.message_input = discord.ui.TextInput(label="Map ping message", style=discord.TextStyle.paragraph, default=current_message[:4000], max_length=4000)
         self.add_item(self.message_input)
 
@@ -8822,6 +8834,8 @@ class EditMapRoleModal(discord.ui.Modal):
                         else None
                     )
                 ping.message = str(self.message_input.value).strip()
+                if self.min_players is not None:
+                    ping.min_players = int(self.min_players)
                 final_role_id = int(ping.role_id or 0)
 
             warning = (
@@ -8871,7 +8885,12 @@ class EditMapRoleModal(discord.ui.Modal):
 
 
 @tree.command(name="editmaprole", description="Edit an existing map-role ping")
-async def editmaprole(interaction: discord.Interaction, map_name: str, role: discord.Role | None = None):
+async def editmaprole(
+    interaction: discord.Interaction,
+    map_name: str,
+    role: discord.Role | None = None,
+    min_players: app_commands.Range[int, 0, 64] | None = None,
+):
     started = time.perf_counter()
     if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not can_manage(interaction.user) or not management_channel_allowed(interaction):
         await interaction.response.send_message("⛔ You cannot use that command here.", ephemeral=True)
@@ -8881,7 +8900,16 @@ async def editmaprole(interaction: discord.Interaction, map_name: str, role: dis
         await interaction.response.send_message("⚠️ Choose one configured map.", ephemeral=True)
         return
     ping, map_row = matches[0]
-    await interaction.response.send_modal(EditMapRoleModal(interaction.guild.id, map_row.map_key, map_row.map_name, role.id if role else None, ping.message))
+    await interaction.response.send_modal(
+        EditMapRoleModal(
+            interaction.guild.id,
+            map_row.map_key,
+            map_row.map_name,
+            role.id if role else None,
+            ping.message,
+            min_players=min_players,
+        )
+    )
     audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="editmaprole", command_type="slash", success=True, started=started, result_code="modal_opened", target_type="map", target_id=map_row.map_key, target_name=map_row.map_name)
 
 

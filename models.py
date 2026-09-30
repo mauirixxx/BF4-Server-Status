@@ -230,6 +230,7 @@ class GuildMapRolePing(Base):
     role_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    min_players: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class GuildServerState(Base):
