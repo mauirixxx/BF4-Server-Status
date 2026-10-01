@@ -724,8 +724,14 @@ def apply_keeper_lifecycle_result(
 def record_keeper_lifecycle_result(
     server_guid: str, result: str, observed_at: datetime | None = None
 ) -> None:
-    """Compatibility wrapper for the central v3.2.0 lifecycle engine."""
+    """Record Keeper evidence and immediately invalidate cache on authoritative 404."""
     apply_keeper_lifecycle_result(server_guid, result, observed_at=observed_at)
+    if str(result or "").strip().upper() == "NOT_FOUND":
+        # Do not wait for the next Discord monitor cycle to suppress a snapshot
+        # that Keeper has already authoritatively invalidated. Direct /status,
+        # !status, /debug and announcement paths all consult this cache first.
+        FRESH_SERVER_CACHE.pop(server_guid, None)
+        BFLIST_CACHE.pop(server_guid, None)
 
 
 def request_server_lifecycle_revalidation(server_guid: str) -> dict | None:
