@@ -740,6 +740,26 @@ def record_keeper_lifecycle_result(
     apply_keeper_lifecycle_result(server_guid, result, observed_at=observed_at)
 
 
+def request_server_lifecycle_revalidation(server_guid: str) -> dict | None:
+    """Make a catalog server immediately eligible for Keeper validation.
+
+    This is an operator/guild hint only: it never marks the server CONFIRMED.
+    Keeper SUCCESS remains the sole authority that resurrects a server.
+    """
+    with SessionLocal.begin() as session:
+        row = session.scalar(
+            select(BF4Server)
+            .where(BF4Server.server_guid == server_guid)
+            .with_for_update()
+        )
+        if row is None:
+            return None
+        old_state = row.lifecycle_state
+        if old_state in {"STALE", "RETIRED"}:
+            row.next_lifecycle_probe_at = session.scalar(select(func.now()))
+        return {"state": old_state, "requested": old_state in {"STALE", "RETIRED"}}
+
+
 def keeper_service_failure_reason(exc: Exception) -> str | None:
     """Classify failures that can indicate Keeper-wide throttling/outage."""
     if isinstance(exc, requests.HTTPError):
@@ -7617,6 +7637,8 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
     refs = [x for x in re.split(r"[\s,]+", server_urls.strip()) if x]
     added, updated, failed = [], [], []
     activated = []
+    immediate_validation_guids = []
+    revalidation_requested = []
     tick_rate_changes: dict[str, tuple[int | None, int | None]] = {}
     configured_channels = configured_announcement_channels(interaction.guild.id)
     default_channel = None
@@ -7731,6 +7753,16 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                             )
                         )
 
+            if guid not in immediate_validation_guids:
+                immediate_validation_guids.append(guid)
+            revalidation = await asyncio.to_thread(request_server_lifecycle_revalidation, guid)
+            if revalidation and revalidation.get("requested"):
+                revalidation_requested.append(parsed["name"])
+                log.info(
+                    "Immediate Keeper lifecycle revalidation requested guild=%s server=%s state=%s source=addserver",
+                    interaction.guild.id, guid, revalidation.get("state"),
+                )
+
             if (
                 existing_global_present
                 and old_tick_rate_hz != tick_rate_hz
@@ -7738,6 +7770,26 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                 tick_rate_changes[guid] = (
                     old_tick_rate_hz,
                     tick_rate_hz,
+                )
+
+        # /addserver always asks Keeper now. The command can make a STALE/RETIRED
+        # server immediately probe-eligible, but only Keeper SUCCESS can confirm it.
+        for guid in immediate_validation_guids:
+            try:
+                snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
+                observed_at = utcnow()
+                await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID)
+                await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
+                FRESH_SERVER_CACHE[guid] = snapshot
+            except Exception as keeper_exc:
+                observed_at = utcnow()
+                await asyncio.to_thread(
+                    record_keeper_lifecycle_result, guid,
+                    keeper_result_from_exception(keeper_exc), observed_at,
+                )
+                log.info(
+                    "Immediate Keeper validation did not confirm server=%s source=addserver result=%s error=%s",
+                    guid, keeper_result_from_exception(keeper_exc), type(keeper_exc).__name__,
                 )
 
         for changed_guid, (old_hz, new_hz) in tick_rate_changes.items():
@@ -7749,7 +7801,16 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
 
         for guid, display_name, channel_id, channel_name in activated:
             try:
-                snapshot = FRESH_SERVER_CACHE.get(guid) or await asyncio.to_thread(get_keeper_snapshot, guid)
+                with SessionLocal() as session:
+                    bf = session.get(BF4Server, guid)
+                    lifecycle = bf.lifecycle_state if bf else "DISCOVERED"
+                snapshot = FRESH_SERVER_CACHE.get(guid) if lifecycle == "CONFIRMED" else None
+                if snapshot is None:
+                    log.info(
+                        "Immediate default announcement deferred pending Keeper confirmation guild=%s server=%s state=%s",
+                        interaction.guild.id, guid, lifecycle,
+                    )
+                    continue
                 await post_automatic_announcement(
                     interaction.guild.id,
                     GuildServer(
@@ -7772,6 +7833,11 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
         lines = [f"✅ Added: {', '.join(added)}" if added else "Added: none"]
         if updated:
             lines.append("Existing/updated: " + ", ".join(updated))
+        if revalidation_requested:
+            lines.append(
+                "🔎 Keeper revalidation requested: " + ", ".join(revalidation_requested)
+                + ". Keeper remains authoritative for online status."
+            )
         if failed:
             lines.append("⚠️ Could not parse: " + ", ".join(failed))
         await interaction.followup.send("\n".join(lines), ephemeral=True)
