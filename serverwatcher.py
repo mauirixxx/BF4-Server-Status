@@ -7543,7 +7543,7 @@ async def default_add(
                         platform=platform,
                     ),
                     snapshot,
-                    None,
+                    bflist,
                     next_player_display_eta_unix(current_unique_server_count()),
                 )
                 player_note = f" Persistent player list: **{result['result']}**."
