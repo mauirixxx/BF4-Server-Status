@@ -93,6 +93,23 @@ class BF4Server(Base):
     battlelog_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     platform_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tick_rate_hz: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    first_404_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_keeper_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_keeper_result_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_lifecycle_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BF4ServerNameHistory(Base):
+    __tablename__ = "bf4_server_name_history"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    server_guid: Mapped[str] = mapped_column(
+        String(36), ForeignKey("bf4_servers.server_guid", ondelete="CASCADE"), nullable=False
+    )
+    server_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class GuildServer(Base):
@@ -263,6 +280,11 @@ class GuildServerState(Base):
     player_eta_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     player_eta_channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     player_eta_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lifecycle_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lifecycle_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    recovery_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    recovery_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    management_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CommandAudit(Base):
@@ -285,7 +307,6 @@ class CommandAudit(Base):
     error_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     request_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-
 
 
 class ClusterWorker(Base):
@@ -472,6 +493,7 @@ class ClusterOperatorEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
+
 class ClusterOperatorDestination(Base):
     __tablename__ = "cluster_operator_destinations"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -484,25 +506,22 @@ class ClusterOperatorDestination(Base):
     channel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_failure_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class ClusterOperatorEventDelivery(Base):
-    __tablename__ = "cluster_operator_event_deliveries"
+class ClusterOperatorDelivery(Base):
+    __tablename__ = "cluster_operator_deliveries"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     event_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("cluster_operator_events.id", ondelete="CASCADE"), nullable=False)
     destination_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("cluster_operator_destinations.id", ondelete="CASCADE"), nullable=False)
+    delivery_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    discord_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    __table_args__ = (UniqueConstraint("event_id", "destination_id", name="uq_cluster_operator_event_delivery"),)
