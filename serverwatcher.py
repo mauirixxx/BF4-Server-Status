@@ -5419,7 +5419,13 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
     if lane_name not in {"bulk", "fast", "lifecycle"}:
         raise ValueError(f"unsupported Keeper lane {lane_name!r}")
     role_name = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
-    gate_key = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
+    # Lifecycle probes share keeper_bulk worker eligibility, but use their own
+    # lane waiter/gate so a due hourly/weekly probe cannot queue behind the
+    # continuously busy normal bulk traversal. The global Keeper gate remains
+    # the hard aggregate ceiling across all lanes.
+    gate_key = "keeper_fast" if lane_name == "fast" else (
+        "keeper_lifecycle" if lane_name == "lifecycle" else "keeper_bulk"
+    )
     local_retry_after: dict[str, float] = {}
 
     while True:

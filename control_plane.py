@@ -571,7 +571,7 @@ def record_keeper_lane_sweep(
     """Persist one completed Keeper lane traversal for adaptive health policy."""
     worker_id = validate_worker_id(worker_id)
     lane = str(lane or "").strip().lower()
-    if lane not in {"bulk", "fast"}:
+    if lane not in {"bulk", "fast", "lifecycle"}:
         raise ValueError(f"unsupported Keeper lane {lane!r}")
     with SessionLocal.begin() as session:
         now = session.scalar(select(func.now()))

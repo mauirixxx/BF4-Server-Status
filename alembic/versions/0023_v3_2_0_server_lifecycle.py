@@ -100,7 +100,21 @@ def upgrade():
     op.add_column("guild_server_state", sa.Column("management_notified_at", sa.DateTime(timezone=True), nullable=True))
 
 
+    # Lifecycle probes share keeper_bulk worker ownership but have a dedicated
+    # fair rate-gate queue. This prevents an hourly/weekly due probe from sitting
+    # behind the continuously populated normal bulk waiter queue. The global
+    # `keeper` gate still enforces the hard aggregate Keeper request ceiling.
+    op.execute(sa.text("""
+        INSERT INTO keeper_rate_gate
+            (gate_key, next_request_at, last_worker_id, total_grants, created_at, updated_at)
+        VALUES ('keeper_lifecycle', now(), NULL, 0, now(), now())
+        ON CONFLICT (gate_key) DO NOTHING
+    """))
+
+
 def downgrade():
+    op.execute(sa.text("DELETE FROM keeper_rate_waiters WHERE gate_key='keeper_lifecycle'"))
+    op.execute(sa.text("DELETE FROM keeper_rate_gate WHERE gate_key='keeper_lifecycle'"))
     op.drop_column("guild_server_state", "management_notified_at")
     op.drop_column("guild_server_state", "recovery_message_id")
     op.drop_column("guild_server_state", "recovery_channel_id")
