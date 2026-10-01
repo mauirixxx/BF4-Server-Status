@@ -17,7 +17,11 @@ normal_files=['.env.example','Dockerfile','docker-compose.yml','docker-compose.w
 normal_files += [str(p.relative_to(ROOT)) for p in sorted((ROOT/'alembic').rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'}]
 ha_files=[str(p.relative_to(ROOT/'postgresql-ha')) for p in sorted((ROOT/'postgresql-ha').rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'}]
 dashboard_files=[str(p.relative_to(DASH_ROOT)) for p in sorted(DASH_ROOT.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'} and p.name != '.env']
-doc_files=['README.md','CHANGELOG.md','HF1_CHANGELOG.md','HF2_CHANGELOG.md','RELEASE-v3.2.0.md','docs/V3.2.0_STALE_SERVER_DESIGN.md','THIRD_PARTY.md','postgresql-ha/README.md','postgresql-ha/RELEASE-NOTES.md','postgresql-ha/LIVE-VALIDATION-20260929.md','postgresql-ha/CHANGELOG.md','postgresql-ha/BUILD-INFO.txt']
+doc_files=[str(p.relative_to(ROOT)) for p in sorted(ROOT.glob('*.md'))]
+doc_files += [str(p.relative_to(ROOT)) for p in sorted((ROOT/'docs').rglob('*.md'))]
+doc_files += [str(p.relative_to(ROOT)) for p in sorted((ROOT/'postgresql-ha').rglob('*.md'))]
+doc_files += ['postgresql-ha/BUILD-INFO.txt']
+
 
 def make(name, files, base=ROOT):
     with ZipFile(OUT/name,'w',ZIP_DEFLATED) as z:
