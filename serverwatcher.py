@@ -4201,12 +4201,21 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         recovery_message = state.recovery_message_id if state else None
     if map_change and recovery_channel and recovery_message:
         recovery_deleted = await delete_discord_message(guild_id, recovery_channel, recovery_message)
-        if recovery_deleted:
-            with SessionLocal.begin() as session:
-                recovery_state = session.get(GuildServerState, (guild_id, gs.server_guid))
-                if recovery_state:
-                    recovery_state.recovery_channel_id = None
-                    recovery_state.recovery_message_id = None
+        if not recovery_deleted:
+            # Preserve the temporary recovery notice until we can remove it.
+            # Posting the new-map announcement anyway would leave contradictory
+            # status-channel state and lose the next-map cleanup guarantee.
+            log.warning(
+                "Announcement replacement deferred because recovery message cleanup failed "
+                "guild=%s server=%s channel=%s message=%s",
+                guild_id, gs.server_guid, recovery_channel, recovery_message,
+            )
+            return None
+        with SessionLocal.begin() as session:
+            recovery_state = session.get(GuildServerState, (guild_id, gs.server_guid))
+            if recovery_state:
+                recovery_state.recovery_channel_id = None
+                recovery_state.recovery_message_id = None
     if old_channel and old_message:
         old_deleted = await delete_discord_message(guild_id, old_channel, old_message)
         if not old_deleted:
