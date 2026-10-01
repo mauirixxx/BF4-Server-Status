@@ -7636,18 +7636,23 @@ async def default_add(
                     target_name=gs.display_name,
                 )
                 return
-            # Validate Keeper before committing the default-server mutation.
-            # A failed authoritative fetch must not leave a server marked default
-            # when no announcement/player stack could be created.
+            # Making an already-configured server a Discord default is an
+            # administrative mutation, not a manual lifecycle resurrection.
+            # Only /addserver may force immediate validation of STALE/RETIRED.
+            # CONFIRMED/GRACE retain the legacy immediate Keeper behavior.
             name = gs.display_name
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
 
-        snapshot = (
-            FRESH_SERVER_CACHE.get(server)
-            or await get_keeper_snapshot_authoritative(server)
-        )
+        if lifecycle_state in {"STALE", "RETIRED"}:
+            snapshot = None
+        else:
+            snapshot = (
+                FRESH_SERVER_CACHE.get(server)
+                or await get_keeper_snapshot_authoritative(server)
+            )
         with SessionLocal.begin() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
@@ -7666,15 +7671,20 @@ async def default_add(
             announcement_channel_id=selected_channel.id,
             announcement_channel_name=selected_channel.name,
         )
-        await post_automatic_announcement(
-            interaction.guild.id,
-            temp_gs,
-            get_server_status(snapshot),
-            map_change=False,
-        )
+        if snapshot is not None:
+            await post_automatic_announcement(
+                interaction.guild.id,
+                temp_gs,
+                get_server_status(snapshot),
+                map_change=False,
+            )
+        else:
+            # Publish the durable offline/retired lifecycle notice immediately;
+            # do not wait for the next reconciler cycle.
+            await reconcile_server_lifecycle_discord()
 
         player_note = ""
-        if include_users:
+        if include_users and snapshot is not None:
             try:
                 bflist = None
                 if normalize_platform_label(platform) == "PC":
@@ -7714,7 +7724,12 @@ async def default_add(
             f"✅ **{name}** added to default servers in "
             f"**#{selected_channel.name}**. "
             f"Include Users: **{'Yes' if include_users else 'No'}**."
-            f"{player_note}",
+            f"{player_note}"
+            + (
+                " Server remains offline; Keeper lifecycle polling will reactivate "
+                "it automatically when it returns."
+                if snapshot is None else ""
+            ),
             ephemeral=True,
         )
         audit_command(

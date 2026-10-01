@@ -32,6 +32,14 @@ class LifecycleMutationPathTests(unittest.TestCase):
         self.assertNotIn("session.delete(bf)", src)
         self.assertNotIn("delete(BF4Server)", src)
 
+    def test_default_add_does_not_probe_stale_or_retired(self):
+        src = function_source("default_add")
+        gate = 'if lifecycle_state in {"STALE", "RETIRED"}'
+        self.assertIn(gate, src)
+        self.assertLess(src.index(gate), src.index("get_keeper_snapshot_authoritative(server)"))
+        self.assertIn("await reconcile_server_lifecycle_discord()", src)
+        self.assertIn("if include_users and snapshot is not None", src)
+
     def test_default_modify_does_not_probe_stale_or_retired(self):
         src = function_source("default_modify")
         gate = 'if lifecycle_state not in {"STALE", "RETIRED"}'
