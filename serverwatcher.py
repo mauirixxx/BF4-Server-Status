@@ -6426,6 +6426,8 @@ async def guild_cleanup_once():
                 counts = {
                     "announcement_channels": session.scalar(select(func.count()).select_from(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id)) or 0,
                     "listen_channels": session.scalar(select(func.count()).select_from(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id)) or 0,
+                    "log_channels": session.scalar(select(func.count()).select_from(GuildLogChannel).where(GuildLogChannel.guild_id == guild_id)) or 0,
+                    "player_watches": session.scalar(select(func.count()).select_from(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id)) or 0,
                     "guild_servers": session.scalar(select(func.count()).select_from(GuildServer).where(GuildServer.guild_id == guild_id)) or 0,
                     "map_roles": session.scalar(select(func.count()).select_from(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id)) or 0,
                     "server_states": session.scalar(select(func.count()).select_from(GuildServerState).where(GuildServerState.guild_id == guild_id)) or 0,
@@ -6436,6 +6438,8 @@ async def guild_cleanup_once():
                 session.execute(delete(GuildRolePanelMessage).where(GuildRolePanelMessage.guild_id == guild_id))
                 session.execute(delete(GuildServerState).where(GuildServerState.guild_id == guild_id))
                 session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id))
+                session.execute(delete(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id))
+                session.execute(delete(GuildLogChannel).where(GuildLogChannel.guild_id == guild_id))
                 session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id))
                 session.execute(delete(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id))
                 session.execute(delete(GuildServer).where(GuildServer.guild_id == guild_id))
