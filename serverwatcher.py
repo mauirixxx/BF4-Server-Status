@@ -4989,6 +4989,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
             .where(
                 GuildServer.is_default.is_(True),
                 GuildServer.include_users.is_(True),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
             .order_by(GuildServer.server_guid, GuildServer.guild_id)
         ).all()
