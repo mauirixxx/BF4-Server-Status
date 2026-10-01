@@ -8347,6 +8347,21 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
             battlelog_url = bf.battlelog_url
             display_name = gs.display_name
             old_tick_rate = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
+
+        if lifecycle_state in {"STALE", "RETIRED"}:
+            await interaction.followup.send(
+                f"ℹ️ **{display_name}** is currently {lifecycle_state}. "
+                "Tick-rate discovery is deferred until Keeper confirms the server online again.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+                command_name="refreshserverhz", command_type="slash", success=True,
+                started=started, result_code="offline_deferred", target_type="server",
+                target_id=server, target_name=display_name,
+            )
+            return
 
         if old_tick_rate is not None:
             await interaction.followup.send(
@@ -8472,6 +8487,7 @@ def refreshserverhz_choices(guild_id: int, current: str):
             .where(
                 GuildServer.guild_id == guild_id,
                 BF4Server.tick_rate_hz.is_(None),
+                BF4Server.lifecycle_state.notin_(["STALE", "RETIRED"]),
             )
             .order_by(GuildServer.display_name)
         ).all()

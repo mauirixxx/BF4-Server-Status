@@ -32,6 +32,27 @@ class LifecycleMutationPathTests(unittest.TestCase):
         self.assertNotIn("session.delete(bf)", src)
         self.assertNotIn("delete(BF4Server)", src)
 
+    def test_refreshserverhz_defers_offline_servers(self):
+        src = function_source("refreshserverhz")
+        gate = 'if lifecycle_state in {"STALE", "RETIRED"}'
+        self.assertIn(gate, src)
+        self.assertLess(src.index(gate), src.index("get_battlelog_tick_rate"))
+        self.assertIn('result_code="offline_deferred"', src)
+
+    def test_tick_rate_autocomplete_excludes_offline_servers(self):
+        src = function_source("refreshserverhz_choices")
+        self.assertIn('BF4Server.lifecycle_state.notin_(["STALE", "RETIRED"])', src)
+
+    def test_rename_remains_metadata_only(self):
+        src = function_source("renameserver")
+        self.assertNotIn("get_keeper_snapshot", src)
+        self.assertNotIn("lifecycle_state", src)
+
+    def test_default_remove_remains_metadata_cleanup_only(self):
+        src = function_source("default_remove")
+        self.assertNotIn("get_keeper_snapshot", src)
+        self.assertNotIn("lifecycle_state", src)
+
     def test_default_add_does_not_probe_stale_or_retired(self):
         src = function_source("default_add")
         gate = 'if lifecycle_state in {"STALE", "RETIRED"}'
