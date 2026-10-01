@@ -141,6 +141,7 @@ BATTLELOG_DEFAULT_429_BACKOFF_SECONDS = max(
     int(os.getenv("BATTLELOG_DEFAULT_429_BACKOFF_SECONDS", "30")),
 )
 LAST_GOOD_PRESENCE_PLAYERS: int | None = None
+LAST_GOOD_PRESENCE_SERVERS: int | None = None
 LAST_GOOD_PRESENCE_COMPUTED_AT: datetime | None = None
 LAST_GOOD_PRESENCE_VALID_UNTIL: datetime | None = None
 # Player-list ETA learns the real display-cycle cadence in-process. This makes
@@ -5248,6 +5249,7 @@ async def _distributed_presence_policy(default_guids: set[str]) -> dict[str, flo
 async def _hydrate_persisted_presence(reason: str) -> bool:
     """Hydrate process-local presence cache from durable cluster state if still valid."""
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
@@ -5272,6 +5274,7 @@ async def _hydrate_persisted_presence(reason: str) -> bool:
         return False
 
     LAST_GOOD_PRESENCE_PLAYERS = int(state["player_count"])
+    LAST_GOOD_PRESENCE_SERVERS = int(state["server_count"])
     LAST_GOOD_PRESENCE_COMPUTED_AT = computed_at
     LAST_GOOD_PRESENCE_VALID_UNTIL = computed_at + timedelta(seconds=valid_seconds)
     log.info(
@@ -5494,6 +5497,7 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
@@ -5933,9 +5937,17 @@ async def monitor_cycle():
     # so this aggregate cannot fan out into synchronous DB round trips on the
     # Discord event loop. Legacy mode continues to aggregate this cycle's fetches.
     aggregate_started = time.perf_counter()
+    with SessionLocal() as session:
+        confirmed_guids = {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(BF4Server.lifecycle_state == "CONFIRMED")
+            )
+        }
+    confirmed_fresh = {guid: snapshot for guid, snapshot in fresh.items() if guid in confirmed_guids}
+    confirmed_count = len(confirmed_guids)
     player_total = sum(
         get_server_status(snapshot)["players"]
-        for snapshot in fresh.values()
+        for snapshot in confirmed_fresh.values()
     )
     aggregate_elapsed = time.perf_counter() - aggregate_started
     log.info(
@@ -5944,9 +5956,10 @@ async def monitor_cycle():
         aggregate_elapsed,
         len(_MAP_NAME_CACHE),
     )
+    presence_usable = len(confirmed_fresh)
     success_ratio = (
-        1.0 if unique_count == 0
-        else len(fresh) / unique_count
+        1.0 if confirmed_count == 0
+        else presence_usable / confirmed_count
     )
     # Isolated per-server failures (especially Keeper 404s for offline console
     # servers) must not freeze rich presence. Distributed mode tolerates a small
@@ -5959,9 +5972,9 @@ async def monitor_cycle():
         # isolated stale/offline servers must not permanently suppress player
         # presence, but severe snapshot loss should retain the previous total.
         presence_healthy = (
-            unique_count == 0
+            confirmed_count == 0
             or (
-                len(fresh) > 0
+                presence_usable > 0
                 and success_ratio >= PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO
                 and service_failures == 0
                 and not circuit_opened
@@ -5969,20 +5982,20 @@ async def monitor_cycle():
         )
     else:
         presence_healthy = (
-            unique_count == 0
+            confirmed_count == 0
             or (
-                len(fresh) > 0
-                and skipped == 0
+                presence_usable > 0
+                and success_ratio >= PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO
                 and service_failures == 0
                 and not circuit_opened
             )
         )
     if distributed_work:
         log.info(
-            "Presence aggregate evaluated players=%s servers=%s usable=%s stale=%s missing=%s "
+            "Presence aggregate evaluated players=%s confirmed_servers=%s confirmed_usable=%s lane_stale=%s lane_missing=%s "
             "coverage_ratio=%.4f required_ratio=%.4f bulk_horizon_seconds=%.1f "
             "fast_horizon_seconds=%.1f fast_active=%s healthy=%s",
-            player_total, unique_count, len(fresh), snapshot_stale, snapshot_missing,
+            player_total, confirmed_count, presence_usable, snapshot_stale, snapshot_missing,
             success_ratio, PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO,
             float(presence_policy["bulk_horizon_seconds"]),
             float(presence_policy["fast_horizon_seconds"]),
@@ -5991,6 +6004,7 @@ async def monitor_cycle():
 
     if presence_healthy:
         LAST_GOOD_PRESENCE_PLAYERS = player_total
+        LAST_GOOD_PRESENCE_SERVERS = confirmed_count
         computed_at = datetime.now(timezone.utc)
         fallback_valid_seconds = (
             float(presence_policy["fallback_valid_seconds"])
@@ -6004,9 +6018,9 @@ async def monitor_cycle():
                 persisted_at = await asyncio.to_thread(
                     save_presence_aggregate_state,
                     player_count=player_total,
-                    server_count=unique_count,
-                    usable_snapshots=len(fresh),
-                    total_servers=unique_count,
+                    server_count=confirmed_count,
+                    usable_snapshots=presence_usable,
+                    total_servers=confirmed_count,
                     coverage_ratio=success_ratio,
                     worker_id=WORKER_ID,
                     leadership_generation=DISCORD_SESSION_GENERATION,
@@ -6026,11 +6040,11 @@ async def monitor_cycle():
     else:
         log.info(
             "Presence aggregate retained players=%s reason=unhealthy_cycle "
-            "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s "
+            "confirmed_usable=%s confirmed_servers=%s failed=%s skipped=%s circuit_opened=%s "
             "coverage_ratio=%.4f distributed_work=%s",
             LAST_GOOD_PRESENCE_PLAYERS,
-            len(fresh),
-            unique_count,
+            presence_usable,
+            confirmed_count,
             failures,
             skipped,
             circuit_opened,
@@ -6090,6 +6104,7 @@ async def monitor_loop(generation: int):
 
 async def presence_loop():
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
@@ -6123,20 +6138,23 @@ async def presence_loop():
                     LAST_GOOD_PRESENCE_PLAYERS, age_seconds,
                 )
                 LAST_GOOD_PRESENCE_PLAYERS = None
+                LAST_GOOD_PRESENCE_SERVERS = None
                 LAST_GOOD_PRESENCE_COMPUTED_AT = None
                 LAST_GOOD_PRESENCE_VALID_UNTIL = None
 
-            with SessionLocal() as session:
-                unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
-            if LAST_GOOD_PRESENCE_PLAYERS is None:
-                activities = [f"Tracking {unique_count} BF4 servers"]
+            if LAST_GOOD_PRESENCE_PLAYERS is None or LAST_GOOD_PRESENCE_SERVERS is None:
+                with SessionLocal() as session:
+                    confirmed_count = session.scalar(
+                        select(func.count()).select_from(BF4Server).where(BF4Server.lifecycle_state == "CONFIRMED")
+                    ) or 0
+                activity_name = f"Tracking {confirmed_count:,} Servers"
             else:
-                activities = [
-                    f"Tracking {unique_count} BF4 servers",
-                    f"{LAST_GOOD_PRESENCE_PLAYERS:,} players across all tracked servers",
-                ]
+                activity_name = (
+                    f"Tracking {LAST_GOOD_PRESENCE_SERVERS:,} Servers | "
+                    f"{LAST_GOOD_PRESENCE_PLAYERS:,} Players"
+                )
             await client.change_presence(
-                activity=discord.CustomActivity(name=activities[index % len(activities)])
+                activity=discord.CustomActivity(name=activity_name)
             )
             index += 1
         except Exception as exc:
