@@ -7690,6 +7690,7 @@ async def default_modify(
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
 
         if int(old_channel_id or 0) == selected_channel.id:
             await interaction.followup.send(
@@ -7712,10 +7713,16 @@ async def default_modify(
             )
             return
 
-        snapshot = (
-            FRESH_SERVER_CACHE.get(server)
-            or await get_keeper_snapshot_authoritative(server)
-        )
+        # Moving Discord routing is an administrative operation, not a server
+        # revalidation request. STALE/RETIRED servers must keep their lifecycle
+        # polling cadence; their durable offline notice is moved below without
+        # touching Keeper.
+        snapshot = None
+        if lifecycle_state not in {"STALE", "RETIRED"}:
+            snapshot = (
+                FRESH_SERVER_CACHE.get(server)
+                or await get_keeper_snapshot_authoritative(server)
+            )
         temp_gs = GuildServer(
             guild_id=interaction.guild.id,
             server_guid=server,
@@ -7756,14 +7763,25 @@ async def default_modify(
             live.announcement_channel_id = selected_channel.id
             live.announcement_channel_name = selected_channel.name
 
-        await post_automatic_announcement(
-            interaction.guild.id,
-            temp_gs,
-            get_server_status(snapshot),
-            map_change=False,
-        )
+        if snapshot is not None:
+            await post_automatic_announcement(
+                interaction.guild.id,
+                temp_gs,
+                get_server_status(snapshot),
+                map_change=False,
+            )
+        else:
+            # The lifecycle reconciler owns the durable STALE/RETIRED notice.
+            # Routing is already committed, so reconcile immediately to move it
+            # from the old announcement channel to the selected channel.
+            await reconcile_server_lifecycle_discord()
+            with SessionLocal() as session:
+                moved_state = session.get(GuildServerState, (interaction.guild.id, server))
+                moved_lifecycle_channel = int(moved_state.lifecycle_channel_id or 0) if moved_state else 0
+            if moved_lifecycle_channel != selected_channel.id:
+                raise RuntimeError("lifecycle_notice_move_failed")
 
-        if include_users:
+        if include_users and snapshot is not None:
             bflist = None
             if normalize_platform_label(platform) == "PC":
                 bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
