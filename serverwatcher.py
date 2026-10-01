@@ -23,7 +23,6 @@ import requests
 from discord import app_commands
 from dotenv import load_dotenv
 from sqlalchemy import delete, func, or_, select, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
 from control_plane import (
@@ -642,31 +641,100 @@ def keeper_result_from_exception(exc: Exception) -> str:
     return "ERROR"
 
 
-def record_keeper_lifecycle_result(server_guid: str, result: str) -> None:
-    """Persist Keeper evidence used by the v3.2.0 lifecycle state machine."""
+def apply_keeper_lifecycle_result(
+    server_guid: str,
+    result: str,
+    *,
+    observed_at: datetime | None = None,
+) -> dict | None:
+    """Transactionally apply one ordered Keeper observation to server lifecycle."""
     normalized = str(result or "").strip().upper()
     if normalized not in {"SUCCESS", "NOT_FOUND", "ERROR"}:
         raise ValueError(f"unsupported Keeper lifecycle result {result!r}")
 
-    try:
-        with SessionLocal.begin() as session:
-            row = session.get(BF4Server, server_guid)
-            if row is None:
-                return
-            now = session.scalar(select(func.now()))
-            row.last_keeper_result_at = now
-            if normalized == "SUCCESS":
-                row.last_keeper_success_at = now
-                row.first_404_at = None
-            elif normalized == "NOT_FOUND" and row.first_404_at is None:
-                row.first_404_at = now
-    except SQLAlchemyError as exc:
-        # Keeper acquisition succeeded or failed independently of telemetry DB
-        # persistence. Never reclassify a Keeper result because this write failed.
-        log.warning(
-            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
-            server_guid, normalized, type(exc).__name__, str(exc),
+    grace = timedelta(minutes=60)
+    stale_probe = timedelta(hours=1)
+    retirement = timedelta(hours=72)
+    console_probe = timedelta(days=7)
+
+    with SessionLocal.begin() as session:
+        row = session.scalar(
+            select(BF4Server)
+            .where(BF4Server.server_guid == server_guid)
+            .with_for_update()
         )
+        if row is None:
+            return None
+        now = observed_at or session.scalar(select(func.now()))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        previous_result_at = row.last_keeper_result_at
+        if previous_result_at is not None:
+            if previous_result_at.tzinfo is None:
+                previous_result_at = previous_result_at.replace(tzinfo=timezone.utc)
+            if now < previous_result_at:
+                return {"ignored": True, "state": row.lifecycle_state}
+
+        old_state = row.lifecycle_state
+        # ERROR has no lifecycle meaning, but it is still an ordered Keeper
+        # observation. Advance the watermark so an older distributed 404 cannot
+        # arrive later and mutate lifecycle state.
+        row.last_keeper_result_at = now
+        if normalized == "ERROR":
+            return {"ignored": False, "state": old_state, "changed": False}
+
+        if normalized == "SUCCESS":
+            row.last_keeper_success_at = now
+            row.first_404_at = None
+            row.retired_at = None
+            row.next_lifecycle_probe_at = None
+            row.lifecycle_state = "CONFIRMED"
+        else:
+            if row.first_404_at is None:
+                row.first_404_at = now
+            first_404 = row.first_404_at
+            if first_404.tzinfo is None:
+                first_404 = first_404.replace(tzinfo=timezone.utc)
+            outage_age = now - first_404
+            if outage_age >= retirement:
+                row.lifecycle_state = "RETIRED"
+                if row.retired_at is None:
+                    row.retired_at = now
+                platform = normalize_platform_label(row.platform)
+                row.next_lifecycle_probe_at = (
+                    now + console_probe if platform in {"XBox", "PS4/5"} else None
+                )
+            elif outage_age >= grace:
+                row.lifecycle_state = "STALE"
+                row.retired_at = None
+                row.next_lifecycle_probe_at = now + stale_probe
+            else:
+                row.lifecycle_state = "GRACE"
+                row.retired_at = None
+                row.next_lifecycle_probe_at = None
+
+        changed = old_state != row.lifecycle_state
+        result_state = row.lifecycle_state
+        first_404_value = row.first_404_at
+        next_probe = row.next_lifecycle_probe_at
+
+    if changed:
+        log.info(
+            "Server lifecycle transition server=%s old_state=%s new_state=%s result=%s "
+            "observed_at=%s first_404_at=%s next_probe_at=%s",
+            server_guid, old_state, result_state, normalized, now, first_404_value, next_probe,
+        )
+    return {
+        "ignored": False, "changed": changed, "old_state": old_state,
+        "state": result_state, "result": normalized,
+    }
+
+
+def record_keeper_lifecycle_result(
+    server_guid: str, result: str, observed_at: datetime | None = None
+) -> None:
+    """Compatibility wrapper for the central v3.2.0 lifecycle engine."""
+    apply_keeper_lifecycle_result(server_guid, result, observed_at=observed_at)
 
 
 def keeper_service_failure_reason(exc: Exception) -> str | None:
@@ -4958,15 +5026,17 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                 )
                 try:
                     snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
+                    observed_at = utcnow()
                     await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID)
-                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS")
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
                     local_retry_after.pop(guid, None)
                     succeeded += 1
                 except Exception as exc:
                     failed += 1
                     keeper_result = keeper_result_from_exception(exc)
+                    observed_at = utcnow()
                     try:
-                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result)
+                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result, observed_at)
                     except Exception as lifecycle_exc:
                         log.warning(
                             "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
@@ -5154,9 +5224,10 @@ async def monitor_cycle():
                         get_keeper_snapshot,
                         guid,
                     )
+                    observed_at = utcnow()
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
-                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS")
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
                     KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
                     KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
                     async with state_lock:
@@ -5164,8 +5235,9 @@ async def monitor_cycle():
                         consecutive_403_failures = 0
                 except Exception as exc:
                     keeper_result = keeper_result_from_exception(exc)
+                    observed_at = utcnow()
                     try:
-                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result)
+                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result, observed_at)
                     except Exception as lifecycle_exc:
                         log.warning(
                             "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
