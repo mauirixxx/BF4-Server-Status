@@ -5,7 +5,7 @@ import hashlib, shutil, subprocess
 
 ROOT=Path(__file__).resolve().parent
 OUT=ROOT/'dist'
-VERSION='v3.1.3'
+VERSION='v3.2.0'
 NORMAL=f'BF4_Server_Watcher_{VERSION}.zip'
 HA=f'BF4_Server_Watcher_{VERSION}-postgresql-ha.zip'
 DOCS=f'BF4_Server_Watcher_{VERSION}-docs.zip'
@@ -13,11 +13,11 @@ DASH_ROOT=ROOT/'optional/web-dashboard'
 DASH_VERSION=(DASH_ROOT/'VERSION').read_text().strip().split('-',1)[0]
 DASH=f'bf4-status-web-dashboard-v{DASH_VERSION}.zip'
 
-normal_files=['.env.example','Dockerfile','docker-compose.yml','docker-compose.worker-agent.yml','entrypoint.sh','requirements.txt','alembic.ini','serverwatcher.py','worker_agent.py','discord_leader.py','control_plane.py','operator_notifications.py','migrate_with_lock.py','db.py','models.py','LICENSE','THIRD_PARTY.md','README.md','CHANGELOG.md','RELEASE-v3.1.3.md']
+normal_files=['.env.example','Dockerfile','docker-compose.yml','docker-compose.worker-agent.yml','entrypoint.sh','requirements.txt','alembic.ini','serverwatcher.py','server_lifecycle.py','worker_agent.py','discord_leader.py','control_plane.py','operator_notifications.py','migrate_with_lock.py','db.py','models.py','LICENSE','THIRD_PARTY.md','README.md','CHANGELOG.md','RELEASE-v3.2.0.md']
 normal_files += [str(p.relative_to(ROOT)) for p in sorted((ROOT/'alembic').rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'}]
 ha_files=[str(p.relative_to(ROOT/'postgresql-ha')) for p in sorted((ROOT/'postgresql-ha').rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'}]
 dashboard_files=[str(p.relative_to(DASH_ROOT)) for p in sorted(DASH_ROOT.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix not in {'.pyc','.pyo'} and p.name != '.env']
-doc_files=['README.md','CHANGELOG.md','HF1_CHANGELOG.md','HF2_CHANGELOG.md','RELEASE-v3.1.3.md','THIRD_PARTY.md','postgresql-ha/README.md','postgresql-ha/RELEASE-NOTES.md','postgresql-ha/LIVE-VALIDATION-20260929.md','postgresql-ha/CHANGELOG.md','postgresql-ha/BUILD-INFO.txt']
+doc_files=['README.md','CHANGELOG.md','HF1_CHANGELOG.md','HF2_CHANGELOG.md','RELEASE-v3.2.0.md','docs/V3.2.0_STALE_SERVER_DESIGN.md','THIRD_PARTY.md','postgresql-ha/README.md','postgresql-ha/RELEASE-NOTES.md','postgresql-ha/LIVE-VALIDATION-20260929.md','postgresql-ha/CHANGELOG.md','postgresql-ha/BUILD-INFO.txt']
 
 def make(name, files, base=ROOT):
     with ZipFile(OUT/name,'w',ZIP_DEFLATED) as z:
