@@ -681,6 +681,9 @@ def apply_keeper_lifecycle_result(
         # arrive later and mutate lifecycle state.
         row.last_keeper_result_at = now
         if normalized == "ERROR":
+            # A due lifecycle probe that failed ambiguously must remain due. It
+            # may be retried on the next scheduler sweep, but it cannot advance
+            # the outage state or retirement clock.
             return {"ignored": False, "state": old_state, "changed": False}
 
         if normalized == "SUCCESS":
@@ -4922,13 +4925,46 @@ async def _hydrate_persisted_presence(reason: str) -> bool:
 
 
 def _keeper_lane_guid_sets() -> tuple[set[str], set[str]]:
-    """Return globally deduplicated (all GUIDs, default/high-priority GUIDs)."""
-    with SessionLocal() as session:
-        relations = list(session.scalars(select(GuildServer)))
-    all_guids = {str(row.server_guid) for row in relations}
-    default_guids = {str(row.server_guid) for row in relations if row.is_default}
-    return all_guids, default_guids
+    """Return lifecycle-eligible normal GUIDs and default/high-priority GUIDs.
 
+    v3.2.0 makes bf4_servers the permanent Keeper catalog. DISCOVERED,
+    CONFIRMED, and GRACE remain in normal FAST/BULK scheduling; STALE and
+    RETIRED are handled exclusively by the lifecycle-probe lane.
+    """
+    with SessionLocal() as session:
+        normal_guids = {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(
+                    BF4Server.lifecycle_state.in_(("DISCOVERED", "CONFIRMED", "GRACE"))
+                )
+            )
+        }
+        default_guids = {
+            str(guid) for guid in session.scalars(
+                select(GuildServer.server_guid)
+                .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+                .where(
+                    GuildServer.is_default.is_(True),
+                    BF4Server.lifecycle_state.in_(("CONFIRMED", "GRACE")),
+                )
+            )
+        }
+    return normal_guids, default_guids
+
+
+def _keeper_lifecycle_probe_guids() -> set[str]:
+    """Return STALE/RETIRED GUIDs whose authoritative lifecycle probe is due."""
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        return {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(
+                    BF4Server.lifecycle_state.in_(("STALE", "RETIRED")),
+                    BF4Server.next_lifecycle_probe_at.is_not(None),
+                    BF4Server.next_lifecycle_probe_at <= now,
+                )
+            )
+        }
 
 def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
     """Return one PR4-D lane assignment with fail-safe bulk fallback.
@@ -4953,6 +4989,13 @@ def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
             return ({wid: 0 for wid in fast_counts}, {}, fast_eligible, fast_caps, fast_active, len(default_guids))
         return fast_counts, fast_owners, fast_eligible, fast_caps, fast_active, len(default_guids)
 
+    if lane_name == "lifecycle":
+        scope = _keeper_lifecycle_probe_guids()
+        counts, owners, eligible, caps = keeper_assignment_snapshot(
+            stale_after_seconds, role_name="keeper_bulk", guids=scope
+        )
+        return counts, owners, eligible, caps, fast_active, len(default_guids)
+
     if lane_name != "bulk":
         raise ValueError(f"unsupported Keeper lane {lane_name!r}")
     scope = all_guids - default_guids if fast_active else all_guids
@@ -4964,7 +5007,7 @@ def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
 
 async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
     """Fetch this worker's HRW-owned servers for one Keeper scheduling lane."""
-    if lane_name not in {"bulk", "fast"}:
+    if lane_name not in {"bulk", "fast", "lifecycle"}:
         raise ValueError(f"unsupported Keeper lane {lane_name!r}")
     role_name = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
     gate_key = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
@@ -4992,6 +5035,11 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
             if lane_name == "fast":
                 lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.fast_requests_per_second", 0.10)))
                 sweep_seconds = max(30, int(CONTROL_SETTINGS.get("keeper.fast_sweep_seconds", 120)))
+            elif lane_name == "lifecycle":
+                # Probe scheduling shares the existing bulk/global PostgreSQL
+                # rate gates; next_lifecycle_probe_at fences per-server cadence.
+                lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.bulk_requests_per_second", 0.23)))
+                sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.lifecycle_sweep_seconds", 60)))
             else:
                 lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.bulk_requests_per_second", 0.23)))
                 sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.distributed_sweep_seconds", 480)))
@@ -5092,14 +5140,11 @@ async def monitor_cycle():
 
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
-        default_guids = {
-            row.server_guid for row in relations if row.is_default
-        }
-        all_guids = {row.server_guid for row in relations}
-        unique_guids = (
-            sorted(default_guids)
-            + sorted(all_guids - default_guids)
-        )
+    all_guids, default_guids = _keeper_lane_guid_sets()
+    unique_guids = (
+        sorted(default_guids)
+        + sorted(all_guids - default_guids)
+    )
 
     references = len(relations)
     unique_count = len(unique_guids)
@@ -10524,6 +10569,10 @@ async def main_async():
         distributed_keeper_acquisition_loop("fast"),
         name="distributed-keeper-fast-acquisition",
     )
+    keeper_lifecycle_acquisition_task = asyncio.create_task(
+        distributed_keeper_acquisition_loop("lifecycle"),
+        name="distributed-keeper-lifecycle-acquisition",
+    )
     persona_enrichment_task = asyncio.create_task(
         distributed_persona_enrichment_loop(),
         name="distributed-player-persona-enrichment",
@@ -10555,6 +10604,7 @@ async def main_async():
             )
 
         await _cancel_process_task(persona_enrichment_task)
+        await _cancel_process_task(keeper_lifecycle_acquisition_task)
         await _cancel_process_task(keeper_fast_acquisition_task)
         await _cancel_process_task(keeper_acquisition_task)
         await _cancel_process_task(heartbeat_task)
