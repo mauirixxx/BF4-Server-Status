@@ -8214,20 +8214,13 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                 )
 
         # /addserver always asks Keeper now. The command can make a STALE/RETIRED
-        # server immediately probe-eligible, but only Keeper SUCCESS can confirm it.
+        # server immediately probe-eligible, but only an ordered Keeper SUCCESS
+        # that leaves the catalog CONFIRMED may publish/cache a snapshot. Reuse
+        # the authoritative helper so an older SUCCESS cannot beat a newer 404.
         for guid in immediate_validation_guids:
             try:
-                snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
-                observed_at = utcnow()
-                await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID, observed_at)
-                await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
-                FRESH_SERVER_CACHE[guid] = snapshot
+                await get_keeper_snapshot_authoritative(guid)
             except Exception as keeper_exc:
-                observed_at = utcnow()
-                await asyncio.to_thread(
-                    record_keeper_lifecycle_result, guid,
-                    keeper_result_from_exception(keeper_exc), observed_at,
-                )
                 log.info(
                     "Immediate Keeper validation did not confirm server=%s source=addserver result=%s error=%s",
                     guid, keeper_result_from_exception(keeper_exc), type(keeper_exc).__name__,
