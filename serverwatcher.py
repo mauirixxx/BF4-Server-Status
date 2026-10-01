@@ -4477,6 +4477,22 @@ async def _send_server_lifecycle_log(guild: discord.Guild, content: str) -> int:
     return sent
 
 
+def lifecycle_command_notice(bf: BF4Server, display_name: str) -> str | None:
+    state = str(getattr(bf, "lifecycle_state", "") or "").upper()
+    if state not in {"STALE", "RETIRED"}:
+        return None
+    first_404_at = getattr(bf, "first_404_at", None)
+    if first_404_at is not None:
+        if first_404_at.tzinfo is None:
+            first_404_at = first_404_at.replace(tzinfo=timezone.utc)
+        content = f'This Discord server named **{display_name}** is currently offline as of <t:{int(first_404_at.timestamp())}:F>.'
+    else:
+        content = f'This Discord server named **{display_name}** is currently offline.'
+    if state == "RETIRED":
+        content += "\nThis server is RETIRED from regular polling until Keeper confirms it online again."
+    return content
+
+
 def _lifecycle_offline_content(name: str, first_404_at: datetime, *, retired: bool, role_id: int = 0) -> str:
     stamp = int(first_404_at.timestamp())
     lines = [f'This Discord server named **{name}** is currently offline as of <t:{stamp}:F>.']
@@ -7247,6 +7263,11 @@ async def status_all(interaction: discord.Interaction):
         failed_names = []
         for gs, bf in rows:
             try:
+                lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+                if lifecycle_notice:
+                    await interaction.channel.send(lifecycle_notice)
+                    sent += 1
+                    continue
                 snapshot = FRESH_SERVER_CACHE.get(bf.server_guid)
                 if snapshot is None:
                     snapshot = await get_keeper_snapshot_authoritative(bf.server_guid)
@@ -7318,7 +7339,12 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
                 audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="server_not_found", target_type="server", target_id=server)
                 return
             display_name, platform = gs.display_name, bf.platform
+            lifecycle_notice = lifecycle_command_notice(bf, display_name)
 
+        if lifecycle_notice:
+            await interaction.followup.send(lifecycle_notice, ephemeral=True)
+            audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="offline", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
+            return
         snapshot = FRESH_SERVER_CACHE.get(server) or await get_keeper_snapshot_authoritative(server)
         if not players:
             marker = " (default)" if gs.is_default else ""
@@ -10114,9 +10140,15 @@ async def debug(interaction: discord.Interaction, server: str | None = None):
             return
         server = defaults[0][0].server_guid
     try:
-        snapshot = FRESH_SERVER_CACHE.get(server) or await get_keeper_snapshot_authoritative(server)
         with SessionLocal() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
+            bf = session.get(BF4Server, server)
+            lifecycle_notice = lifecycle_command_notice(bf, gs.display_name if gs else server) if bf else None
+        if lifecycle_notice:
+            await interaction.followup.send(f"Debug server: **{gs.display_name if gs else server}**\n{lifecycle_notice}", ephemeral=True)
+            audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=True, started=started, result_code="offline", target_type="server", target_id=server)
+            return
+        snapshot = FRESH_SERVER_CACHE.get(server) or await get_keeper_snapshot_authoritative(server)
         await interaction.followup.send(f"Debug server: **{gs.display_name if gs else server}**\n{build_debug_report(snapshot)}", ephemeral=True)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server)
     except Exception as exc:
@@ -10156,6 +10188,9 @@ async def announce(interaction: discord.Interaction):
             )
             continue
         try:
+            if lifecycle_command_notice(bf, gs.display_name):
+                failed += 1
+                continue
             snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
             msg = await channel.send(
                 build_map_announcement(
@@ -10697,6 +10732,9 @@ async def on_message(message: discord.Message):
                     failed += 1
                     continue
                 try:
+                    if lifecycle_command_notice(bf, gs.display_name):
+                        failed += 1
+                        continue
                     snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
                     msg = await channel.send(
                         build_map_announcement(
@@ -10757,6 +10795,10 @@ async def on_message(message: discord.Message):
                     await message.channel.send("No default server(s) set")
                     return
                 for gs, bf in defaults:
+                    lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+                    if lifecycle_notice:
+                        await message.channel.send(lifecycle_notice)
+                        continue
                     snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
                     await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name} (default)", get_server_status(snapshot), bf.server_guid))
                 audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="defaults", metadata={"count": len(defaults)})
@@ -10785,6 +10827,11 @@ async def on_message(message: discord.Message):
                     )
                 return
             gs, bf = matches[0]
+            lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+            if lifecycle_notice:
+                await message.channel.send(lifecycle_notice)
+                audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="offline", target_type="server", target_id=bf.server_guid, target_name=gs.display_name, metadata={"players": players})
+                return
             snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
             if players:
                 teams = None
