@@ -15,6 +15,7 @@ import time
 import zipfile
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
@@ -41,6 +42,7 @@ from models import (
     BF4PlayerAlias,
     BF4PlayerSession,
     BF4Server,
+    BF4ServerNameHistory,
     CommandAudit,
     Guild,
     GuildAnnouncementChannel,
@@ -1016,6 +1018,121 @@ def get_bflist_server_cached(guid: str, snapshot: dict):
     result = get_bflist_server_for_guid(guid, snapshot)
     BFLIST_CACHE[guid] = (now, result)
     return result
+
+
+def get_bflist_pc_servers() -> list[dict]:
+    """Fetch one cursor-consistent snapshot of BFLIST's current BF4 PC servers."""
+    servers: list[dict] = []
+    cursor = None
+    after = None
+    while True:
+        params = {"perPage": 100}
+        if cursor and after:
+            params.update({"cursor": cursor, "after": after})
+        response = requests.get(
+            "https://api.bflist.io/v2/bf4/servers", params=params, timeout=15
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("servers")
+        if not isinstance(page, list):
+            raise ValueError("BFLIST server list did not contain a servers array")
+        for server in page:
+            if not isinstance(server, dict):
+                continue
+            guid = str(server.get("guid") or "").strip()
+            if not guid:
+                continue
+            servers.append(server)
+            ip = str(server.get("ip") or "").strip()
+            port = server.get("port")
+            if ip and port is not None:
+                after = f"{ip}:{port}"
+        cursor = payload.get("cursor")
+        if not payload.get("hasMore"):
+            break
+        if not cursor or not after:
+            raise ValueError("BFLIST pagination response was incomplete")
+    return servers
+
+
+def persist_bflist_pc_discovery(servers: list[dict]) -> dict[str, int]:
+    """Add new PC GUIDs to the permanent catalog; never infer absence/death."""
+    discovered = 0
+    already_known = 0
+    invalid = 0
+    now = utcnow()
+    with SessionLocal.begin() as session:
+        known = set(session.scalars(select(BF4Server.server_guid)))
+        for item in servers:
+            guid = str(item.get("guid") or "").strip()
+            name = str(item.get("name") or guid).strip()[:255]
+            if not guid:
+                invalid += 1
+                continue
+            if guid in known:
+                already_known += 1
+                continue
+            session.add(BF4Server(
+                server_guid=guid, server_name=name, platform="PC",
+                platform_source="bflist_discovery", lifecycle_state="DISCOVERED",
+            ))
+            session.add(BF4ServerNameHistory(
+                server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None,
+            ))
+            known.add(guid)
+            discovered += 1
+    return {"discovered": discovered, "known": already_known, "invalid": invalid}
+
+
+def bflist_discovery_completed_for_date(run_date: str) -> bool:
+    with SessionLocal() as session:
+        value = session.scalar(text(
+            "SELECT setting_value FROM cluster_runtime_settings "
+            "WHERE setting_key='discovery.bflist_pc_last_success_hst' "
+            "AND scope_type='global' AND scope_name='' LIMIT 1"
+        ))
+    return str(value or "") == run_date
+
+
+def mark_bflist_discovery_completed(run_date: str) -> None:
+    with SessionLocal.begin() as session:
+        session.execute(text(
+            "INSERT INTO cluster_runtime_settings "
+            "(setting_key, scope_type, scope_name, setting_value, value_type, description, updated_by, created_at, updated_at) "
+            "VALUES ('discovery.bflist_pc_last_success_hst','global','',:run_date,'string',"
+            "'Last successful daily BFLIST PC discovery date in Pacific/Honolulu',:worker,now(),now()) "
+            "ON CONFLICT (setting_key, scope_type, scope_name) DO UPDATE SET "
+            "setting_value=EXCLUDED.setting_value, updated_by=EXCLUDED.updated_by, updated_at=now()"
+        ), {"run_date": run_date, "worker": WORKER_ID})
+
+
+async def bflist_pc_discovery_loop() -> None:
+    """Discord-leader-only daily PC discovery at 09:30 Pacific/Honolulu."""
+    hst = ZoneInfo("Pacific/Honolulu")
+    while True:
+        try:
+            now = datetime.now(hst)
+            run_date = now.date().isoformat()
+            due = now.hour > 9 or (now.hour == 9 and now.minute >= 30)
+            completed = await asyncio.to_thread(bflist_discovery_completed_for_date, run_date)
+            if due and not completed:
+                servers = await asyncio.to_thread(get_bflist_pc_servers)
+                result = await asyncio.to_thread(persist_bflist_pc_discovery, servers)
+                await asyncio.to_thread(mark_bflist_discovery_completed, run_date)
+                log.info(
+                    "BFLIST daily PC discovery complete worker_id=%s date_hst=%s seen=%s discovered=%s known=%s invalid=%s",
+                    WORKER_ID, now.date(), len(servers), result["discovered"],
+                    result["known"], result["invalid"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "BFLIST daily PC discovery failed worker_id=%s error=%s message=%r",
+                WORKER_ID, type(exc).__name__, str(exc),
+            )
+        await asyncio.sleep(30)
 
 
 def bflist_team_rosters(bflist_server: dict, snapshot: dict):
@@ -10670,6 +10787,9 @@ async def on_ready():
     _track_discord_leader_task(version_loop(), f"version-g{generation}")
     _track_discord_leader_task(guild_cleanup_loop(), f"guild-cleanup-g{generation}")
     _track_discord_leader_task(operator_event_loop(), f"operator-events-g{generation}")
+    _track_discord_leader_task(
+        bflist_pc_discovery_loop(), f"bflist-discovery-g{generation}"
+    )
 
     # Reconcile processor ownership continuously for this exact Discord lease
     # generation. This handles hot changes to keeper.distributed_enabled and
