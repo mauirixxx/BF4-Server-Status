@@ -5081,8 +5081,51 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
     }
 
 
+def keeper_server_name(snapshot: dict) -> str | None:
+    """Extract Keeper's authoritative server name from a successful snapshot."""
+    for key in ("serverName", "name"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:255]
+    return None
+
+
+def reconcile_keeper_server_name(guid: str, snapshot: dict, observed_at: datetime | None = None) -> dict | None:
+    """Update canonical GUID identity/name history from authoritative Keeper data."""
+    name = keeper_server_name(snapshot)
+    if not name:
+        return None
+    with SessionLocal.begin() as session:
+        row = session.scalar(select(BF4Server).where(BF4Server.server_guid == guid).with_for_update())
+        if row is None:
+            return None
+        now = observed_at or session.scalar(select(func.now()))
+        old_name = row.server_name
+        current = session.scalar(
+            select(BF4ServerNameHistory)
+            .where(BF4ServerNameHistory.server_guid == guid, BF4ServerNameHistory.last_seen_at.is_(None))
+            .order_by(BF4ServerNameHistory.first_seen_at.desc(), BF4ServerNameHistory.id.desc())
+            .limit(1)
+        )
+        if old_name == name:
+            if current is None:
+                session.add(BF4ServerNameHistory(server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None))
+            return {"changed": False, "name": name}
+        if current is not None:
+            current.last_seen_at = now
+        row.server_name = name
+        session.add(BF4ServerNameHistory(server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None))
+        return {"changed": True, "old_name": old_name, "name": name}
+
+
 def _store_keeper_snapshot(guid: str, snapshot: dict, worker_id: str) -> None:
-    """Upsert one worker-fetched snapshot for fenced Discord-leader processing."""
+    """Upsert one worker-fetched snapshot and reconcile Keeper-authoritative identity."""
+    rename = reconcile_keeper_server_name(guid, snapshot)
+    if rename and rename.get("changed"):
+        log.info(
+            "Keeper authoritative server rename guid=%s old_name=%r new_name=%r worker_id=%s",
+            guid, rename.get("old_name"), rename.get("name"), worker_id,
+        )
     with SessionLocal.begin() as session:
         now = session.scalar(select(func.now()))
         row = session.get(KeeperSnapshot, guid)
@@ -5588,6 +5631,12 @@ async def monitor_cycle():
                     observed_at = utcnow()
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
+                    rename = await asyncio.to_thread(reconcile_keeper_server_name, guid, snapshot, observed_at)
+                    if rename and rename.get("changed"):
+                        log.info(
+                            "Keeper authoritative server rename guid=%s old_name=%r new_name=%r worker_id=%s",
+                            guid, rename.get("old_name"), rename.get("name"), WORKER_ID,
+                        )
                     await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
                     KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
                     KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
