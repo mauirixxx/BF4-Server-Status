@@ -4486,8 +4486,8 @@ def _lifecycle_offline_content(name: str, first_404_at: datetime, *, retired: bo
         days = max(3, int((utcnow() - first_404_at).total_seconds() // 86400))
         lines.append(
             f'Server **{name}** has been offline for {days} days and will no longer be '
-            'polled for regular updates until the server owner starts it back up and '
-            're-adds it to this Discord.'
+            'polled for regular updates. BF4SW will resume normal monitoring when Keeper '
+            'confirms the server online again; `/addserver` can request immediate validation.'
         )
     return "\n".join(lines)
 
@@ -4519,6 +4519,8 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
             lifecycle_channel_id = int(state.lifecycle_channel_id or 0) if state else 0
             recovery_message_id = int(state.recovery_message_id or 0) if state else 0
             management_notified_at = state.management_notified_at if state else None
+            offline_logged_at = state.lifecycle_offline_logged_at if state else None
+            recovery_logged_at = state.lifecycle_recovery_logged_at if state else None
             old_announcement_channel = int(state.announcement_channel_id or 0) if state else 0
             old_announcement_message = int(state.announcement_message_id or 0) if state else 0
 
@@ -4540,7 +4542,13 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                                 st.announcement_channel_id = None
                                 st.announcement_channel_name = None
                                 st.announcement_message_id = None
-                await clear_persistent_player_stack(guild, guid)
+                    else:
+                        summary["failed"] += 1
+                        continue
+                _stack_deleted, stack_failed = await clear_persistent_player_stack(guild, guid)
+                if stack_failed:
+                    summary["failed"] += 1
+                    continue
                 if recovery_message_id:
                     with SessionLocal() as session:
                         st = session.get(GuildServerState, (guild_id, guid))
@@ -4551,10 +4559,16 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                             if st:
                                 st.recovery_channel_id = None
                                 st.recovery_message_id = None
+                    else:
+                        summary["failed"] += 1
+                        continue
                 message = None
                 if lifecycle_message_id and lifecycle_channel_id and lifecycle_channel_id != channel.id:
                     if await delete_discord_message(guild_id, lifecycle_channel_id, lifecycle_message_id):
                         lifecycle_message_id = 0
+                    else:
+                        summary["failed"] += 1
+                        continue
                 if lifecycle_message_id and lifecycle_channel_id == channel.id:
                     try:
                         message = await channel.fetch_message(lifecycle_message_id)
@@ -4571,6 +4585,7 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                         allowed_mentions=discord.AllowedMentions(roles=should_ping, users=False, everyone=False),
                         suppress_embeds=True,
                     )
+                if offline_logged_at is None:
                     await _send_server_lifecycle_log(
                         guild,
                         f'🔴 BF4 server offline: **{name}** as of <t:{int(first_404_at.timestamp())}:F>.',
@@ -4584,6 +4599,9 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                     st.lifecycle_message_id = message.id
                     if should_ping:
                         st.management_notified_at = utcnow()
+                    if offline_logged_at is None:
+                        st.lifecycle_offline_logged_at = utcnow()
+                    st.lifecycle_recovery_logged_at = None
                 summary["retired" if retired else "offline"] += 1
             except Exception as exc:
                 summary["failed"] += 1
@@ -4605,10 +4623,11 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                     allowed_mentions=discord.AllowedMentions.none(),
                     suppress_embeds=True,
                 )
-                await _send_server_lifecycle_log(
-                    guild,
-                    f'🟢 BF4 server online again: **{name}** as of <t:{int(recovered_at.timestamp())}:F>.',
-                )
+                if recovery_logged_at is None:
+                    await _send_server_lifecycle_log(
+                        guild,
+                        f'🟢 BF4 server online again: **{name}** as of <t:{int(recovered_at.timestamp())}:F>.',
+                    )
                 with SessionLocal.begin() as session:
                     st = session.get(GuildServerState, (guild_id, guid))
                     if st:
@@ -4617,6 +4636,9 @@ async def reconcile_server_lifecycle_discord() -> dict[str, int]:
                         st.recovery_channel_id = channel.id
                         st.recovery_message_id = recovery.id
                         st.management_notified_at = None
+                        st.lifecycle_offline_logged_at = None
+                        if recovery_logged_at is None:
+                            st.lifecycle_recovery_logged_at = recovered_at
                 summary["recovered"] += 1
             except Exception as exc:
                 summary["failed"] += 1

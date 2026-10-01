@@ -98,6 +98,8 @@ def upgrade():
     op.add_column("guild_server_state", sa.Column("recovery_channel_id", sa.BigInteger(), nullable=True))
     op.add_column("guild_server_state", sa.Column("recovery_message_id", sa.BigInteger(), nullable=True))
     op.add_column("guild_server_state", sa.Column("management_notified_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("guild_server_state", sa.Column("lifecycle_offline_logged_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("guild_server_state", sa.Column("lifecycle_recovery_logged_at", sa.DateTime(timezone=True), nullable=True))
 
 
     # Lifecycle probes share keeper_bulk worker ownership but have a dedicated
@@ -115,6 +117,8 @@ def upgrade():
 def downgrade():
     op.execute(sa.text("DELETE FROM keeper_rate_waiters WHERE gate_key='keeper_lifecycle'"))
     op.execute(sa.text("DELETE FROM keeper_rate_gate WHERE gate_key='keeper_lifecycle'"))
+    op.drop_column("guild_server_state", "lifecycle_recovery_logged_at")
+    op.drop_column("guild_server_state", "lifecycle_offline_logged_at")
     op.drop_column("guild_server_state", "management_notified_at")
     op.drop_column("guild_server_state", "recovery_message_id")
     op.drop_column("guild_server_state", "recovery_channel_id")

@@ -285,6 +285,8 @@ class GuildServerState(Base):
     recovery_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     recovery_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     management_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lifecycle_offline_logged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lifecycle_recovery_logged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CommandAudit(Base):
