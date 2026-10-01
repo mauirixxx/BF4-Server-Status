@@ -7495,10 +7495,9 @@ async def default_add(
                     target_name=gs.display_name,
                 )
                 return
-            gs.is_default = True
-            gs.include_users = bool(include_users)
-            gs.announcement_channel_id = selected_channel.id
-            gs.announcement_channel_name = selected_channel.name
+            # Validate Keeper before committing the default-server mutation.
+            # A failed authoritative fetch must not leave a server marked default
+            # when no announcement/player stack could be created.
             name = gs.display_name
             platform = bf.platform
             server_name = bf.server_name
@@ -7508,6 +7507,15 @@ async def default_add(
             FRESH_SERVER_CACHE.get(server)
             or await get_keeper_snapshot_authoritative(server)
         )
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            gs.is_default = True
+            gs.include_users = bool(include_users)
+            gs.announcement_channel_id = selected_channel.id
+            gs.announcement_channel_name = selected_channel.name
+
         temp_gs = GuildServer(
             guild_id=interaction.guild.id,
             server_guid=server,
