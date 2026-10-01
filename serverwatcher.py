@@ -37,6 +37,8 @@ from control_plane import (
 )
 from operator_notifications import (bootstrap_primary_operator, is_operator, list_destinations, add_dm, add_channel, set_destination_enabled, remove_destination, ensure_delivery_rows, due_deliveries, mark_delivery_success, mark_delivery_failure, cluster_status_snapshot, delivery_class, set_notifications_enabled)
 from discord_leader import DiscordLeadershipSupervisor
+from server_lifecycle import decide_lifecycle
+
 from models import (
     BF4Map,
     BF4PlayerAlias,
@@ -655,11 +657,6 @@ def apply_keeper_lifecycle_result(
     if normalized not in {"SUCCESS", "NOT_FOUND", "ERROR"}:
         raise ValueError(f"unsupported Keeper lifecycle result {result!r}")
 
-    grace = timedelta(minutes=60)
-    stale_probe = timedelta(hours=1)
-    retirement = timedelta(hours=72)
-    console_probe = timedelta(days=7)
-
     with SessionLocal.begin() as session:
         row = session.scalar(
             select(BF4Server)
@@ -689,35 +686,23 @@ def apply_keeper_lifecycle_result(
             # the outage state or retirement clock.
             return {"ignored": False, "state": old_state, "changed": False}
 
-        if normalized == "SUCCESS":
-            row.last_keeper_success_at = now
-            row.first_404_at = None
-            row.retired_at = None
-            row.next_lifecycle_probe_at = None
-            row.lifecycle_state = "CONFIRMED"
-        else:
-            if row.first_404_at is None:
-                row.first_404_at = now
-            first_404 = row.first_404_at
-            if first_404.tzinfo is None:
-                first_404 = first_404.replace(tzinfo=timezone.utc)
-            outage_age = now - first_404
-            if outage_age >= retirement:
-                row.lifecycle_state = "RETIRED"
-                if row.retired_at is None:
-                    row.retired_at = now
-                platform = normalize_platform_label(row.platform)
-                row.next_lifecycle_probe_at = (
-                    now + console_probe if platform in {"XBox", "PS4/5"} else None
-                )
-            elif outage_age >= grace:
-                row.lifecycle_state = "STALE"
-                row.retired_at = None
-                row.next_lifecycle_probe_at = now + stale_probe
-            else:
-                row.lifecycle_state = "GRACE"
-                row.retired_at = None
-                row.next_lifecycle_probe_at = None
+        first_404 = row.first_404_at
+        if first_404 is not None and first_404.tzinfo is None:
+            first_404 = first_404.replace(tzinfo=timezone.utc)
+        retired_at = row.retired_at
+        if retired_at is not None and retired_at.tzinfo is None:
+            retired_at = retired_at.replace(tzinfo=timezone.utc)
+        decision = decide_lifecycle(
+            state=old_state, result=normalized, observed_at=now,
+            first_404_at=first_404, retired_at=retired_at,
+            platform=normalize_platform_label(row.platform),
+        )
+        row.lifecycle_state = decision.state
+        row.first_404_at = decision.first_404_at
+        row.retired_at = decision.retired_at
+        row.next_lifecycle_probe_at = decision.next_probe_at
+        if decision.success_at is not None:
+            row.last_keeper_success_at = decision.success_at
 
         changed = old_state != row.lifecycle_state
         result_state = row.lifecycle_state
