@@ -10,7 +10,7 @@ Keeper success is authoritative and immediately returns any lifecycle state to `
 
 ## Global catalog and discovery
 
-`bf4_servers` is now the permanent Keeper scheduling universe. Removing a guild/server relationship does not delete the global server record. BFLIST is used only for once-daily PC server discovery at 09:30 HST by the current Discord leader; absence from BFLIST has no lifecycle meaning. Keeper is authoritative for server names, with GUID-based rename history retained in `bf4_server_name_history`.
+`bf4_servers` is now the permanent Keeper scheduling universe. Removing a guild/server relationship does not delete the global server record. BFLIST performs once-daily PC server discovery at 09:30 HST by the current Discord leader and continues to provide PC player roster/stat enrichment; BFLIST presence or absence has no lifecycle meaning. Keeper is authoritative for server names, with GUID-based rename history retained in `bf4_server_name_history`.
 
 ## Discord and presence
 

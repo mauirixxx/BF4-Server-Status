@@ -127,6 +127,8 @@ LATEST_VERSION = None
 VERSION_CHECK_ERROR = None
 FRESH_SERVER_CACHE: dict[str, dict] = {}
 LAST_SUCCESS_CACHE: dict[str, dict] = {}
+BFLIST_CACHE: dict[str, tuple[float, dict | None]] = {}
+BFLIST_CACHE_SECONDS = 15
 EXTERNAL_LOOKUP_WORKERS = max(1, int(os.getenv("EXTERNAL_LOOKUP_WORKERS", "3")))
 EXTERNAL_REQUESTS_PER_SECOND = max(
     0.1,
@@ -972,6 +974,38 @@ def keeper_player_candidates(snapshot: dict):
     return names
 
 
+def get_bflist_server_for_guid(guid: str, snapshot: dict):
+    target = guid.lower()
+    for name in keeper_player_candidates(snapshot)[:12]:
+        try:
+            response = requests.get(
+                f"https://api.bflist.io/v2/bf4/players/{quote(name, safe='')}/server",
+                timeout=6,
+            )
+            if response.status_code != 200:
+                continue
+            server = response.json()
+            if (
+                isinstance(server, dict)
+                and str(server.get("guid", "")).lower() == target
+                and isinstance(server.get("players"), list)
+            ):
+                return server
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+    return None
+
+
+def get_bflist_server_cached(guid: str, snapshot: dict):
+    now = time.monotonic()
+    cached = BFLIST_CACHE.get(guid)
+    if cached and now - cached[0] <= BFLIST_CACHE_SECONDS:
+        return cached[1]
+    result = get_bflist_server_for_guid(guid, snapshot)
+    BFLIST_CACHE[guid] = (now, result)
+    return result
+
+
 def get_bflist_pc_servers() -> list[dict]:
     """Fetch one cursor-consistent snapshot of BFLIST's current BF4 PC servers."""
     servers: list[dict] = []
@@ -1088,6 +1122,36 @@ async def bflist_pc_discovery_loop() -> None:
                 WORKER_ID, type(exc).__name__, str(exc),
             )
         await asyncio.sleep(30)
+
+
+def bflist_team_rosters(bflist_server: dict, snapshot: dict):
+    factions = {t["team_id"]: t.get("faction") for t in keeper_team_rosters(snapshot)}
+    grouped = {}
+    for player in bflist_server.get("players", []):
+        if not isinstance(player, dict):
+            continue
+        ptype = as_int(player.get("type"))
+        label = str(player.get("typeLabel", "")).lower()
+        if ptype not in (None, 0) or (label and label != "player"):
+            continue
+        tid = as_int(player.get("team"))
+        if tid is None or tid <= 0:
+            continue
+        grouped.setdefault(str(tid), []).append({
+            "name": player_display_name(player),
+            "score": as_int(player.get("score")) or 0,
+            "kills": as_int(player.get("kills")) or 0,
+            "deaths": as_int(player.get("deaths")) or 0,
+        })
+    result = []
+    for team_id in sorted(set(factions) | set(grouped), key=lambda x: int(x) if x.isdigit() else 99):
+        rows = grouped.get(team_id, [])
+        rows.sort(key=lambda r: (-r["score"], r["name"].casefold()))
+        for i, row in enumerate(rows, 1):
+            row["place"] = i
+            row["kdr"] = row["kills"] / row["deaths"] if row["deaths"] else float(row["kills"])
+        result.append({"team_id": team_id, "faction": factions.get(team_id), "rows": rows})
+    return result
 
 
 def roster_header(team, rows_key="names"):
@@ -4121,8 +4185,23 @@ def persistent_roster_chunks(
     snapshot: dict,
     bflist_server: dict | None = None,
 ) -> list[str]:
-    """Render persistent rosters exclusively from authoritative Keeper data."""
-    return compact_roster_messages(keeper_team_rosters(snapshot), gs.display_name)
+    """Render the same compact roster style as `!status <server> players`."""
+    teams = None
+    if normalize_platform_label(bf.platform) == "PC" and bflist_server:
+        rich = bflist_team_rosters(bflist_server, snapshot)
+        teams = [
+            {
+                "team_id": team["team_id"],
+                "faction": team["faction"],
+                "names": [row["name"] for row in team["rows"]],
+                "numbered": True,
+            }
+            for team in rich
+        ]
+    if not teams:
+        teams = keeper_team_rosters(snapshot)
+    return compact_roster_messages(teams, gs.display_name)
+
 
 def roster_chunks_with_last_updated(chunks: list[str], updated_unix: int) -> list[str]:
     """Add the native Discord timestamp to the primary roster header only."""
@@ -4811,10 +4890,47 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
         duplicate_avoided,
     )
 
-    # v3.2.0: BFLIST is discovery-only. Player rosters come exclusively
-    # from the successful Keeper snapshot already present in this cycle.
-    bflist_by_guid: dict[str, dict | None] = {guid: None for guid in unique_guids}
+    # One volatile BFLIST/player-detail result per unique server for this cycle.
+    bflist_by_guid: dict[str, dict | None] = {}
     lookup_count = 0
+    for index, guid in enumerate(unique_guids, 1):
+        snapshot = fresh.get(guid)
+        if snapshot is None:
+            continue
+        platform = next(
+            row["platform"]
+            for row in requested
+            if row["server_guid"] == guid
+        )
+        if normalize_platform_label(platform) != "PC":
+            bflist_by_guid[guid] = None
+            continue
+        lookup_count += 1
+        try:
+            bflist_by_guid[guid] = await asyncio.to_thread(
+                get_bflist_server_cached,
+                guid,
+                snapshot,
+            )
+            log.debug(
+                "Player roster lookup complete server=%s progress=%s/%s "
+                "source=%s",
+                guid,
+                index,
+                len(unique_guids),
+                "BFLIST" if bflist_by_guid[guid] else "Keeper fallback",
+            )
+        except Exception as exc:
+            bflist_by_guid[guid] = None
+            log.warning(
+                "Player roster lookup failed server=%s progress=%s/%s "
+                "error=%s message=%r fallback=Keeper",
+                guid,
+                index,
+                len(unique_guids),
+                type(exc).__name__,
+                str(exc),
+            )
 
     unchanged = refreshed = failed = posted = deleted = edited = 0
     eta_seconds, eta_source = _player_display_eta_seconds(len(unique_guids))
@@ -7174,7 +7290,14 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
             marker = " (default)" if gs.is_default else ""
             await interaction.followup.send(build_status_message(f"BF4 Server Status — {display_name}{marker}", get_server_status(snapshot), server), ephemeral=True)
         else:
-            chunks = compact_roster_messages(keeper_team_rosters(snapshot), display_name)
+            chunks = None
+            if normalize_platform_label(platform) == "PC":
+                bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
+                if bflist:
+                    rich = bflist_team_rosters(bflist, snapshot)
+                    chunks = wide_scoreboard_messages(rich, display_name) if layout == "wide" else mobile_scoreboard_messages(rich, display_name)
+            if not chunks:
+                chunks = compact_roster_messages(keeper_team_rosters(snapshot), display_name)
             await send_clean_chunks(interaction, chunks)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
     except Exception as exc:
@@ -7370,6 +7493,13 @@ async def default_add(
         player_note = ""
         if include_users:
             try:
+                bflist = None
+                if normalize_platform_label(platform) == "PC":
+                    bflist = await asyncio.to_thread(
+                        get_bflist_server_cached,
+                        server,
+                        snapshot,
+                    )
                 result = await update_persistent_player_display(
                     interaction.guild,
                     temp_gs,
@@ -7566,12 +7696,15 @@ async def default_modify(
         )
 
         if include_users:
+            bflist = None
+            if normalize_platform_label(platform) == "PC":
+                bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
             await update_persistent_player_display(
                 interaction.guild,
                 temp_gs,
                 BF4Server(server_guid=server, server_name=server_name, platform=platform),
                 snapshot,
-                None,
+                bflist,
                 next_player_display_eta_unix(current_unique_server_count()),
             )
         PLAYER_DISPLAY_VALIDATED.discard((interaction.guild.id, server))
@@ -10612,7 +10745,21 @@ async def on_message(message: discord.Message):
             gs, bf = matches[0]
             snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
             if players:
-                teams = keeper_team_rosters(snapshot)
+                teams = None
+                if normalize_platform_label(bf.platform) == "PC":
+                    bflist = await asyncio.to_thread(get_bflist_server_cached, bf.server_guid, snapshot)
+                    if bflist:
+                        rich = bflist_team_rosters(bflist, snapshot)
+                        teams = []
+                        for team in rich:
+                            teams.append({
+                                "team_id": team["team_id"],
+                                "faction": team["faction"],
+                                "names": [r["name"] for r in team["rows"]],
+                                "numbered": True,
+                            })
+                if not teams:
+                    teams = keeper_team_rosters(snapshot)
                 for chunk in compact_roster_messages(teams, gs.display_name):
                     await message.channel.send(chunk)
             else:

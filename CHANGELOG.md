@@ -11,7 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Added Keeper-authoritative canonical server names with GUID-based rename history.
 - Added Discord offline/retired/recovery reconciliation and permanent no-ping `/logschannel` lifecycle events.
 - Made `/addserver` request immediate Keeper revalidation without allowing the command itself to declare a server online.
-- Restricted BFLIST to leader-owned daily PC discovery at 09:30 HST; BFLIST absence has no lifecycle meaning and BFLIST is no longer used for player rosters/status enrichment.
+- Added leader-owned daily PC server discovery at 09:30 HST while preserving existing BFLIST-backed PC player roster/stat enrichment. BFLIST presence or absence has no lifecycle meaning; Keeper remains authoritative for lifecycle and server identity.
 - Rich Presence now reports CONFIRMED-only server/player totals as `Tracking N Servers | N Players`.
 - Added Alembic revision `0023_v3_2_0_server_lifecycle` and lifecycle boundary tests.
 - Hardened distributed snapshot/name ordering, stale-snapshot suppression, guild relationship cleanup, and on-demand Keeper lifecycle evidence.
