@@ -28,6 +28,7 @@ from models import (
     KeeperLaneWorkerState,
     PresenceAggregateState,
     BF4PlayerSession,
+    BF4Server,
     PlayerPersonaEnrichmentState,
 )
 
@@ -365,9 +366,12 @@ def persona_assignment_snapshot(stale_after_seconds: int = DEFAULT_STALE_AFTER_S
             )
         }
         guids = sorted(set(session.scalars(
-            select(BF4PlayerSession.server_guid).where(
+            select(BF4PlayerSession.server_guid)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         )))
 

@@ -2910,6 +2910,13 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
         player_session = session.get(BF4PlayerSession, int(session_id))
         if player_session is None:
             return 0
+        bf = session.get(BF4Server, player_session.server_guid)
+        if (
+            player_session.time_left is not None
+            or bf is None
+            or str(bf.lifecycle_state or "").upper() != "CONFIRMED"
+        ):
+            return 0
         session_platform = normalize_platform_label(player_session.platform)
         watch_rows = session.scalars(
             select(GuildPlayerWatch).where(
@@ -3115,9 +3122,12 @@ def _seed_legacy_persona_queue_from_db() -> int:
     with SessionLocal() as session:
         db_now = session.scalar(select(func.now()))
         rows = session.execute(
-            select(BF4PlayerSession.server_guid, BF4PlayerSession.id).where(
+            select(BF4PlayerSession.server_guid, BF4PlayerSession.id)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         ).all()
         states = {
@@ -3163,9 +3173,12 @@ def _seed_legacy_persona_queue_from_db() -> int:
 def _persona_open_unresolved_count() -> int:
     with SessionLocal() as session:
         return int(session.scalar(
-            select(func.count()).select_from(BF4PlayerSession).where(
+            select(func.count()).select_from(BF4PlayerSession)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         ) or 0)
 
@@ -3251,10 +3264,13 @@ def _persona_pending_ids(server_guid: str) -> set[int]:
         return {
             int(value)
             for value in session.scalars(
-                select(BF4PlayerSession.id).where(
+                select(BF4PlayerSession.id)
+                .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+                .where(
                     BF4PlayerSession.server_guid == server_guid,
                     BF4PlayerSession.time_left.is_(None),
                     BF4PlayerSession.persona_id.is_(None),
+                    BF4Server.lifecycle_state == "CONFIRMED",
                 )
             ).all()
         }
@@ -3549,8 +3565,10 @@ async def process_player_persona_enrichment():
         async with semaphore:
             with SessionLocal() as session:
                 bf = session.get(BF4Server, guid)
-                if bf is None:
+                if bf is None or str(bf.lifecycle_state or "").upper() != "CONFIRMED":
                     PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                    PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+                    PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
                     return
                 platform = normalize_platform_label(bf.platform)
                 url = battlelog_server_url_for(bf)
