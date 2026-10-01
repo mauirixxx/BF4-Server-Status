@@ -668,12 +668,18 @@ def apply_keeper_lifecycle_result(
         now = observed_at or session.scalar(select(func.now()))
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
+        closed_session_ids: set[int] = set()
         previous_result_at = row.last_keeper_result_at
         if previous_result_at is not None:
             if previous_result_at.tzinfo is None:
                 previous_result_at = previous_result_at.replace(tzinfo=timezone.utc)
             if now < previous_result_at:
-                return {"ignored": True, "state": row.lifecycle_state}
+                return {
+                    "ignored": True,
+                    "state": row.lifecycle_state,
+                    "closed_session_ids": closed_session_ids,
+                    "needs_recovery_baseline": row.lifecycle_state in {"STALE", "RETIRED"},
+                }
 
         old_state = row.lifecycle_state
         # ERROR has no lifecycle meaning, but it is still an ordered Keeper
@@ -684,7 +690,13 @@ def apply_keeper_lifecycle_result(
             # A due lifecycle probe that failed ambiguously must remain due. It
             # may be retried on the next scheduler sweep, but it cannot advance
             # the outage state or retirement clock.
-            return {"ignored": False, "state": old_state, "changed": False}
+            return {
+                "ignored": False,
+                "state": old_state,
+                "changed": False,
+                "closed_session_ids": closed_session_ids,
+                "needs_recovery_baseline": old_state in {"STALE", "RETIRED"},
+            }
 
         first_404 = row.first_404_at
         if first_404 is not None and first_404.tzinfo is None:
@@ -697,12 +709,47 @@ def apply_keeper_lifecycle_result(
             first_404_at=first_404, retired_at=retired_at,
             platform=normalize_platform_label(row.platform),
         )
+        needs_recovery_baseline = (
+            decision.state in {"STALE", "RETIRED"}
+            or (normalized == "SUCCESS" and old_state in {"STALE", "RETIRED"})
+        )
         row.lifecycle_state = decision.state
         row.first_404_at = decision.first_404_at
         row.retired_at = decision.retired_at
         row.next_lifecycle_probe_at = decision.next_probe_at
         if decision.success_at is not None:
             row.last_keeper_success_at = decision.success_at
+
+        # Keep sessions open during GRACE. On the first transition into STALE
+        # (or directly into RETIRED after delayed evidence), close them at the
+        # player's own last confirmed observation, not at the first 404.
+        sessions_closed = 0
+        if (
+            old_state not in {"STALE", "RETIRED"}
+            and decision.state in {"STALE", "RETIRED"}
+        ):
+            # The server row lock serializes transition ownership; this same
+            # transaction closes sessions and clears durable enrichment state.
+            open_sessions = session.scalars(
+                select(BF4PlayerSession).where(
+                    BF4PlayerSession.server_guid == server_guid,
+                    BF4PlayerSession.time_left.is_(None),
+                )
+            ).all()
+            closed_session_ids = {int(player_session.id) for player_session in open_sessions}
+            for player_session in open_sessions:
+                player_session.time_left = player_session.last_seen
+                player_session.persona_alert_mode = None
+            session.execute(
+                delete(PlayerPersonaEnrichmentState).where(
+                    PlayerPersonaEnrichmentState.server_guid == server_guid
+                )
+            )
+            sessions_closed = len(open_sessions)
+            # This may run on a Keeper worker rather than the Discord leader.
+            # Do not mutate process-local enrichment hints here; the DB closure
+            # is authoritative and queue consumers revalidate open session
+            # state before external work.
 
         changed = old_state != row.lifecycle_state
         result_state = row.lifecycle_state
@@ -712,26 +759,51 @@ def apply_keeper_lifecycle_result(
     if changed:
         log.info(
             "Server lifecycle transition server=%s old_state=%s new_state=%s result=%s "
-            "observed_at=%s first_404_at=%s next_probe_at=%s",
-            server_guid, old_state, result_state, normalized, now, first_404_value, next_probe,
+            "observed_at=%s first_404_at=%s next_probe_at=%s "
+            "player_sessions_closed=%s",
+            server_guid, old_state, result_state, normalized, now,
+            first_404_value, next_probe, sessions_closed,
+        )
+    elif sessions_closed:
+        log.info(
+            "Server lifecycle repaired dangling player sessions server=%s state=%s "
+            "player_sessions_closed=%s",
+            server_guid, result_state, sessions_closed,
         )
     return {
         "ignored": False, "changed": changed, "old_state": old_state,
         "state": result_state, "result": normalized,
+        "player_sessions_closed": sessions_closed,
+        "closed_session_ids": closed_session_ids,
+        "needs_recovery_baseline": needs_recovery_baseline,
     }
 
 
 def record_keeper_lifecycle_result(
     server_guid: str, result: str, observed_at: datetime | None = None
-) -> None:
-    """Record Keeper evidence and immediately invalidate cache on authoritative 404."""
-    apply_keeper_lifecycle_result(server_guid, result, observed_at=observed_at)
-    if str(result or "").strip().upper() == "NOT_FOUND":
+) -> dict | None:
+    """Record lifecycle evidence and invalidate cached state on Keeper 404."""
+    normalized = str(result or "").strip().upper()
+    outcome = apply_keeper_lifecycle_result(
+        server_guid, result, observed_at=observed_at
+    )
+    if normalized == "NOT_FOUND":
         # Do not wait for the next Discord monitor cycle to suppress a snapshot
         # that Keeper has already authoritatively invalidated. Direct /status,
         # !status, /debug and announcement paths all consult this cache first.
         FRESH_SERVER_CACHE.pop(server_guid, None)
         BFLIST_CACHE.pop(server_guid, None)
+    if outcome and outcome.get("needs_recovery_baseline"):
+        PLAYER_ROSTER_RECOVERY_REQUIRED.add(server_guid)
+        for session_id in outcome.get("closed_session_ids", ()):
+            PENDING_PLAYER_ABSENCES.pop((server_guid, int(session_id)), None)
+            PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(int(session_id))
+            PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.discard(int(session_id))
+        PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(server_guid, None)
+        PLAYER_ENRICHMENT_RETRY_AFTER.pop(server_guid, None)
+        PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(server_guid, None)
+        PLAYER_ENRICHMENT_QUEUED.discard(server_guid)
+    return outcome
 
 
 def request_server_lifecycle_revalidation(server_guid: str) -> dict | None:
@@ -3955,10 +4027,13 @@ def _process_player_history_server_db(
 
 async def process_player_history(
     fresh: dict[str, dict],
-    tracked_guids: list[str],
+    confirmed_tracked_guids: set[str],
 ):
     """Maintain global player sessions from authoritative Keeper rosters."""
-    for guid in tracked_guids:
+    # Preserve the pre-v3.2 recovery-baseline behavior for ambiguous/transient
+    # misses, but do not baseline GRACE servers: their open sessions deliberately
+    # survive the 60-minute 404 window.
+    for guid in confirmed_tracked_guids:
         if guid not in fresh and guid in PLAYER_ROSTER_BASELINED:
             PLAYER_ROSTER_RECOVERY_REQUIRED.add(guid)
 
@@ -4029,7 +4104,8 @@ async def process_player_history(
                 joins_alerted += await evaluate_player_watch_alerts(session_id)
 
         PLAYER_ROSTER_BASELINED.add(guid)
-        PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
+        if recovery_baseline:
+            PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
 
         # Keep an explicit cooperative yield between servers even though the
         # SQLAlchemy transaction itself now runs in asyncio.to_thread().
@@ -5555,7 +5631,12 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                     keeper_result = keeper_result_from_exception(exc)
                     observed_at = utcnow()
                     try:
-                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result, observed_at)
+                        await asyncio.to_thread(
+                            record_keeper_lifecycle_result,
+                            guid,
+                            keeper_result,
+                            observed_at,
+                        )
                     except Exception as lifecycle_exc:
                         log.warning(
                             "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
@@ -5760,7 +5841,12 @@ async def monitor_cycle():
                     keeper_result = keeper_result_from_exception(exc)
                     observed_at = utcnow()
                     try:
-                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result, observed_at)
+                        await asyncio.to_thread(
+                            record_keeper_lifecycle_result,
+                            guid,
+                            keeper_result,
+                            observed_at,
+                        )
                     except Exception as lifecycle_exc:
                         log.warning(
                             "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
@@ -5916,16 +6002,19 @@ async def monitor_cycle():
     # A persisted Keeper snapshot can remain fresh by age after a later 404.
     # Never let that pre-404 data drive Discord, player history, rosters, or
     # command cache while the catalog is DISCOVERED/GRACE/STALE/RETIRED.
-    if fresh:
+    confirmed_tracked_guids: set[str] = set()
+    if unique_guids:
         with SessionLocal() as session:
-            confirmed_now = {
+            confirmed_tracked_guids = {
                 str(guid) for guid in session.scalars(
                     select(BF4Server.server_guid).where(
-                        BF4Server.server_guid.in_(list(fresh)),
+                        BF4Server.server_guid.in_(unique_guids),
                         BF4Server.lifecycle_state == "CONFIRMED",
                     )
                 )
             }
+    if fresh:
+        confirmed_now = set(fresh).intersection(confirmed_tracked_guids)
         suppressed = len(fresh) - len(confirmed_now)
         if suppressed:
             log.info(
@@ -6023,7 +6112,9 @@ async def monitor_cycle():
         },
     }
     try:
-        player_history_summary = await process_player_history(fresh, unique_guids)
+        player_history_summary = await process_player_history(
+            fresh, confirmed_tracked_guids
+        )
     except Exception as exc:
         log.error(
             "Player history cycle failed error=%s message=%r",
