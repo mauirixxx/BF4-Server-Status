@@ -628,6 +628,47 @@ def get_keeper_snapshot(guid: str) -> dict:
     return snapshot
 
 
+def keeper_result_from_exception(exc: Exception) -> str:
+    """Return the lifecycle-safe Keeper result for a failed request.
+
+    Only an authoritative HTTP 404 means the BF4 server was not found. Every
+    other failure is operationally ambiguous and must remain ERROR so outages,
+    throttling, and transport failures can never age a server toward retirement.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) == 404:
+            return "NOT_FOUND"
+    return "ERROR"
+
+
+def record_keeper_lifecycle_result(server_guid: str, result: str) -> None:
+    """Persist Keeper evidence used by the v3.2.0 lifecycle state machine."""
+    normalized = str(result or "").strip().upper()
+    if normalized not in {"SUCCESS", "NOT_FOUND", "ERROR"}:
+        raise ValueError(f"unsupported Keeper lifecycle result {result!r}")
+
+    try:
+        with SessionLocal.begin() as session:
+            row = session.get(BF4Server, server_guid)
+            if row is None:
+                return
+            now = session.scalar(select(func.now()))
+            row.last_keeper_result_at = now
+            if normalized == "SUCCESS":
+                row.last_keeper_success_at = now
+                row.first_404_at = None
+            elif normalized == "NOT_FOUND" and row.first_404_at is None:
+                row.first_404_at = now
+    except SQLAlchemyError as exc:
+        # Keeper acquisition succeeded or failed independently of telemetry DB
+        # persistence. Never reclassify a Keeper result because this write failed.
+        log.warning(
+            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
+            server_guid, normalized, type(exc).__name__, str(exc),
+        )
+
+
 def keeper_service_failure_reason(exc: Exception) -> str | None:
     """Classify failures that can indicate Keeper-wide throttling/outage."""
     if isinstance(exc, requests.HTTPError):
@@ -1383,6 +1424,7 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
                 platform="PC",
                 battlelog_url=f"https://battlelog.battlefield.com/bf4/servers/show/pc/{AAA_GUID}/",
                 platform_source="bundled",
+                lifecycle_state="DISCOVERED",
             )
             session.add(aaa)
 
@@ -4917,10 +4959,19 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                 try:
                     snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
                     await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID)
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS")
                     local_retry_after.pop(guid, None)
                     succeeded += 1
                 except Exception as exc:
                     failed += 1
+                    keeper_result = keeper_result_from_exception(exc)
+                    try:
+                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result)
+                    except Exception as lifecycle_exc:
+                        log.warning(
+                            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
+                            guid, keeper_result, type(lifecycle_exc).__name__, str(lifecycle_exc),
+                        )
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
                     if status == 403:
@@ -5105,12 +5156,21 @@ async def monitor_cycle():
                     )
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS")
                     KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
                     KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
                     async with state_lock:
                         consecutive_service_failures = 0
                         consecutive_403_failures = 0
                 except Exception as exc:
+                    keeper_result = keeper_result_from_exception(exc)
+                    try:
+                        await asyncio.to_thread(record_keeper_lifecycle_result, guid, keeper_result)
+                    except Exception as lifecycle_exc:
+                        log.warning(
+                            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
+                            guid, keeper_result, type(lifecycle_exc).__name__, str(lifecycle_exc),
+                        )
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
                     if status == 403:
@@ -7316,6 +7376,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         battlelog_url=parsed.get("battlelog_url"),
                         platform_source=parsed.get("platform_source"),
                         tick_rate_hz=tick_rate_hz,
+                        lifecycle_state="DISCOVERED",
                     )
                     session.add(global_server)
                 else:
