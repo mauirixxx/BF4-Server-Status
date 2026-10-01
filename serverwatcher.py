@@ -5312,7 +5312,12 @@ async def get_keeper_snapshot_authoritative(guid: str) -> dict:
             )
         if state == "CONFIRMED":
             FRESH_SERVER_CACHE[guid] = snapshot
-        return snapshot
+            return snapshot
+        # The lifecycle write can be ignored when a newer Keeper observation
+        # already won the ordering race. Never return this older snapshot to a
+        # direct command merely because its HTTP request itself succeeded.
+        FRESH_SERVER_CACHE.pop(guid, None)
+        raise RuntimeError(f"Keeper snapshot superseded by lifecycle state {state or 'UNKNOWN'}")
     except Exception as exc:
         observed_at = utcnow()
         try:
