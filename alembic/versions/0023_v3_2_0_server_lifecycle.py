@@ -39,7 +39,11 @@ def upgrade():
         SET lifecycle_state = 'CONFIRMED',
             last_keeper_success_at = ks.fetched_at,
             last_keeper_result_at = ks.fetched_at
-        FROM keeper_snapshots AS ks
+        FROM (
+            SELECT DISTINCT ON (server_guid) server_guid, fetched_at
+            FROM keeper_snapshots
+            ORDER BY server_guid, fetched_at DESC
+        ) AS ks
         WHERE ks.server_guid = s.server_guid
         """
     )
