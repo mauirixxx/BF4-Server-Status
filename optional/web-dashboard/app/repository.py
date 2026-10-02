@@ -36,7 +36,7 @@ def _scalar(sql:str,*,optional:bool=False)->Metric:
     return Metric(int(next(iter(row.values())) or 0),True)
 
 def _freshness_params(): return {"strict_seconds":settings.snapshot_fresh_seconds,"adaptive_seconds":settings.snapshot_adaptive_seconds}
-def get_summary(): return {"player_names":_scalar(queries.PLAYER_NAMES_OBSERVED_SQL,optional=True),"unique_servers":_scalar(queries.UNIQUE_SERVERS_SQL),"default_refs":_scalar(queries.DEFAULT_SERVER_REFERENCES_SQL),"default_servers":_scalar(queries.DEFAULT_PHYSICAL_SERVERS_SQL)}
+def get_summary(): return {"player_names":_scalar(queries.PLAYER_NAMES_OBSERVED_SQL,optional=True),"unique_servers":_scalar(queries.UNIQUE_SERVERS_SQL),"default_refs":_scalar(queries.DEFAULT_SERVER_REFERENCES_SQL),"default_servers":_scalar(queries.DEFAULT_PHYSICAL_SERVERS_SQL),"lifecycle_confirmed":_scalar(queries.LIFECYCLE_CONFIRMED_SQL),"lifecycle_discovered":_scalar(queries.LIFECYCLE_DISCOVERED_SQL),"lifecycle_grace":_scalar(queries.LIFECYCLE_GRACE_SQL),"lifecycle_retired":_scalar(queries.LIFECYCLE_RETIRED_SQL)}
 
 def get_platforms():
     with db_connection() as conn: rows=conn.execute(queries.CURRENT_PLATFORM_PLAYERS_SQL,_freshness_params()).fetchall()
