@@ -1,5 +1,12 @@
 # BF4 Status Web Dashboard changelog
 
+## v0.5.7
+
+- Added BF4 Server Watcher v3.2.0 server-lifecycle counts to the existing Data Quality card.
+- Displays `CONFIRMED`, `GRACE`, `DISCOVERED`, and `RETIRED` catalog counts directly from `bf4_servers.lifecycle_state`.
+- Preserves the existing Snapshot Health row, layout, and dashboard presentation; this is a focused observability addition rather than a redesign.
+- Dashboard remains read-only and uses only `SELECT` queries for lifecycle telemetry.
+
 ## v0.5.6.2
 
 - Replaced the `pg_stat_database.stats_reset` transaction-rate estimate with sampler-backed transaction telemetry, because PostgreSQL can legitimately report `stats_reset = NULL`.
