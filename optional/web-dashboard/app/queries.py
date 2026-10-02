@@ -6,6 +6,10 @@ SELECT stat_value AS value FROM dashboard_stats WHERE stat_key = 'player_persona
 UNIQUE_SERVERS_SQL = """SELECT COUNT(*) AS value FROM bf4_servers"""
 DEFAULT_SERVER_REFERENCES_SQL = """SELECT COUNT(*) AS value FROM guild_servers WHERE is_default = TRUE"""
 DEFAULT_PHYSICAL_SERVERS_SQL = """SELECT COUNT(DISTINCT server_guid) AS value FROM guild_servers WHERE is_default = TRUE"""
+LIFECYCLE_CONFIRMED_SQL = """SELECT COUNT(*) AS value FROM bf4_servers WHERE lifecycle_state = 'CONFIRMED'"""
+LIFECYCLE_DISCOVERED_SQL = """SELECT COUNT(*) AS value FROM bf4_servers WHERE lifecycle_state = 'DISCOVERED'"""
+LIFECYCLE_GRACE_SQL = """SELECT COUNT(*) AS value FROM bf4_servers WHERE lifecycle_state = 'GRACE'"""
+LIFECYCLE_RETIRED_SQL = """SELECT COUNT(*) AS value FROM bf4_servers WHERE lifecycle_state = 'RETIRED'"""
 
 CURRENT_PLATFORM_PLAYERS_SQL = """
 WITH active_servers AS (
