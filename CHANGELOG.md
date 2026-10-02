@@ -4,6 +4,18 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.2.0] - 2026-10-01
+
+- Added permanent DISCOVERED/CONFIRMED/GRACE/STALE/RETIRED server lifecycle management with ordered Keeper evidence.
+- Moved normal Keeper scheduling to the global `bf4_servers` catalog; STALE servers use hourly lifecycle probes and retired console servers use weekly resurrection probes.
+- Added Keeper-authoritative canonical server names with GUID-based rename history.
+- Added Discord offline/retired/recovery reconciliation and permanent no-ping `/logschannel` lifecycle events.
+- Made `/addserver` request immediate Keeper revalidation without allowing the command itself to declare a server online.
+- Added leader-owned daily PC server discovery at 09:30 HST while preserving existing BFLIST-backed PC player roster/stat enrichment. BFLIST presence or absence has no lifecycle meaning; Keeper remains authoritative for lifecycle and server identity.
+- Rich Presence now reports CONFIRMED-only server/player totals as `Tracking N Servers | N Players`.
+- Added Alembic revision `0023_v3_2_0_server_lifecycle` and lifecycle boundary tests.
+- Hardened distributed snapshot/name ordering, stale-snapshot suppression, guild relationship cleanup, and on-demand Keeper lifecycle evidence.
+
 ## [v3.1.3] - 2026-09-30
 
 - Added command-audit coverage for all leaf `/operator ...` commands.

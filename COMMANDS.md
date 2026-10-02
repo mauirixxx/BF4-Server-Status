@@ -1,6 +1,6 @@
 # BF4 Server Watcher Commands
 
-Command reference for **BF4 Server Watcher v3.1.3**. Commands are grouped by the authorization level used by the bot.
+Command reference for **BF4 Server Watcher v3.2.0**. Commands are grouped by the authorization level used by the bot.
 
 ## Command access
 

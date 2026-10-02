@@ -15,6 +15,7 @@ import time
 import zipfile
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
@@ -23,7 +24,6 @@ import requests
 from discord import app_commands
 from dotenv import load_dotenv
 from sqlalchemy import delete, func, or_, select, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from db import SessionLocal, wait_for_database
 from control_plane import (
@@ -37,11 +37,14 @@ from control_plane import (
 )
 from operator_notifications import (bootstrap_primary_operator, is_operator, list_destinations, add_dm, add_channel, set_destination_enabled, remove_destination, ensure_delivery_rows, due_deliveries, mark_delivery_success, mark_delivery_failure, cluster_status_snapshot, delivery_class, set_notifications_enabled)
 from discord_leader import DiscordLeadershipSupervisor
+from server_lifecycle import decide_lifecycle
+
 from models import (
     BF4Map,
     BF4PlayerAlias,
     BF4PlayerSession,
     BF4Server,
+    BF4ServerNameHistory,
     CommandAudit,
     Guild,
     GuildAnnouncementChannel,
@@ -59,7 +62,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.1.3"
+BOT_VERSION = "v3.2.0"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -140,6 +143,7 @@ BATTLELOG_DEFAULT_429_BACKOFF_SECONDS = max(
     int(os.getenv("BATTLELOG_DEFAULT_429_BACKOFF_SECONDS", "30")),
 )
 LAST_GOOD_PRESENCE_PLAYERS: int | None = None
+LAST_GOOD_PRESENCE_SERVERS: int | None = None
 LAST_GOOD_PRESENCE_COMPUTED_AT: datetime | None = None
 LAST_GOOD_PRESENCE_VALID_UNTIL: datetime | None = None
 # Player-list ETA learns the real display-cycle cadence in-process. This makes
@@ -628,6 +632,200 @@ def get_keeper_snapshot(guid: str) -> dict:
     return snapshot
 
 
+def keeper_result_from_exception(exc: Exception) -> str:
+    """Return the lifecycle-safe Keeper result for a failed request.
+
+    Only an authoritative HTTP 404 means the BF4 server was not found. Every
+    other failure is operationally ambiguous and must remain ERROR so outages,
+    throttling, and transport failures can never age a server toward retirement.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) == 404:
+            return "NOT_FOUND"
+    return "ERROR"
+
+
+def apply_keeper_lifecycle_result(
+    server_guid: str,
+    result: str,
+    *,
+    observed_at: datetime | None = None,
+) -> dict | None:
+    """Transactionally apply one ordered Keeper observation to server lifecycle."""
+    normalized = str(result or "").strip().upper()
+    if normalized not in {"SUCCESS", "NOT_FOUND", "ERROR"}:
+        raise ValueError(f"unsupported Keeper lifecycle result {result!r}")
+
+    with SessionLocal.begin() as session:
+        row = session.scalar(
+            select(BF4Server)
+            .where(BF4Server.server_guid == server_guid)
+            .with_for_update()
+        )
+        if row is None:
+            return None
+        now = observed_at or session.scalar(select(func.now()))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        closed_session_ids: set[int] = set()
+        previous_result_at = row.last_keeper_result_at
+        if previous_result_at is not None:
+            if previous_result_at.tzinfo is None:
+                previous_result_at = previous_result_at.replace(tzinfo=timezone.utc)
+            if now < previous_result_at:
+                return {
+                    "ignored": True,
+                    "state": row.lifecycle_state,
+                    "closed_session_ids": closed_session_ids,
+                    "needs_recovery_baseline": row.lifecycle_state in {"STALE", "RETIRED"},
+                }
+
+        old_state = row.lifecycle_state
+        # ERROR has no lifecycle meaning, but it is still an ordered Keeper
+        # observation. Advance the watermark so an older distributed 404 cannot
+        # arrive later and mutate lifecycle state.
+        row.last_keeper_result_at = now
+        if normalized == "ERROR":
+            # A due lifecycle probe that failed ambiguously must remain due. It
+            # may be retried on the next scheduler sweep, but it cannot advance
+            # the outage state or retirement clock.
+            return {
+                "ignored": False,
+                "state": old_state,
+                "changed": False,
+                "closed_session_ids": closed_session_ids,
+                "needs_recovery_baseline": old_state in {"STALE", "RETIRED"},
+            }
+
+        first_404 = row.first_404_at
+        if first_404 is not None and first_404.tzinfo is None:
+            first_404 = first_404.replace(tzinfo=timezone.utc)
+        retired_at = row.retired_at
+        if retired_at is not None and retired_at.tzinfo is None:
+            retired_at = retired_at.replace(tzinfo=timezone.utc)
+        decision = decide_lifecycle(
+            state=old_state, result=normalized, observed_at=now,
+            first_404_at=first_404, retired_at=retired_at,
+            platform=normalize_platform_label(row.platform),
+        )
+        needs_recovery_baseline = (
+            decision.state in {"STALE", "RETIRED"}
+            or (normalized == "SUCCESS" and old_state in {"STALE", "RETIRED"})
+        )
+        row.lifecycle_state = decision.state
+        row.first_404_at = decision.first_404_at
+        row.retired_at = decision.retired_at
+        row.next_lifecycle_probe_at = decision.next_probe_at
+        if decision.success_at is not None:
+            row.last_keeper_success_at = decision.success_at
+
+        # Keep sessions open during GRACE. On the first transition into STALE
+        # (or directly into RETIRED after delayed evidence), close them at the
+        # player's own last confirmed observation, not at the first 404.
+        sessions_closed = 0
+        if (
+            old_state not in {"STALE", "RETIRED"}
+            and decision.state in {"STALE", "RETIRED"}
+        ):
+            # The server row lock serializes transition ownership; this same
+            # transaction closes sessions and clears durable enrichment state.
+            open_sessions = session.scalars(
+                select(BF4PlayerSession).where(
+                    BF4PlayerSession.server_guid == server_guid,
+                    BF4PlayerSession.time_left.is_(None),
+                )
+            ).all()
+            closed_session_ids = {int(player_session.id) for player_session in open_sessions}
+            for player_session in open_sessions:
+                player_session.time_left = player_session.last_seen
+                player_session.persona_alert_mode = None
+            session.execute(
+                delete(PlayerPersonaEnrichmentState).where(
+                    PlayerPersonaEnrichmentState.server_guid == server_guid
+                )
+            )
+            sessions_closed = len(open_sessions)
+            # This may run on a Keeper worker rather than the Discord leader.
+            # Do not mutate process-local enrichment hints here; the DB closure
+            # is authoritative and queue consumers revalidate open session
+            # state before external work.
+
+        changed = old_state != row.lifecycle_state
+        result_state = row.lifecycle_state
+        first_404_value = row.first_404_at
+        next_probe = row.next_lifecycle_probe_at
+
+    if changed:
+        log.info(
+            "Server lifecycle transition server=%s old_state=%s new_state=%s result=%s "
+            "observed_at=%s first_404_at=%s next_probe_at=%s "
+            "player_sessions_closed=%s",
+            server_guid, old_state, result_state, normalized, now,
+            first_404_value, next_probe, sessions_closed,
+        )
+    elif sessions_closed:
+        log.info(
+            "Server lifecycle repaired dangling player sessions server=%s state=%s "
+            "player_sessions_closed=%s",
+            server_guid, result_state, sessions_closed,
+        )
+    return {
+        "ignored": False, "changed": changed, "old_state": old_state,
+        "state": result_state, "result": normalized,
+        "player_sessions_closed": sessions_closed,
+        "closed_session_ids": closed_session_ids,
+        "needs_recovery_baseline": needs_recovery_baseline,
+    }
+
+
+def record_keeper_lifecycle_result(
+    server_guid: str, result: str, observed_at: datetime | None = None
+) -> dict | None:
+    """Record lifecycle evidence and invalidate cached state on Keeper 404."""
+    normalized = str(result or "").strip().upper()
+    outcome = apply_keeper_lifecycle_result(
+        server_guid, result, observed_at=observed_at
+    )
+    if normalized == "NOT_FOUND":
+        # Do not wait for the next Discord monitor cycle to suppress a snapshot
+        # that Keeper has already authoritatively invalidated. Direct /status,
+        # !status, /debug and announcement paths all consult this cache first.
+        FRESH_SERVER_CACHE.pop(server_guid, None)
+        BFLIST_CACHE.pop(server_guid, None)
+    if outcome and outcome.get("needs_recovery_baseline"):
+        PLAYER_ROSTER_RECOVERY_REQUIRED.add(server_guid)
+        for session_id in outcome.get("closed_session_ids", ()):
+            PENDING_PLAYER_ABSENCES.pop((server_guid, int(session_id)), None)
+            PLAYER_ENRICHMENT_ALERT_ELIGIBLE.discard(int(session_id))
+            PLAYER_ENRICHMENT_STARTUP_ALERT_ELIGIBLE.discard(int(session_id))
+        PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(server_guid, None)
+        PLAYER_ENRICHMENT_RETRY_AFTER.pop(server_guid, None)
+        PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(server_guid, None)
+        PLAYER_ENRICHMENT_QUEUED.discard(server_guid)
+    return outcome
+
+
+def request_server_lifecycle_revalidation(server_guid: str) -> dict | None:
+    """Make a catalog server immediately eligible for Keeper validation.
+
+    This is an operator/guild hint only: it never marks the server CONFIRMED.
+    Keeper SUCCESS remains the sole authority that resurrects a server.
+    """
+    with SessionLocal.begin() as session:
+        row = session.scalar(
+            select(BF4Server)
+            .where(BF4Server.server_guid == server_guid)
+            .with_for_update()
+        )
+        if row is None:
+            return None
+        old_state = row.lifecycle_state
+        if old_state in {"STALE", "RETIRED"}:
+            row.next_lifecycle_probe_at = session.scalar(select(func.now()))
+        return {"state": old_state, "requested": old_state in {"STALE", "RETIRED"}}
+
+
 def keeper_service_failure_reason(exc: Exception) -> str | None:
     """Classify failures that can indicate Keeper-wide throttling/outage."""
     if isinstance(exc, requests.HTTPError):
@@ -886,6 +1084,124 @@ def get_bflist_server_cached(guid: str, snapshot: dict):
     return result
 
 
+def get_bflist_pc_servers() -> list[dict]:
+    """Fetch one cursor-consistent snapshot of BFLIST's current BF4 PC servers."""
+    servers: list[dict] = []
+    cursor = None
+    after = None
+    while True:
+        params = {"perPage": 100}
+        if cursor and after:
+            params.update({"cursor": cursor, "after": after})
+        response = requests.get(
+            "https://api.bflist.io/v2/bf4/servers", params=params, timeout=15
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("servers")
+        if not isinstance(page, list):
+            raise ValueError("BFLIST server list did not contain a servers array")
+        for server in page:
+            if not isinstance(server, dict):
+                continue
+            guid = str(server.get("guid") or "").strip()
+            if not guid:
+                continue
+            servers.append(server)
+            ip = str(server.get("ip") or "").strip()
+            port = server.get("port")
+            if ip and port is not None:
+                after = f"{ip}:{port}"
+        cursor = payload.get("cursor")
+        if not payload.get("hasMore"):
+            break
+        if not cursor or not after:
+            raise ValueError("BFLIST pagination response was incomplete")
+    return servers
+
+
+def persist_bflist_pc_discovery(servers: list[dict]) -> dict[str, int]:
+    """Add new PC GUIDs to the permanent catalog; never infer absence/death."""
+    discovered = 0
+    already_known = 0
+    invalid = 0
+    now = utcnow()
+    with SessionLocal.begin() as session:
+        known = set(session.scalars(select(BF4Server.server_guid)))
+        for item in servers:
+            guid = str(item.get("guid") or "").strip().lower()
+            name = str(item.get("name") or guid).strip()[:255]
+            if not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                guid,
+            ):
+                invalid += 1
+                continue
+            if guid in known:
+                already_known += 1
+                continue
+            session.add(BF4Server(
+                server_guid=guid, server_name=name, platform="PC",
+                platform_source="bflist_discovery", lifecycle_state="DISCOVERED",
+            ))
+            session.add(BF4ServerNameHistory(
+                server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None,
+            ))
+            known.add(guid)
+            discovered += 1
+    return {"discovered": discovered, "known": already_known, "invalid": invalid}
+
+
+def bflist_discovery_completed_for_date(run_date: str) -> bool:
+    with SessionLocal() as session:
+        value = session.scalar(text(
+            "SELECT setting_value FROM cluster_runtime_settings "
+            "WHERE setting_key='discovery.bflist_pc_last_success_hst' "
+            "AND scope_type='global' AND scope_name='' LIMIT 1"
+        ))
+    return str(value or "") == run_date
+
+
+def mark_bflist_discovery_completed(run_date: str) -> None:
+    with SessionLocal.begin() as session:
+        session.execute(text(
+            "INSERT INTO cluster_runtime_settings "
+            "(setting_key, scope_type, scope_name, setting_value, value_type, description, updated_by, created_at, updated_at) "
+            "VALUES ('discovery.bflist_pc_last_success_hst','global','',:run_date,'string',"
+            "'Last successful daily BFLIST PC discovery date in Pacific/Honolulu',:worker,now(),now()) "
+            "ON CONFLICT (setting_key, scope_type, scope_name) DO UPDATE SET "
+            "setting_value=EXCLUDED.setting_value, updated_by=EXCLUDED.updated_by, updated_at=now()"
+        ), {"run_date": run_date, "worker": WORKER_ID})
+
+
+async def bflist_pc_discovery_loop() -> None:
+    """Discord-leader-only daily PC discovery at 09:30 Pacific/Honolulu."""
+    hst = ZoneInfo("Pacific/Honolulu")
+    while True:
+        try:
+            now = datetime.now(hst)
+            run_date = now.date().isoformat()
+            due = now.hour > 9 or (now.hour == 9 and now.minute >= 30)
+            completed = await asyncio.to_thread(bflist_discovery_completed_for_date, run_date)
+            if due and not completed:
+                servers = await asyncio.to_thread(get_bflist_pc_servers)
+                result = await asyncio.to_thread(persist_bflist_pc_discovery, servers)
+                await asyncio.to_thread(mark_bflist_discovery_completed, run_date)
+                log.info(
+                    "BFLIST daily PC discovery complete worker_id=%s date_hst=%s seen=%s discovered=%s known=%s invalid=%s",
+                    WORKER_ID, now.date(), len(servers), result["discovered"],
+                    result["known"], result["invalid"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "BFLIST daily PC discovery failed worker_id=%s error=%s message=%r",
+                WORKER_ID, type(exc).__name__, str(exc),
+            )
+        await asyncio.sleep(30)
+
+
 def bflist_team_rosters(bflist_server: dict, snapshot: dict):
     factions = {t["team_id"]: t.get("faction") for t in keeper_team_rosters(snapshot)}
     grouped = {}
@@ -951,65 +1267,6 @@ def compact_roster_messages(teams, server_name):
         ])
         messages.append(f"👥 **BF4 Players — {server_name}**\n```text\n{body}\n```")
     return split_messages(messages, 1900)
-
-
-def mobile_scoreboard_messages(teams, server_name):
-    messages = []
-    for team in teams:
-        rows = team.get("rows", [])
-        name_width = min(28, max([4] + [len(r["name"]) for r in rows] + [1]))
-        columns = f"{'PL':>2}  {'NAME'.ljust(name_width)}  {'SCORE':>7}  {'K':>3}  {'D':>3}  {'KDR':>5}"
-        rendered = []
-        for r in rows:
-            name = r["name"] if len(r["name"]) <= name_width else r["name"][:name_width - 1] + "…"
-            rendered.append(
-                f"{r['place']:02d}  {name.ljust(name_width)}  {r['score']:>7,}  "
-                f"{r['kills']:>3}  {r['deaths']:>3}  {r['kdr']:>5.2f}"
-            )
-        header = roster_header(team, "rows")
-        prefix = f"👥 **BF4 Player Stats — {server_name}**\n"
-        messages.extend(chunk_table(prefix, [header, "-" * len(columns), columns], rendered, 1750))
-    return messages
-
-
-def wide_scoreboard_messages(teams, server_name):
-    if not teams:
-        return []
-    messages = []
-    for start in range(0, len(teams), 2):
-        pair = teams[start:start + 2]
-        left = pair[0]
-        right = pair[1] if len(pair) == 2 else None
-
-        def prepare(team):
-            rows = team.get("rows", [])
-            width = min(20, max([4] + [len(r["name"]) for r in rows] + [1]))
-            cols = f"{'PL':>2} {'NAME'.ljust(width)} {'SCORE':>7} {'K':>3} {'D':>3} {'KDR':>5}"
-            rendered = []
-            for r in rows:
-                name = r["name"] if len(r["name"]) <= width else r["name"][:width - 1] + "…"
-                rendered.append(
-                    f"{r['place']:02d} {name.ljust(width)} {r['score']:>7,} "
-                    f"{r['kills']:>3} {r['deaths']:>3} {r['kdr']:>5.2f}"
-                )
-            return roster_header(team, "rows"), cols, rendered
-
-        lh, lc, lr = prepare(left)
-        rh, rc, rr = prepare(right) if right else ("", "", [])
-        lw = max([len(lh), len(lc)] + [len(x) for x in lr] + [1])
-        rw = max([len(rh), len(rc)] + [len(x) for x in rr] + [1]) if right else 0
-        fixed = [
-            f"{lh.ljust(lw)}   {rh}".rstrip() if right else lh,
-            f"{'-' * lw}   {'-' * rw}" if right else "-" * lw,
-            f"{lc.ljust(lw)}   {rc}".rstrip() if right else lc,
-        ]
-        rows = []
-        for i in range(max(len(lr), len(rr), 1)):
-            l = lr[i] if i < len(lr) else ""
-            r = rr[i] if i < len(rr) else ""
-            rows.append(f"{l.ljust(lw)}   {r}".rstrip() if right else l)
-        messages.extend(chunk_table(f"👥 **BF4 Player Stats — {server_name}**\n", fixed, rows, 1750))
-    return messages
 
 
 def chunk_table(prefix, fixed_lines, rows, limit):
@@ -1383,6 +1640,7 @@ def ensure_guild_record(discord_guild: discord.Guild, *, joining=False):
                 platform="PC",
                 battlelog_url=f"https://battlelog.battlefield.com/bf4/servers/show/pc/{AAA_GUID}/",
                 platform_source="bundled",
+                lifecycle_state="DISCOVERED",
             )
             session.add(aaa)
 
@@ -2724,6 +2982,13 @@ async def evaluate_player_watch_alerts(session_id: int, *, startup_current: bool
         player_session = session.get(BF4PlayerSession, int(session_id))
         if player_session is None:
             return 0
+        bf = session.get(BF4Server, player_session.server_guid)
+        if (
+            player_session.time_left is not None
+            or bf is None
+            or str(bf.lifecycle_state or "").upper() != "CONFIRMED"
+        ):
+            return 0
         session_platform = normalize_platform_label(player_session.platform)
         watch_rows = session.scalars(
             select(GuildPlayerWatch).where(
@@ -2929,9 +3194,12 @@ def _seed_legacy_persona_queue_from_db() -> int:
     with SessionLocal() as session:
         db_now = session.scalar(select(func.now()))
         rows = session.execute(
-            select(BF4PlayerSession.server_guid, BF4PlayerSession.id).where(
+            select(BF4PlayerSession.server_guid, BF4PlayerSession.id)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         ).all()
         states = {
@@ -2977,9 +3245,12 @@ def _seed_legacy_persona_queue_from_db() -> int:
 def _persona_open_unresolved_count() -> int:
     with SessionLocal() as session:
         return int(session.scalar(
-            select(func.count()).select_from(BF4PlayerSession).where(
+            select(func.count()).select_from(BF4PlayerSession)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         ) or 0)
 
@@ -3065,10 +3336,13 @@ def _persona_pending_ids(server_guid: str) -> set[int]:
         return {
             int(value)
             for value in session.scalars(
-                select(BF4PlayerSession.id).where(
+                select(BF4PlayerSession.id)
+                .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+                .where(
                     BF4PlayerSession.server_guid == server_guid,
                     BF4PlayerSession.time_left.is_(None),
                     BF4PlayerSession.persona_id.is_(None),
+                    BF4Server.lifecycle_state == "CONFIRMED",
                 )
             ).all()
         }
@@ -3363,8 +3637,10 @@ async def process_player_persona_enrichment():
         async with semaphore:
             with SessionLocal() as session:
                 bf = session.get(BF4Server, guid)
-                if bf is None:
+                if bf is None or str(bf.lifecycle_state or "").upper() != "CONFIRMED":
                     PLAYER_ENRICHMENT_PENDING_SESSIONS.pop(guid, None)
+                    PLAYER_ENRICHMENT_RETRY_AFTER.pop(guid, None)
+                    PLAYER_ENRICHMENT_NO_PROGRESS_STREAK.pop(guid, None)
                     return
                 platform = normalize_platform_label(bf.platform)
                 url = battlelog_server_url_for(bf)
@@ -3751,10 +4027,13 @@ def _process_player_history_server_db(
 
 async def process_player_history(
     fresh: dict[str, dict],
-    tracked_guids: list[str],
+    confirmed_tracked_guids: set[str],
 ):
     """Maintain global player sessions from authoritative Keeper rosters."""
-    for guid in tracked_guids:
+    # Preserve the pre-v3.2 recovery-baseline behavior for ambiguous/transient
+    # misses, but do not baseline GRACE servers: their open sessions deliberately
+    # survive the 60-minute 404 window.
+    for guid in confirmed_tracked_guids:
         if guid not in fresh and guid in PLAYER_ROSTER_BASELINED:
             PLAYER_ROSTER_RECOVERY_REQUIRED.add(guid)
 
@@ -3825,7 +4104,8 @@ async def process_player_history(
                 joins_alerted += await evaluate_player_watch_alerts(session_id)
 
         PLAYER_ROSTER_BASELINED.add(guid)
-        PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
+        if recovery_baseline:
+            PLAYER_ROSTER_RECOVERY_REQUIRED.discard(guid)
 
         # Keep an explicit cooperative yield between servers even though the
         # SQLAlchemy transaction itself now runs in asyncio.to_thread().
@@ -3917,6 +4197,25 @@ async def post_automatic_announcement(guild_id, gs: GuildServer, status: dict, *
         ) or 0
         old_channel = state.announcement_channel_id if state else None
         old_message = state.announcement_message_id if state else None
+        recovery_channel = state.recovery_channel_id if state else None
+        recovery_message = state.recovery_message_id if state else None
+    if map_change and recovery_channel and recovery_message:
+        recovery_deleted = await delete_discord_message(guild_id, recovery_channel, recovery_message)
+        if not recovery_deleted:
+            # Preserve the temporary recovery notice until we can remove it.
+            # Posting the new-map announcement anyway would leave contradictory
+            # status-channel state and lose the next-map cleanup guarantee.
+            log.warning(
+                "Announcement replacement deferred because recovery message cleanup failed "
+                "guild=%s server=%s channel=%s message=%s",
+                guild_id, gs.server_guid, recovery_channel, recovery_message,
+            )
+            return None
+        with SessionLocal.begin() as session:
+            recovery_state = session.get(GuildServerState, (guild_id, gs.server_guid))
+            if recovery_state:
+                recovery_state.recovery_channel_id = None
+                recovery_state.recovery_message_id = None
     if old_channel and old_message:
         old_deleted = await delete_discord_message(guild_id, old_channel, old_message)
         if not old_deleted:
@@ -3993,7 +4292,7 @@ def persistent_roster_chunks(
     gs: GuildServer,
     bf: BF4Server,
     snapshot: dict,
-    bflist_server: dict | None,
+    bflist_server: dict | None = None,
 ) -> list[str]:
     """Render the same compact roster style as `!status <server> players`."""
     teams = None
@@ -4234,6 +4533,238 @@ async def clear_persistent_player_stack(guild: discord.Guild, server_guid: str) 
     return eta_deleted + roster_deleted, failed
 
 
+async def cleanup_guild_server_discord_state(guild: discord.Guild, server_guid: str) -> bool:
+    """Delete tracked transient Discord state before removing a guild relationship."""
+    with SessionLocal() as session:
+        state = session.get(GuildServerState, (guild.id, server_guid))
+        refs = [] if state is None else [
+            (state.announcement_channel_id, state.announcement_message_id),
+            (state.lifecycle_channel_id, state.lifecycle_message_id),
+            (state.recovery_channel_id, state.recovery_message_id),
+        ]
+    failed = 0
+    for channel_id, message_id in refs:
+        if channel_id and message_id:
+            if not await delete_discord_message(guild.id, int(channel_id), int(message_id)):
+                failed += 1
+    _deleted, stack_failed = await clear_persistent_player_stack(guild, server_guid)
+    failed += stack_failed
+    if failed:
+        log.warning(
+            "Guild server removal deferred; Discord cleanup incomplete guild=%s server=%s failed=%s",
+            guild.id, server_guid, failed,
+        )
+        return False
+    return True
+
+
+async def _send_server_lifecycle_log(guild: discord.Guild, content: str) -> int:
+    """Fan out a permanent lifecycle event to configured log channels, never pinging."""
+    sent = 0
+    for row in configured_log_channels(guild.id):
+        channel = guild.get_channel(int(row["channel_id"]))
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions.none(),
+                suppress_embeds=True,
+            )
+            sent += 1
+        except Exception as exc:
+            log.warning(
+                "Server lifecycle log failed guild=%s channel=%s error=%s message=%r",
+                guild.id, row["channel_id"], type(exc).__name__, str(exc),
+            )
+    return sent
+
+
+def lifecycle_command_notice(bf: BF4Server, display_name: str) -> str | None:
+    state = str(getattr(bf, "lifecycle_state", "") or "").upper()
+    if state not in {"STALE", "RETIRED"}:
+        return None
+    first_404_at = getattr(bf, "first_404_at", None)
+    if first_404_at is not None:
+        if first_404_at.tzinfo is None:
+            first_404_at = first_404_at.replace(tzinfo=timezone.utc)
+        content = f'This Discord server named **{display_name}** is currently offline as of <t:{int(first_404_at.timestamp())}:F>.'
+    else:
+        content = f'This Discord server named **{display_name}** is currently offline.'
+    if state == "RETIRED":
+        content += "\nThis server is RETIRED from regular polling until Keeper confirms it online again."
+    return content
+
+
+def _lifecycle_offline_content(name: str, first_404_at: datetime, *, retired: bool, role_id: int = 0) -> str:
+    stamp = int(first_404_at.timestamp())
+    lines = [f'This Discord server named **{name}** is currently offline as of <t:{stamp}:F>.']
+    if role_id:
+        lines.append(f'<@&{role_id}> has been notified as of this message.')
+    if retired:
+        days = max(3, int((utcnow() - first_404_at).total_seconds() // 86400))
+        lines.append(
+            f'Server **{name}** has been offline for {days} days and will no longer be '
+            'polled for regular updates. BF4SW will resume normal monitoring when Keeper '
+            'confirms the server online again; `/addserver` can request immediate validation.'
+        )
+    return "\n".join(lines)
+
+
+async def reconcile_server_lifecycle_discord() -> dict[str, int]:
+    """Reconcile STALE/RETIRED/CONFIRMED lifecycle state into guild status channels."""
+    summary = {"offline": 0, "retired": 0, "recovered": 0, "failed": 0}
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(GuildServer, BF4Server, GuildSettings)
+            .join(BF4Server, BF4Server.server_guid == GuildServer.server_guid)
+            .join(GuildSettings, GuildSettings.guild_id == GuildServer.guild_id)
+            .where(GuildServer.is_default.is_(True))
+        ).all()
+        detached = [(
+            int(gs.guild_id), str(gs.server_guid), gs.display_name,
+            int(gs.announcement_channel_id or 0), bf.lifecycle_state,
+            bf.first_404_at, int(settings.management_min_role_id or 0),
+        ) for gs, bf, settings in rows]
+
+    for guild_id, guid, name, channel_id, lifecycle, first_404_at, role_id in detached:
+        guild = client.get_guild(guild_id)
+        channel = guild.get_channel(channel_id) if guild and channel_id else None
+        if guild is None or not isinstance(channel, discord.TextChannel):
+            continue
+        with SessionLocal() as session:
+            state = session.get(GuildServerState, (guild_id, guid))
+            lifecycle_message_id = int(state.lifecycle_message_id or 0) if state else 0
+            lifecycle_channel_id = int(state.lifecycle_channel_id or 0) if state else 0
+            recovery_message_id = int(state.recovery_message_id or 0) if state else 0
+            management_notified_at = state.management_notified_at if state else None
+            offline_logged_at = state.lifecycle_offline_logged_at if state else None
+            recovery_logged_at = state.lifecycle_recovery_logged_at if state else None
+            old_announcement_channel = int(state.announcement_channel_id or 0) if state else 0
+            old_announcement_message = int(state.announcement_message_id or 0) if state else 0
+
+        if lifecycle in {"STALE", "RETIRED"} and first_404_at is not None:
+            if first_404_at.tzinfo is None:
+                first_404_at = first_404_at.replace(tzinfo=timezone.utc)
+            retired = lifecycle == "RETIRED"
+            should_ping = bool(role_id and management_notified_at is None)
+            content = _lifecycle_offline_content(
+                name, first_404_at, retired=retired, role_id=role_id
+            )
+            try:
+                # Stale status data must disappear before the durable offline notice.
+                if old_announcement_channel and old_announcement_message:
+                    if await delete_discord_message(guild_id, old_announcement_channel, old_announcement_message):
+                        with SessionLocal.begin() as session:
+                            st = session.get(GuildServerState, (guild_id, guid))
+                            if st:
+                                st.announcement_channel_id = None
+                                st.announcement_channel_name = None
+                                st.announcement_message_id = None
+                    else:
+                        summary["failed"] += 1
+                        continue
+                _stack_deleted, stack_failed = await clear_persistent_player_stack(guild, guid)
+                if stack_failed:
+                    summary["failed"] += 1
+                    continue
+                if recovery_message_id:
+                    with SessionLocal() as session:
+                        st = session.get(GuildServerState, (guild_id, guid))
+                        recovery_channel_id = int(st.recovery_channel_id or 0) if st else 0
+                    if recovery_channel_id and await delete_discord_message(guild_id, recovery_channel_id, recovery_message_id):
+                        with SessionLocal.begin() as session:
+                            st = session.get(GuildServerState, (guild_id, guid))
+                            if st:
+                                st.recovery_channel_id = None
+                                st.recovery_message_id = None
+                    else:
+                        summary["failed"] += 1
+                        continue
+                message = None
+                if lifecycle_message_id and lifecycle_channel_id and lifecycle_channel_id != channel.id:
+                    if await delete_discord_message(guild_id, lifecycle_channel_id, lifecycle_message_id):
+                        lifecycle_message_id = 0
+                    else:
+                        summary["failed"] += 1
+                        continue
+                if lifecycle_message_id and lifecycle_channel_id == channel.id:
+                    try:
+                        message = await channel.fetch_message(lifecycle_message_id)
+                        await message.edit(
+                            content=content,
+                            allowed_mentions=discord.AllowedMentions(roles=should_ping, users=False, everyone=False),
+                            suppress=True,
+                        )
+                    except discord.NotFound:
+                        message = None
+                if message is None:
+                    message = await channel.send(
+                        content,
+                        allowed_mentions=discord.AllowedMentions(roles=should_ping, users=False, everyone=False),
+                        suppress_embeds=True,
+                    )
+                if offline_logged_at is None:
+                    await _send_server_lifecycle_log(
+                        guild,
+                        f'🔴 BF4 server offline: **{name}** as of <t:{int(first_404_at.timestamp())}:F>.',
+                    )
+                with SessionLocal.begin() as session:
+                    st = session.get(GuildServerState, (guild_id, guid))
+                    if st is None:
+                        st = GuildServerState(guild_id=guild_id, guild_name=guild.name, server_guid=guid)
+                        session.add(st)
+                    st.lifecycle_channel_id = channel.id
+                    st.lifecycle_message_id = message.id
+                    if should_ping:
+                        st.management_notified_at = utcnow()
+                    if offline_logged_at is None:
+                        st.lifecycle_offline_logged_at = utcnow()
+                    st.lifecycle_recovery_logged_at = None
+                summary["retired" if retired else "offline"] += 1
+            except Exception as exc:
+                summary["failed"] += 1
+                log.error("Lifecycle offline reconciliation failed guild=%s server=%s error=%s message=%r", guild_id, guid, type(exc).__name__, str(exc))
+            continue
+
+        if lifecycle == "CONFIRMED" and lifecycle_message_id:
+            try:
+                if lifecycle_channel_id and not await delete_discord_message(
+                    guild_id, lifecycle_channel_id, lifecycle_message_id
+                ):
+                    # Do not announce recovery while a contradictory durable
+                    # offline notice is still present; retain tracking and retry.
+                    summary["failed"] += 1
+                    continue
+                recovered_at = utcnow()
+                recovery = await channel.send(
+                    f'🟢 BF4 server **{name}** is back online as of <t:{int(recovered_at.timestamp())}:F>.',
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    suppress_embeds=True,
+                )
+                if recovery_logged_at is None:
+                    await _send_server_lifecycle_log(
+                        guild,
+                        f'🟢 BF4 server online again: **{name}** as of <t:{int(recovered_at.timestamp())}:F>.',
+                    )
+                with SessionLocal.begin() as session:
+                    st = session.get(GuildServerState, (guild_id, guid))
+                    if st:
+                        st.lifecycle_channel_id = None
+                        st.lifecycle_message_id = None
+                        st.recovery_channel_id = channel.id
+                        st.recovery_message_id = recovery.id
+                        st.management_notified_at = None
+                        st.lifecycle_offline_logged_at = None
+                        if recovery_logged_at is None:
+                            st.lifecycle_recovery_logged_at = recovered_at
+                summary["recovered"] += 1
+            except Exception as exc:
+                summary["failed"] += 1
+                log.error("Lifecycle recovery reconciliation failed guild=%s server=%s error=%s message=%r", guild_id, guid, type(exc).__name__, str(exc))
+    return summary
+
+
 async def player_display_messages_exist(guild: discord.Guild, rows) -> bool:
     for row in rows:
         channel = guild.get_channel(int(row["channel_id"]))
@@ -4467,6 +4998,7 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
             .where(
                 GuildServer.is_default.is_(True),
                 GuildServer.include_users.is_(True),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
             .order_by(GuildServer.server_guid, GuildServer.guild_id)
         ).all()
@@ -4652,28 +5184,163 @@ async def refresh_persistent_player_displays(fresh: dict[str, dict]):
     }
 
 
-def _store_keeper_snapshot(guid: str, snapshot: dict, worker_id: str) -> None:
-    """Upsert one worker-fetched snapshot for fenced Discord-leader processing."""
+def keeper_server_name(snapshot: dict) -> str | None:
+    """Extract Keeper's authoritative server name from a successful snapshot."""
+    for key in ("serverName", "name"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:255]
+    return None
+
+
+def reconcile_keeper_server_name(guid: str, snapshot: dict, observed_at: datetime | None = None) -> dict | None:
+    """Update canonical GUID identity/name history from authoritative Keeper data."""
+    name = keeper_server_name(snapshot)
+    if not name:
+        return None
     with SessionLocal.begin() as session:
-        now = session.scalar(select(func.now()))
+        row = session.scalar(select(BF4Server).where(BF4Server.server_guid == guid).with_for_update())
+        if row is None:
+            return None
+        now = observed_at or session.scalar(select(func.now()))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        watermark = row.last_keeper_result_at
+        if watermark is not None:
+            if watermark.tzinfo is None:
+                watermark = watermark.replace(tzinfo=timezone.utc)
+            if now < watermark:
+                return {"changed": False, "ignored": True, "name": row.server_name}
+        old_name = row.server_name
+        current = session.scalar(
+            select(BF4ServerNameHistory)
+            .where(BF4ServerNameHistory.server_guid == guid, BF4ServerNameHistory.last_seen_at.is_(None))
+            .order_by(BF4ServerNameHistory.first_seen_at.desc(), BF4ServerNameHistory.id.desc())
+            .limit(1)
+        )
+        if old_name == name:
+            if current is None:
+                session.add(BF4ServerNameHistory(server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None))
+            return {"changed": False, "name": name}
+        if current is not None:
+            current.last_seen_at = now
+        row.server_name = name
+        session.add(BF4ServerNameHistory(server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None))
+        return {"changed": True, "old_name": old_name, "name": name}
+
+
+def _store_keeper_snapshot(
+    guid: str, snapshot: dict, worker_id: str, observed_at: datetime | None = None
+) -> bool:
+    """Persist only the newest distributed Keeper success for one GUID."""
+    with SessionLocal.begin() as session:
+        db_now = session.scalar(select(func.now()))
+        observed = observed_at or db_now
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        server = session.scalar(
+            select(BF4Server).where(BF4Server.server_guid == guid).with_for_update()
+        )
+        if server is None:
+            return False
+        watermark = server.last_keeper_result_at
+        if watermark is not None:
+            if watermark.tzinfo is None:
+                watermark = watermark.replace(tzinfo=timezone.utc)
+            if observed < watermark:
+                log.info(
+                    "Ignored out-of-order Keeper success server=%s worker_id=%s observed_at=%s lifecycle_watermark=%s",
+                    guid, worker_id, observed, watermark,
+                )
+                return False
         row = session.get(KeeperSnapshot, guid)
+        if row is not None and row.fetched_at is not None:
+            previous = row.fetched_at
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=timezone.utc)
+            if observed < previous:
+                log.info(
+                    "Ignored out-of-order Keeper snapshot server=%s worker_id=%s observed_at=%s newest_at=%s",
+                    guid, worker_id, observed, previous,
+                )
+                return False
+
+        name = keeper_server_name(snapshot)
+        if name:
+            old_name = server.server_name
+            current = session.scalar(
+                select(BF4ServerNameHistory)
+                .where(
+                    BF4ServerNameHistory.server_guid == guid,
+                    BF4ServerNameHistory.last_seen_at.is_(None),
+                )
+                .order_by(BF4ServerNameHistory.first_seen_at.desc(), BF4ServerNameHistory.id.desc())
+                .limit(1)
+            )
+            if old_name != name:
+                if current is not None:
+                    current.last_seen_at = observed
+                server.server_name = name
+                session.add(BF4ServerNameHistory(
+                    server_guid=guid, server_name=name, first_seen_at=observed, last_seen_at=None
+                ))
+                log.info(
+                    "Keeper authoritative server rename guid=%s old_name=%r new_name=%r worker_id=%s",
+                    guid, old_name, name, worker_id,
+                )
+            elif current is None:
+                session.add(BF4ServerNameHistory(
+                    server_guid=guid, server_name=name, first_seen_at=observed, last_seen_at=None
+                ))
+
         if row is None:
             row = KeeperSnapshot(
-                server_guid=guid,
-                snapshot=snapshot,
-                fetched_at=now,
-                worker_id=worker_id,
-                fetch_generation=1,
-                created_at=now,
-                updated_at=now,
+                server_guid=guid, snapshot=snapshot, fetched_at=observed,
+                worker_id=worker_id, fetch_generation=1,
+                created_at=db_now, updated_at=db_now,
             )
             session.add(row)
         else:
             row.snapshot = snapshot
-            row.fetched_at = now
+            row.fetched_at = observed
             row.worker_id = worker_id
             row.fetch_generation = int(row.fetch_generation or 0) + 1
-            row.updated_at = now
+            row.updated_at = db_now
+    return True
+
+async def get_keeper_snapshot_authoritative(guid: str) -> dict:
+    """Fetch Keeper on demand and feed the same ordered lifecycle evidence path."""
+    try:
+        snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
+        observed_at = utcnow()
+        await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID, observed_at)
+        await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
+        with SessionLocal() as session:
+            state = session.scalar(
+                select(BF4Server.lifecycle_state).where(BF4Server.server_guid == guid)
+            )
+        if state == "CONFIRMED":
+            FRESH_SERVER_CACHE[guid] = snapshot
+            return snapshot
+        # The lifecycle write can be ignored when a newer Keeper observation
+        # already won the ordering race. Never return this older snapshot to a
+        # direct command merely because its HTTP request itself succeeded.
+        FRESH_SERVER_CACHE.pop(guid, None)
+        raise RuntimeError(f"Keeper snapshot superseded by lifecycle state {state or 'UNKNOWN'}")
+    except Exception as exc:
+        observed_at = utcnow()
+        try:
+            await asyncio.to_thread(
+                record_keeper_lifecycle_result, guid,
+                keeper_result_from_exception(exc), observed_at,
+            )
+        except Exception as lifecycle_exc:
+            log.warning(
+                "On-demand Keeper lifecycle persistence failed server=%s error=%s message=%r",
+                guid, type(lifecycle_exc).__name__, str(lifecycle_exc),
+            )
+        FRESH_SERVER_CACHE.pop(guid, None)
+        raise
 
 
 def _load_distributed_keeper_snapshots(
@@ -4776,6 +5443,7 @@ async def _distributed_presence_policy(default_guids: set[str]) -> dict[str, flo
 async def _hydrate_persisted_presence(reason: str) -> bool:
     """Hydrate process-local presence cache from durable cluster state if still valid."""
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
@@ -4800,6 +5468,7 @@ async def _hydrate_persisted_presence(reason: str) -> bool:
         return False
 
     LAST_GOOD_PRESENCE_PLAYERS = int(state["player_count"])
+    LAST_GOOD_PRESENCE_SERVERS = int(state["server_count"])
     LAST_GOOD_PRESENCE_COMPUTED_AT = computed_at
     LAST_GOOD_PRESENCE_VALID_UNTIL = computed_at + timedelta(seconds=valid_seconds)
     log.info(
@@ -4812,13 +5481,46 @@ async def _hydrate_persisted_presence(reason: str) -> bool:
 
 
 def _keeper_lane_guid_sets() -> tuple[set[str], set[str]]:
-    """Return globally deduplicated (all GUIDs, default/high-priority GUIDs)."""
-    with SessionLocal() as session:
-        relations = list(session.scalars(select(GuildServer)))
-    all_guids = {str(row.server_guid) for row in relations}
-    default_guids = {str(row.server_guid) for row in relations if row.is_default}
-    return all_guids, default_guids
+    """Return lifecycle-eligible normal GUIDs and default/high-priority GUIDs.
 
+    v3.2.0 makes bf4_servers the permanent Keeper catalog. DISCOVERED,
+    CONFIRMED, and GRACE remain in normal FAST/BULK scheduling; STALE and
+    RETIRED are handled exclusively by the lifecycle-probe lane.
+    """
+    with SessionLocal() as session:
+        normal_guids = {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(
+                    BF4Server.lifecycle_state.in_(("DISCOVERED", "CONFIRMED", "GRACE"))
+                )
+            )
+        }
+        default_guids = {
+            str(guid) for guid in session.scalars(
+                select(GuildServer.server_guid)
+                .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
+                .where(
+                    GuildServer.is_default.is_(True),
+                    BF4Server.lifecycle_state.in_(("CONFIRMED", "GRACE")),
+                )
+            )
+        }
+    return normal_guids, default_guids
+
+
+def _keeper_lifecycle_probe_guids() -> set[str]:
+    """Return STALE/RETIRED GUIDs whose authoritative lifecycle probe is due."""
+    with SessionLocal() as session:
+        now = session.scalar(select(func.now()))
+        return {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(
+                    BF4Server.lifecycle_state.in_(("STALE", "RETIRED")),
+                    BF4Server.next_lifecycle_probe_at.is_not(None),
+                    BF4Server.next_lifecycle_probe_at <= now,
+                )
+            )
+        }
 
 def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
     """Return one PR4-D lane assignment with fail-safe bulk fallback.
@@ -4843,6 +5545,13 @@ def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
             return ({wid: 0 for wid in fast_counts}, {}, fast_eligible, fast_caps, fast_active, len(default_guids))
         return fast_counts, fast_owners, fast_eligible, fast_caps, fast_active, len(default_guids)
 
+    if lane_name == "lifecycle":
+        scope = _keeper_lifecycle_probe_guids()
+        counts, owners, eligible, caps = keeper_assignment_snapshot(
+            stale_after_seconds, role_name="keeper_bulk", guids=scope
+        )
+        return counts, owners, eligible, caps, fast_active, len(default_guids)
+
     if lane_name != "bulk":
         raise ValueError(f"unsupported Keeper lane {lane_name!r}")
     scope = all_guids - default_guids if fast_active else all_guids
@@ -4854,10 +5563,16 @@ def _keeper_lane_assignment(lane_name: str, stale_after_seconds: int):
 
 async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
     """Fetch this worker's HRW-owned servers for one Keeper scheduling lane."""
-    if lane_name not in {"bulk", "fast"}:
+    if lane_name not in {"bulk", "fast", "lifecycle"}:
         raise ValueError(f"unsupported Keeper lane {lane_name!r}")
     role_name = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
-    gate_key = "keeper_fast" if lane_name == "fast" else "keeper_bulk"
+    # Lifecycle probes share keeper_bulk worker eligibility, but use their own
+    # lane waiter/gate so a due hourly/weekly probe cannot queue behind the
+    # continuously busy normal bulk traversal. The global Keeper gate remains
+    # the hard aggregate ceiling across all lanes.
+    gate_key = "keeper_fast" if lane_name == "fast" else (
+        "keeper_lifecycle" if lane_name == "lifecycle" else "keeper_bulk"
+    )
     local_retry_after: dict[str, float] = {}
 
     while True:
@@ -4882,6 +5597,11 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
             if lane_name == "fast":
                 lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.fast_requests_per_second", 0.10)))
                 sweep_seconds = max(30, int(CONTROL_SETTINGS.get("keeper.fast_sweep_seconds", 120)))
+            elif lane_name == "lifecycle":
+                # Probe scheduling shares the existing bulk/global PostgreSQL
+                # rate gates; next_lifecycle_probe_at fences per-server cadence.
+                lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.bulk_requests_per_second", 0.23)))
+                sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.lifecycle_sweep_seconds", 60)))
             else:
                 lane_rate = max(0.01, float(CONTROL_SETTINGS.get("keeper.bulk_requests_per_second", 0.23)))
                 sweep_seconds = max(60, int(CONTROL_SETTINGS.get("keeper.distributed_sweep_seconds", 480)))
@@ -4916,11 +5636,27 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
                 )
                 try:
                     snapshot = await asyncio.to_thread(get_keeper_snapshot, guid)
-                    await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID)
+                    observed_at = utcnow()
+                    await asyncio.to_thread(_store_keeper_snapshot, guid, snapshot, WORKER_ID, observed_at)
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
                     local_retry_after.pop(guid, None)
                     succeeded += 1
                 except Exception as exc:
                     failed += 1
+                    keeper_result = keeper_result_from_exception(exc)
+                    observed_at = utcnow()
+                    try:
+                        await asyncio.to_thread(
+                            record_keeper_lifecycle_result,
+                            guid,
+                            keeper_result,
+                            observed_at,
+                        )
+                    except Exception as lifecycle_exc:
+                        log.warning(
+                            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
+                            guid, keeper_result, type(lifecycle_exc).__name__, str(lifecycle_exc),
+                        )
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
                     if status == 403:
@@ -4966,19 +5702,17 @@ async def distributed_keeper_acquisition_loop(lane_name: str = "bulk"):
 async def monitor_cycle():
     global FRESH_SERVER_CACHE, KEEPER_BACKOFF_UNTIL
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
     with SessionLocal() as session:
         relations = session.scalars(select(GuildServer)).all()
-        default_guids = {
-            row.server_guid for row in relations if row.is_default
-        }
-        all_guids = {row.server_guid for row in relations}
-        unique_guids = (
-            sorted(default_guids)
-            + sorted(all_guids - default_guids)
-        )
+    all_guids, default_guids = _keeper_lane_guid_sets()
+    unique_guids = (
+        sorted(default_guids)
+        + sorted(all_guids - default_guids)
+    )
 
     references = len(relations)
     unique_count = len(unique_guids)
@@ -5103,14 +5837,36 @@ async def monitor_cycle():
                         get_keeper_snapshot,
                         guid,
                     )
+                    observed_at = utcnow()
                     fresh[guid] = snapshot
                     LAST_SUCCESS_CACHE[guid] = snapshot
+                    rename = await asyncio.to_thread(reconcile_keeper_server_name, guid, snapshot, observed_at)
+                    if rename and rename.get("changed"):
+                        log.info(
+                            "Keeper authoritative server rename guid=%s old_name=%r new_name=%r worker_id=%s",
+                            guid, rename.get("old_name"), rename.get("name"), WORKER_ID,
+                        )
+                    await asyncio.to_thread(record_keeper_lifecycle_result, guid, "SUCCESS", observed_at)
                     KEEPER_SERVER_RETRY_AFTER.pop(guid, None)
                     KEEPER_SERVER_CONSECUTIVE_404S.pop(guid, None)
                     async with state_lock:
                         consecutive_service_failures = 0
                         consecutive_403_failures = 0
                 except Exception as exc:
+                    keeper_result = keeper_result_from_exception(exc)
+                    observed_at = utcnow()
+                    try:
+                        await asyncio.to_thread(
+                            record_keeper_lifecycle_result,
+                            guid,
+                            keeper_result,
+                            observed_at,
+                        )
+                    except Exception as lifecycle_exc:
+                        log.warning(
+                            "Keeper lifecycle evidence persistence failed server=%s result=%s error=%s message=%r",
+                            guid, keeper_result, type(lifecycle_exc).__name__, str(lifecycle_exc),
+                        )
                     response = getattr(exc, "response", None)
                     status = getattr(response, "status_code", None)
                     if status == 403:
@@ -5258,6 +6014,31 @@ async def monitor_cycle():
 
         FRESH_SERVER_CACHE = fresh
 
+    # A persisted Keeper snapshot can remain fresh by age after a later 404.
+    # Never let that pre-404 data drive Discord, player history, rosters, or
+    # command cache while the catalog is DISCOVERED/GRACE/STALE/RETIRED.
+    confirmed_tracked_guids: set[str] = set()
+    if unique_guids:
+        with SessionLocal() as session:
+            confirmed_tracked_guids = {
+                str(guid) for guid in session.scalars(
+                    select(BF4Server.server_guid).where(
+                        BF4Server.server_guid.in_(unique_guids),
+                        BF4Server.lifecycle_state == "CONFIRMED",
+                    )
+                )
+            }
+    if fresh:
+        confirmed_now = set(fresh).intersection(confirmed_tracked_guids)
+        suppressed = len(fresh) - len(confirmed_now)
+        if suppressed:
+            log.info(
+                "Suppressed non-CONFIRMED cached Keeper snapshots count=%s",
+                suppressed,
+            )
+        fresh = {guid: snapshot for guid, snapshot in fresh.items() if guid in confirmed_now}
+    FRESH_SERVER_CACHE = fresh
+
     # Only snapshots successfully fetched in THIS cycle are eligible to drive
     # map-change transitions. LAST_SUCCESS_CACHE is diagnostic-only.
     with SessionLocal() as session:
@@ -5346,12 +6127,24 @@ async def monitor_cycle():
         },
     }
     try:
-        player_history_summary = await process_player_history(fresh, unique_guids)
+        player_history_summary = await process_player_history(
+            fresh, confirmed_tracked_guids
+        )
     except Exception as exc:
         log.error(
             "Player history cycle failed error=%s message=%r",
             type(exc).__name__,
             str(exc),
+        )
+
+    try:
+        lifecycle_discord_summary = await reconcile_server_lifecycle_discord()
+        if any(lifecycle_discord_summary.values()):
+            log.info("Server lifecycle Discord reconciliation summary=%s", lifecycle_discord_summary)
+    except Exception as exc:
+        log.error(
+            "Server lifecycle Discord reconciliation failed error=%s message=%r",
+            type(exc).__name__, str(exc),
         )
 
     player_display_summary = {
@@ -5381,9 +6174,17 @@ async def monitor_cycle():
     # so this aggregate cannot fan out into synchronous DB round trips on the
     # Discord event loop. Legacy mode continues to aggregate this cycle's fetches.
     aggregate_started = time.perf_counter()
+    with SessionLocal() as session:
+        confirmed_guids = {
+            str(guid) for guid in session.scalars(
+                select(BF4Server.server_guid).where(BF4Server.lifecycle_state == "CONFIRMED")
+            )
+        }
+    confirmed_fresh = {guid: snapshot for guid, snapshot in fresh.items() if guid in confirmed_guids}
+    confirmed_count = len(confirmed_guids)
     player_total = sum(
         get_server_status(snapshot)["players"]
-        for snapshot in fresh.values()
+        for snapshot in confirmed_fresh.values()
     )
     aggregate_elapsed = time.perf_counter() - aggregate_started
     log.info(
@@ -5392,9 +6193,10 @@ async def monitor_cycle():
         aggregate_elapsed,
         len(_MAP_NAME_CACHE),
     )
+    presence_usable = len(confirmed_fresh)
     success_ratio = (
-        1.0 if unique_count == 0
-        else len(fresh) / unique_count
+        1.0 if confirmed_count == 0
+        else presence_usable / confirmed_count
     )
     # Isolated per-server failures (especially Keeper 404s for offline console
     # servers) must not freeze rich presence. Distributed mode tolerates a small
@@ -5407,9 +6209,9 @@ async def monitor_cycle():
         # isolated stale/offline servers must not permanently suppress player
         # presence, but severe snapshot loss should retain the previous total.
         presence_healthy = (
-            unique_count == 0
+            confirmed_count == 0
             or (
-                len(fresh) > 0
+                presence_usable > 0
                 and success_ratio >= PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO
                 and service_failures == 0
                 and not circuit_opened
@@ -5417,20 +6219,20 @@ async def monitor_cycle():
         )
     else:
         presence_healthy = (
-            unique_count == 0
+            confirmed_count == 0
             or (
-                len(fresh) > 0
-                and skipped == 0
+                presence_usable > 0
+                and success_ratio >= PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO
                 and service_failures == 0
                 and not circuit_opened
             )
         )
     if distributed_work:
         log.info(
-            "Presence aggregate evaluated players=%s servers=%s usable=%s stale=%s missing=%s "
+            "Presence aggregate evaluated players=%s confirmed_servers=%s confirmed_usable=%s lane_stale=%s lane_missing=%s "
             "coverage_ratio=%.4f required_ratio=%.4f bulk_horizon_seconds=%.1f "
             "fast_horizon_seconds=%.1f fast_active=%s healthy=%s",
-            player_total, unique_count, len(fresh), snapshot_stale, snapshot_missing,
+            player_total, confirmed_count, presence_usable, snapshot_stale, snapshot_missing,
             success_ratio, PRESENCE_DISTRIBUTED_MIN_SUCCESS_RATIO,
             float(presence_policy["bulk_horizon_seconds"]),
             float(presence_policy["fast_horizon_seconds"]),
@@ -5439,6 +6241,7 @@ async def monitor_cycle():
 
     if presence_healthy:
         LAST_GOOD_PRESENCE_PLAYERS = player_total
+        LAST_GOOD_PRESENCE_SERVERS = confirmed_count
         computed_at = datetime.now(timezone.utc)
         fallback_valid_seconds = (
             float(presence_policy["fallback_valid_seconds"])
@@ -5452,9 +6255,9 @@ async def monitor_cycle():
                 persisted_at = await asyncio.to_thread(
                     save_presence_aggregate_state,
                     player_count=player_total,
-                    server_count=unique_count,
-                    usable_snapshots=len(fresh),
-                    total_servers=unique_count,
+                    server_count=confirmed_count,
+                    usable_snapshots=presence_usable,
+                    total_servers=confirmed_count,
                     coverage_ratio=success_ratio,
                     worker_id=WORKER_ID,
                     leadership_generation=DISCORD_SESSION_GENERATION,
@@ -5474,11 +6277,11 @@ async def monitor_cycle():
     else:
         log.info(
             "Presence aggregate retained players=%s reason=unhealthy_cycle "
-            "succeeded=%s unique_servers=%s failed=%s skipped=%s circuit_opened=%s "
+            "confirmed_usable=%s confirmed_servers=%s failed=%s skipped=%s circuit_opened=%s "
             "coverage_ratio=%.4f distributed_work=%s",
             LAST_GOOD_PRESENCE_PLAYERS,
-            len(fresh),
-            unique_count,
+            presence_usable,
+            confirmed_count,
             failures,
             skipped,
             circuit_opened,
@@ -5538,6 +6341,7 @@ async def monitor_loop(generation: int):
 
 async def presence_loop():
     global LAST_GOOD_PRESENCE_PLAYERS
+    global LAST_GOOD_PRESENCE_SERVERS
     global LAST_GOOD_PRESENCE_COMPUTED_AT
     global LAST_GOOD_PRESENCE_VALID_UNTIL
 
@@ -5571,20 +6375,23 @@ async def presence_loop():
                     LAST_GOOD_PRESENCE_PLAYERS, age_seconds,
                 )
                 LAST_GOOD_PRESENCE_PLAYERS = None
+                LAST_GOOD_PRESENCE_SERVERS = None
                 LAST_GOOD_PRESENCE_COMPUTED_AT = None
                 LAST_GOOD_PRESENCE_VALID_UNTIL = None
 
-            with SessionLocal() as session:
-                unique_count = session.scalar(select(func.count(func.distinct(GuildServer.server_guid)))) or 0
-            if LAST_GOOD_PRESENCE_PLAYERS is None:
-                activities = [f"Tracking {unique_count} BF4 servers"]
+            if LAST_GOOD_PRESENCE_PLAYERS is None or LAST_GOOD_PRESENCE_SERVERS is None:
+                with SessionLocal() as session:
+                    confirmed_count = session.scalar(
+                        select(func.count()).select_from(BF4Server).where(BF4Server.lifecycle_state == "CONFIRMED")
+                    ) or 0
+                activity_name = f"Tracking {confirmed_count:,} Servers"
             else:
-                activities = [
-                    f"Tracking {unique_count} BF4 servers",
-                    f"{LAST_GOOD_PRESENCE_PLAYERS:,} players across all tracked servers",
-                ]
+                activity_name = (
+                    f"Tracking {LAST_GOOD_PRESENCE_SERVERS:,} Servers | "
+                    f"{LAST_GOOD_PRESENCE_PLAYERS:,} Players"
+                )
             await client.change_presence(
-                activity=discord.CustomActivity(name=activities[index % len(activities)])
+                activity=discord.CustomActivity(name=activity_name)
             )
             index += 1
         except Exception as exc:
@@ -5628,6 +6435,8 @@ async def guild_cleanup_once():
                 counts = {
                     "announcement_channels": session.scalar(select(func.count()).select_from(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id)) or 0,
                     "listen_channels": session.scalar(select(func.count()).select_from(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id)) or 0,
+                    "log_channels": session.scalar(select(func.count()).select_from(GuildLogChannel).where(GuildLogChannel.guild_id == guild_id)) or 0,
+                    "player_watches": session.scalar(select(func.count()).select_from(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id)) or 0,
                     "guild_servers": session.scalar(select(func.count()).select_from(GuildServer).where(GuildServer.guild_id == guild_id)) or 0,
                     "map_roles": session.scalar(select(func.count()).select_from(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id)) or 0,
                     "server_states": session.scalar(select(func.count()).select_from(GuildServerState).where(GuildServerState.guild_id == guild_id)) or 0,
@@ -5638,6 +6447,8 @@ async def guild_cleanup_once():
                 session.execute(delete(GuildRolePanelMessage).where(GuildRolePanelMessage.guild_id == guild_id))
                 session.execute(delete(GuildServerState).where(GuildServerState.guild_id == guild_id))
                 session.execute(delete(GuildMapRolePing).where(GuildMapRolePing.guild_id == guild_id))
+                session.execute(delete(GuildPlayerWatch).where(GuildPlayerWatch.guild_id == guild_id))
+                session.execute(delete(GuildLogChannel).where(GuildLogChannel.guild_id == guild_id))
                 session.execute(delete(GuildListenChannel).where(GuildListenChannel.guild_id == guild_id))
                 session.execute(delete(GuildAnnouncementChannel).where(GuildAnnouncementChannel.guild_id == guild_id))
                 session.execute(delete(GuildServer).where(GuildServer.guild_id == guild_id))
@@ -6580,9 +7391,14 @@ async def status_all(interaction: discord.Interaction):
         failed_names = []
         for gs, bf in rows:
             try:
+                lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+                if lifecycle_notice:
+                    await interaction.channel.send(lifecycle_notice)
+                    sent += 1
+                    continue
                 snapshot = FRESH_SERVER_CACHE.get(bf.server_guid)
                 if snapshot is None:
-                    snapshot = await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                    snapshot = await get_keeper_snapshot_authoritative(bf.server_guid)
                 marker = " (default)" if gs.is_default else ""
                 await interaction.channel.send(
                     build_status_message(
@@ -6651,8 +7467,13 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
                 audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="server_not_found", target_type="server", target_id=server)
                 return
             display_name, platform = gs.display_name, bf.platform
+            lifecycle_notice = lifecycle_command_notice(bf, display_name)
 
-        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
+        if lifecycle_notice:
+            await interaction.followup.send(lifecycle_notice, ephemeral=True)
+            audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="offline", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
+            return
+        snapshot = FRESH_SERVER_CACHE.get(server) or await get_keeper_snapshot_authoritative(server)
         if not players:
             marker = " (default)" if gs.is_default else ""
             await interaction.followup.send(build_status_message(f"BF4 Server Status — {display_name}{marker}", get_server_status(snapshot), server), ephemeral=True)
@@ -6828,19 +7649,32 @@ async def default_add(
                     target_name=gs.display_name,
                 )
                 return
-            gs.is_default = True
-            gs.include_users = bool(include_users)
-            gs.announcement_channel_id = selected_channel.id
-            gs.announcement_channel_name = selected_channel.name
+            # Making an already-configured server a Discord default is an
+            # administrative mutation, not a manual lifecycle resurrection.
+            # Only /addserver may force immediate validation of STALE/RETIRED.
+            # CONFIRMED/GRACE retain the legacy immediate Keeper behavior.
             name = gs.display_name
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
 
-        snapshot = (
-            FRESH_SERVER_CACHE.get(server)
-            or await asyncio.to_thread(get_keeper_snapshot, server)
-        )
+        if lifecycle_state in {"STALE", "RETIRED"}:
+            snapshot = None
+        else:
+            snapshot = (
+                FRESH_SERVER_CACHE.get(server)
+                or await get_keeper_snapshot_authoritative(server)
+            )
+        with SessionLocal.begin() as session:
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if not gs:
+                raise ValueError("server_not_found")
+            gs.is_default = True
+            gs.include_users = bool(include_users)
+            gs.announcement_channel_id = selected_channel.id
+            gs.announcement_channel_name = selected_channel.name
+
         temp_gs = GuildServer(
             guild_id=interaction.guild.id,
             server_guid=server,
@@ -6850,15 +7684,20 @@ async def default_add(
             announcement_channel_id=selected_channel.id,
             announcement_channel_name=selected_channel.name,
         )
-        await post_automatic_announcement(
-            interaction.guild.id,
-            temp_gs,
-            get_server_status(snapshot),
-            map_change=False,
-        )
+        if snapshot is not None:
+            await post_automatic_announcement(
+                interaction.guild.id,
+                temp_gs,
+                get_server_status(snapshot),
+                map_change=False,
+            )
+        else:
+            # Publish the durable offline/retired lifecycle notice immediately;
+            # do not wait for the next reconciler cycle.
+            await reconcile_server_lifecycle_discord()
 
         player_note = ""
-        if include_users:
+        if include_users and snapshot is not None:
             try:
                 bflist = None
                 if normalize_platform_label(platform) == "PC":
@@ -6898,7 +7737,12 @@ async def default_add(
             f"✅ **{name}** added to default servers in "
             f"**#{selected_channel.name}**. "
             f"Include Users: **{'Yes' if include_users else 'No'}**."
-            f"{player_note}",
+            f"{player_note}"
+            + (
+                " Server remains offline; Keeper lifecycle polling will reactivate "
+                "it automatically when it returns."
+                if snapshot is None else ""
+            ),
             ephemeral=True,
         )
         audit_command(
@@ -6989,6 +7833,7 @@ async def default_modify(
             platform = bf.platform
             server_name = bf.server_name
             tick_rate_hz = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
 
         if int(old_channel_id or 0) == selected_channel.id:
             await interaction.followup.send(
@@ -7011,10 +7856,16 @@ async def default_modify(
             )
             return
 
-        snapshot = (
-            FRESH_SERVER_CACHE.get(server)
-            or await asyncio.to_thread(get_keeper_snapshot, server)
-        )
+        # Moving Discord routing is an administrative operation, not a server
+        # revalidation request. STALE/RETIRED servers must keep their lifecycle
+        # polling cadence; their durable offline notice is moved below without
+        # touching Keeper.
+        snapshot = None
+        if lifecycle_state not in {"STALE", "RETIRED"}:
+            snapshot = (
+                FRESH_SERVER_CACHE.get(server)
+                or await get_keeper_snapshot_authoritative(server)
+            )
         temp_gs = GuildServer(
             guild_id=interaction.guild.id,
             server_guid=server,
@@ -7055,14 +7906,25 @@ async def default_modify(
             live.announcement_channel_id = selected_channel.id
             live.announcement_channel_name = selected_channel.name
 
-        await post_automatic_announcement(
-            interaction.guild.id,
-            temp_gs,
-            get_server_status(snapshot),
-            map_change=False,
-        )
+        if snapshot is not None:
+            await post_automatic_announcement(
+                interaction.guild.id,
+                temp_gs,
+                get_server_status(snapshot),
+                map_change=False,
+            )
+        else:
+            # The lifecycle reconciler owns the durable STALE/RETIRED notice.
+            # Routing is already committed, so reconcile immediately to move it
+            # from the old announcement channel to the selected channel.
+            await reconcile_server_lifecycle_discord()
+            with SessionLocal() as session:
+                moved_state = session.get(GuildServerState, (interaction.guild.id, server))
+                moved_lifecycle_channel = int(moved_state.lifecycle_channel_id or 0) if moved_state else 0
+            if moved_lifecycle_channel != selected_channel.id:
+                raise RuntimeError("lifecycle_notice_move_failed")
 
-        if include_users:
+        if include_users and snapshot is not None:
             bflist = None
             if normalize_platform_label(platform) == "PC":
                 bflist = await asyncio.to_thread(get_bflist_server_cached, server, snapshot)
@@ -7158,17 +8020,10 @@ async def default_remove(interaction, server: str):
                 raise ValueError("server_not_found")
             assigned_channel_id = gs.announcement_channel_id
             name = gs.display_name
-            state = session.get(GuildServerState, (interaction.guild.id, server))
-            old_channel = state.announcement_channel_id if state else None
-            old_message = state.announcement_message_id if state else None
-
-        _, stack_failed = await clear_persistent_player_stack(interaction.guild, server)
-        announcement_deleted = True
-        if old_channel and old_message:
-            announcement_deleted = await delete_discord_message(
-                interaction.guild.id, old_channel, old_message
-            )
-        if stack_failed or not announcement_deleted:
+        cleanup_complete = await cleanup_guild_server_discord_state(
+            interaction.guild, server
+        )
+        if not cleanup_complete:
             await interaction.followup.send(
                 "⚠️ Could not remove this default server yet because one or more "
                 "tracked Discord messages could not be deleted. Tracking and the "
@@ -7251,6 +8106,8 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
     refs = [x for x in re.split(r"[\s,]+", server_urls.strip()) if x]
     added, updated, failed = [], [], []
     activated = []
+    immediate_validation_guids = []
+    revalidation_requested = []
     tick_rate_changes: dict[str, tuple[int | None, int | None]] = {}
     configured_channels = configured_announcement_channels(interaction.guild.id)
     default_channel = None
@@ -7316,6 +8173,7 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         battlelog_url=parsed.get("battlelog_url"),
                         platform_source=parsed.get("platform_source"),
                         tick_rate_hz=tick_rate_hz,
+                        lifecycle_state="DISCOVERED",
                     )
                     session.add(global_server)
                 else:
@@ -7364,6 +8222,16 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                             )
                         )
 
+            if guid not in immediate_validation_guids:
+                immediate_validation_guids.append(guid)
+            revalidation = await asyncio.to_thread(request_server_lifecycle_revalidation, guid)
+            if revalidation and revalidation.get("requested"):
+                revalidation_requested.append(parsed["name"])
+                log.info(
+                    "Immediate Keeper lifecycle revalidation requested guild=%s server=%s state=%s source=addserver",
+                    interaction.guild.id, guid, revalidation.get("state"),
+                )
+
             if (
                 existing_global_present
                 and old_tick_rate_hz != tick_rate_hz
@@ -7371,6 +8239,19 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                 tick_rate_changes[guid] = (
                     old_tick_rate_hz,
                     tick_rate_hz,
+                )
+
+        # /addserver always asks Keeper now. The command can make a STALE/RETIRED
+        # server immediately probe-eligible, but only an ordered Keeper SUCCESS
+        # that leaves the catalog CONFIRMED may publish/cache a snapshot. Reuse
+        # the authoritative helper so an older SUCCESS cannot beat a newer 404.
+        for guid in immediate_validation_guids:
+            try:
+                await get_keeper_snapshot_authoritative(guid)
+            except Exception as keeper_exc:
+                log.info(
+                    "Immediate Keeper validation did not confirm server=%s source=addserver result=%s error=%s",
+                    guid, keeper_result_from_exception(keeper_exc), type(keeper_exc).__name__,
                 )
 
         for changed_guid, (old_hz, new_hz) in tick_rate_changes.items():
@@ -7382,7 +8263,16 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
 
         for guid, display_name, channel_id, channel_name in activated:
             try:
-                snapshot = FRESH_SERVER_CACHE.get(guid) or await asyncio.to_thread(get_keeper_snapshot, guid)
+                with SessionLocal() as session:
+                    bf = session.get(BF4Server, guid)
+                    lifecycle = bf.lifecycle_state if bf else "DISCOVERED"
+                snapshot = FRESH_SERVER_CACHE.get(guid) if lifecycle == "CONFIRMED" else None
+                if snapshot is None:
+                    log.info(
+                        "Immediate default announcement deferred pending Keeper confirmation guild=%s server=%s state=%s",
+                        interaction.guild.id, guid, lifecycle,
+                    )
+                    continue
                 await post_automatic_announcement(
                     interaction.guild.id,
                     GuildServer(
@@ -7405,6 +8295,11 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
         lines = [f"✅ Added: {', '.join(added)}" if added else "Added: none"]
         if updated:
             lines.append("Existing/updated: " + ", ".join(updated))
+        if revalidation_requested:
+            lines.append(
+                "🔎 Keeper revalidation requested: " + ", ".join(revalidation_requested)
+                + ". Keeper remains authoritative for online status."
+            )
         if failed:
             lines.append("⚠️ Could not parse: " + ", ".join(failed))
         await interaction.followup.send("\n".join(lines), ephemeral=True)
@@ -7465,6 +8360,21 @@ async def refreshserverhz(interaction: discord.Interaction, server: str):
             battlelog_url = bf.battlelog_url
             display_name = gs.display_name
             old_tick_rate = bf.tick_rate_hz
+            lifecycle_state = str(bf.lifecycle_state or "").upper()
+
+        if lifecycle_state in {"STALE", "RETIRED"}:
+            await interaction.followup.send(
+                f"ℹ️ **{display_name}** is currently {lifecycle_state}. "
+                "Tick-rate discovery is deferred until Keeper confirms the server online again.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+                command_name="refreshserverhz", command_type="slash", success=True,
+                started=started, result_code="offline_deferred", target_type="server",
+                target_id=server, target_name=display_name,
+            )
+            return
 
         if old_tick_rate is not None:
             await interaction.followup.send(
@@ -7590,6 +8500,7 @@ def refreshserverhz_choices(guild_id: int, current: str):
             .where(
                 GuildServer.guild_id == guild_id,
                 BF4Server.tick_rate_hz.is_(None),
+                BF4Server.lifecycle_state.notin_(["STALE", "RETIRED"]),
             )
             .order_by(GuildServer.display_name)
         ).all()
@@ -7635,26 +8546,36 @@ async def delserver(interaction: discord.Interaction, server: str):
             platform_value, platform_label = bulk_targets[server]
             removed_names = []
             skipped_defaults = []
-            with SessionLocal.begin() as session:
+            cleanup_failed = []
+            with SessionLocal() as session:
                 rows = session.execute(
                     select(GuildServer, BF4Server)
                     .join(BF4Server, GuildServer.server_guid == BF4Server.server_guid)
                     .where(GuildServer.guild_id == interaction.guild.id)
                 ).all()
-                for gs, bf in rows:
-                    if normalize_platform_label(bf.platform) != platform_value:
-                        continue
-                    if gs.is_default:
-                        skipped_defaults.append(gs.display_name)
-                        continue
-                    state = session.get(
-                        GuildServerState,
-                        (interaction.guild.id, gs.server_guid),
-                    )
+                targets = [
+                    (str(gs.server_guid), gs.display_name, bool(gs.is_default))
+                    for gs, bf in rows
+                    if normalize_platform_label(bf.platform) == platform_value
+                ]
+            removable = []
+            for guid, display_name, is_default in targets:
+                if is_default:
+                    skipped_defaults.append(display_name)
+                    continue
+                if not await cleanup_guild_server_discord_state(interaction.guild, guid):
+                    cleanup_failed.append(display_name)
+                    continue
+                removable.append((guid, display_name))
+            with SessionLocal.begin() as session:
+                for guid, display_name in removable:
+                    state = session.get(GuildServerState, (interaction.guild.id, guid))
                     if state:
                         session.delete(state)
-                    removed_names.append(gs.display_name)
-                    session.delete(gs)
+                    gs = session.get(GuildServer, (interaction.guild.id, guid))
+                    if gs:
+                        session.delete(gs)
+                        removed_names.append(display_name)
 
             removed_names.sort(key=str.casefold)
             skipped_defaults.sort(key=str.casefold)
@@ -7674,6 +8595,15 @@ async def delserver(interaction: discord.Interaction, server: str):
                     f"server{'s' if len(skipped_defaults) != 1 else ''}: {shown}."
                 )
 
+            if cleanup_failed:
+                shown = ", ".join(f"**{name}**" for name in cleanup_failed[:10])
+                if len(cleanup_failed) > 10:
+                    shown += f" and {len(cleanup_failed) - 10} more"
+                text += (
+                    f"\n⚠️ Retained {len(cleanup_failed)} server relationship(s) because "
+                    f"Discord cleanup could not be completed: {shown}. Retry `/delserver`."
+                )
+
             await interaction.followup.send(text, ephemeral=True)
             audit_command(
                 guild=interaction.guild,
@@ -7690,31 +8620,50 @@ async def delserver(interaction: discord.Interaction, server: str):
                 metadata={
                     "removed": len(removed_names),
                     "skipped_defaults": len(skipped_defaults),
+                    "cleanup_failed": len(cleanup_failed),
                 },
             )
             return
 
-        with SessionLocal.begin() as session:
+        with SessionLocal() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
             if not gs:
                 raise ValueError("server_not_found")
-            if gs.is_default:
-                await interaction.followup.send(
-                    "⛔ Remove this server from defaults first.", ephemeral=True
-                )
-                audit_command(
-                    guild=interaction.guild, channel=interaction.channel,
-                    user=interaction.user, command_name="delserver",
-                    command_type="slash", success=False, started=started,
-                    result_code="server_is_default", target_type="server",
-                    target_id=server, target_name=gs.display_name,
-                )
-                return
+            is_default = bool(gs.is_default)
             name = gs.display_name
+        if is_default:
+            await interaction.followup.send(
+                "⛔ Remove this server from defaults first.", ephemeral=True
+            )
+            audit_command(
+                guild=interaction.guild, channel=interaction.channel,
+                user=interaction.user, command_name="delserver",
+                command_type="slash", success=False, started=started,
+                result_code="server_is_default", target_type="server",
+                target_id=server, target_name=name,
+            )
+            return
+        if not await cleanup_guild_server_discord_state(interaction.guild, server):
+            await interaction.followup.send(
+                "⚠️ Could not remove this server yet because its tracked Discord "
+                "messages could not all be cleaned up. The guild relationship was "
+                "retained; retry `/delserver`.",
+                ephemeral=True,
+            )
+            audit_command(
+                guild=interaction.guild, channel=interaction.channel,
+                user=interaction.user, command_name="delserver", command_type="slash",
+                success=False, started=started, result_code="cleanup_pending",
+                target_type="server", target_id=server, target_name=name,
+            )
+            return
+        with SessionLocal.begin() as session:
             state = session.get(GuildServerState, (interaction.guild.id, server))
             if state:
                 session.delete(state)
-            session.delete(gs)
+            gs = session.get(GuildServer, (interaction.guild.id, server))
+            if gs:
+                session.delete(gs)
         await interaction.followup.send(
             f"✅ Removed **{name}** from this guild.", ephemeral=True
         )
@@ -9361,9 +10310,15 @@ async def debug(interaction: discord.Interaction, server: str | None = None):
             return
         server = defaults[0][0].server_guid
     try:
-        snapshot = FRESH_SERVER_CACHE.get(server) or await asyncio.to_thread(get_keeper_snapshot, server)
         with SessionLocal() as session:
             gs = session.get(GuildServer, (interaction.guild.id, server))
+            bf = session.get(BF4Server, server)
+            lifecycle_notice = lifecycle_command_notice(bf, gs.display_name if gs else server) if bf else None
+        if lifecycle_notice:
+            await interaction.followup.send(f"Debug server: **{gs.display_name if gs else server}**\n{lifecycle_notice}", ephemeral=True)
+            audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=True, started=started, result_code="offline", target_type="server", target_id=server)
+            return
+        snapshot = FRESH_SERVER_CACHE.get(server) or await get_keeper_snapshot_authoritative(server)
         await interaction.followup.send(f"Debug server: **{gs.display_name if gs else server}**\n{build_debug_report(snapshot)}", ephemeral=True)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="debug", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server)
     except Exception as exc:
@@ -9403,7 +10358,10 @@ async def announce(interaction: discord.Interaction):
             )
             continue
         try:
-            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+            if lifecycle_command_notice(bf, gs.display_name):
+                failed += 1
+                continue
+            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
             msg = await channel.send(
                 build_map_announcement(
                     gs.display_name,
@@ -9944,7 +10902,10 @@ async def on_message(message: discord.Message):
                     failed += 1
                     continue
                 try:
-                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                    if lifecycle_command_notice(bf, gs.display_name):
+                        failed += 1
+                        continue
+                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
                     msg = await channel.send(
                         build_map_announcement(
                             gs.display_name,
@@ -10004,7 +10965,11 @@ async def on_message(message: discord.Message):
                     await message.channel.send("No default server(s) set")
                     return
                 for gs, bf in defaults:
-                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+                    lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+                    if lifecycle_notice:
+                        await message.channel.send(lifecycle_notice)
+                        continue
+                    snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
                     await message.channel.send(build_status_message(f"BF4 Server Status — {gs.display_name} (default)", get_server_status(snapshot), bf.server_guid))
                 audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="defaults", metadata={"count": len(defaults)})
                 return
@@ -10032,7 +10997,12 @@ async def on_message(message: discord.Message):
                     )
                 return
             gs, bf = matches[0]
-            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await asyncio.to_thread(get_keeper_snapshot, bf.server_guid)
+            lifecycle_notice = lifecycle_command_notice(bf, gs.display_name)
+            if lifecycle_notice:
+                await message.channel.send(lifecycle_notice)
+                audit_command(guild=message.guild, channel=message.channel, user=message.author, command_name="status", command_type="prefix", success=True, started=started, result_code="offline", target_type="server", target_id=bf.server_guid, target_name=gs.display_name, metadata={"players": players})
+                return
+            snapshot = FRESH_SERVER_CACHE.get(bf.server_guid) or await get_keeper_snapshot_authoritative(bf.server_guid)
             if players:
                 teams = None
                 if normalize_platform_label(bf.platform) == "PC":
@@ -10237,6 +11207,9 @@ async def on_ready():
     _track_discord_leader_task(version_loop(), f"version-g{generation}")
     _track_discord_leader_task(guild_cleanup_loop(), f"guild-cleanup-g{generation}")
     _track_discord_leader_task(operator_event_loop(), f"operator-events-g{generation}")
+    _track_discord_leader_task(
+        bflist_pc_discovery_loop(), f"bflist-discovery-g{generation}"
+    )
 
     # Reconcile processor ownership continuously for this exact Discord lease
     # generation. This handles hot changes to keeper.distributed_enabled and
@@ -10391,6 +11364,10 @@ async def main_async():
         distributed_keeper_acquisition_loop("fast"),
         name="distributed-keeper-fast-acquisition",
     )
+    keeper_lifecycle_acquisition_task = asyncio.create_task(
+        distributed_keeper_acquisition_loop("lifecycle"),
+        name="distributed-keeper-lifecycle-acquisition",
+    )
     persona_enrichment_task = asyncio.create_task(
         distributed_persona_enrichment_loop(),
         name="distributed-player-persona-enrichment",
@@ -10422,6 +11399,7 @@ async def main_async():
             )
 
         await _cancel_process_task(persona_enrichment_task)
+        await _cancel_process_task(keeper_lifecycle_acquisition_task)
         await _cancel_process_task(keeper_fast_acquisition_task)
         await _cancel_process_task(keeper_acquisition_task)
         await _cancel_process_task(heartbeat_task)

@@ -28,6 +28,7 @@ from models import (
     KeeperLaneWorkerState,
     PresenceAggregateState,
     BF4PlayerSession,
+    BF4Server,
     PlayerPersonaEnrichmentState,
 )
 
@@ -365,9 +366,12 @@ def persona_assignment_snapshot(stale_after_seconds: int = DEFAULT_STALE_AFTER_S
             )
         }
         guids = sorted(set(session.scalars(
-            select(BF4PlayerSession.server_guid).where(
+            select(BF4PlayerSession.server_guid)
+            .join(BF4Server, BF4Server.server_guid == BF4PlayerSession.server_guid)
+            .where(
                 BF4PlayerSession.time_left.is_(None),
                 BF4PlayerSession.persona_id.is_(None),
+                BF4Server.lifecycle_state == "CONFIRMED",
             )
         )))
 
@@ -571,7 +575,7 @@ def record_keeper_lane_sweep(
     """Persist one completed Keeper lane traversal for adaptive health policy."""
     worker_id = validate_worker_id(worker_id)
     lane = str(lane or "").strip().lower()
-    if lane not in {"bulk", "fast"}:
+    if lane not in {"bulk", "fast", "lifecycle"}:
         raise ValueError(f"unsupported Keeper lane {lane!r}")
     with SessionLocal.begin() as session:
         now = session.scalar(select(func.now()))
