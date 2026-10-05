@@ -9,6 +9,7 @@ from fastapi.templating import Jinja2Templates
 from .config import get_settings
 from .database_facts import get_database_facts
 from .db import close_pool, open_pool
+from .lifecycle import get_lifecycle_servers
 from .repository import (
     get_cluster_health,
     get_database_nodes,
@@ -112,6 +113,14 @@ def api_leadership():
 
 @app.get("/api/snapshot-health")
 def api_snapshot_health(): return get_snapshot_health()
+
+
+@app.get("/api/lifecycle-servers/{state}")
+def api_lifecycle_servers(state: str):
+    try:
+        return get_lifecycle_servers(state)
+    except ValueError:
+        return JSONResponse(status_code=404, content={"detail": "Unknown lifecycle state."})
 
 
 @app.get("/api/population-history")
