@@ -83,9 +83,7 @@ def session_scope():
         yield session
         session.commit()
         connectivity.recovered("database.runtime")
-    except Exception as exc:
-        if _is_connectivity_error(exc):
-            connectivity.failure("database.runtime", exc)
+    except Exception:
         session.rollback()
         raise
     finally:
