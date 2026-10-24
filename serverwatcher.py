@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from sqlalchemy import delete, func, or_, select, text
 
 from db import SessionLocal, wait_for_database
+from scoreboard import mobile_scoreboard_messages, wide_scoreboard_messages
 from control_plane import (
     WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker,
     set_worker_status, set_worker_draining, list_workers, validate_worker_id, ensure_new_worker_standby,
