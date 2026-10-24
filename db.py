@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from connectivity_logging import ConnectivityTracker
+
 log = logging.getLogger("serverwatcher.db")
+connectivity = ConnectivityTracker(log)
 
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.environ.get("SERVERWATCHER_RUNTIME_DIR", str(BASE_DIR))).resolve()
@@ -35,13 +38,12 @@ def wait_for_database(attempts: int = 5) -> None:
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+            connectivity.recovered("database.startup")
             log.info("Database ready attempt=%s/%s", attempt, attempts)
             return
         except Exception as exc:
-            log.error(
-                "Database unavailable attempt=%s/%s error=%s message=%r",
-                attempt, attempts, type(exc).__name__, str(exc)
-            )
+            connectivity.failure("database.startup", exc)
+            log.debug("Database unavailable attempt=%s/%s error=%s", attempt, attempts, type(exc).__name__)
             if attempt == attempts:
                 raise
             delay = min(2 ** (attempt - 1), 10)
