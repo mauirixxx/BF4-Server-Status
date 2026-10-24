@@ -40,6 +40,12 @@ def _database_handle_error(context):
         connectivity.failure("database.runtime", context.original_exception)
 
 
+@event.listens_for(engine, "after_cursor_execute")
+def _database_query_succeeded(conn, cursor, statement, parameters, context, executemany):
+    """Record recovery only after a SQL statement really executes."""
+    connectivity.recovered("database.runtime")
+
+
 
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
