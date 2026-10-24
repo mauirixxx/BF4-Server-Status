@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
@@ -31,6 +31,16 @@ engine = create_engine(
     pool_recycle=1800,
     future=True,
 )
+
+
+@event.listens_for(engine, "handle_error")
+def _database_handle_error(context):
+    """Observe failures even when callers bypass session_scope()."""
+    if context.is_disconnect:
+        connectivity.failure("database.runtime", context.original_exception)
+
+
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
