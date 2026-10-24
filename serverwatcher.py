@@ -7497,7 +7497,7 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
             await send_clean_chunks(interaction, chunks)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
     except Exception as exc:
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server, target_name=locals().get("display_name"))
         await interaction.followup.send(f"⚠️ Status failed: `{type(exc).__name__}`", ephemeral=True)
 
 
@@ -8742,7 +8742,7 @@ async def renameserver(interaction: discord.Interaction, server: str, new_name: 
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=True, started=started, result_code="renamed", target_type="server", target_id=server, target_name=cleaned)
     except Exception as exc:
         await interaction.followup.send("⚠️ Rename failed.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server, target_name=locals().get("old"))
 
 
 @renameserver.autocomplete("server")
