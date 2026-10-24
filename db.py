@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from connectivity_logging import ConnectivityTracker
@@ -33,6 +34,13 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
+def _is_connectivity_error(exc: BaseException) -> bool:
+    """Classify database transport errors without treating SQL errors as outages."""
+    return isinstance(exc, (OperationalError, InterfaceError)) or (
+        isinstance(exc, DBAPIError) and exc.connection_invalidated
+    )
+
+
 def wait_for_database(attempts: int = 5) -> None:
     for attempt in range(1, attempts + 1):
         try:
@@ -42,7 +50,8 @@ def wait_for_database(attempts: int = 5) -> None:
             log.info("Database ready attempt=%s/%s", attempt, attempts)
             return
         except Exception as exc:
-            connectivity.failure("database.startup", exc)
+            if _is_connectivity_error(exc):
+                connectivity.failure("database.startup", exc)
             log.debug("Database unavailable attempt=%s/%s error=%s", attempt, attempts, type(exc).__name__)
             if attempt == attempts:
                 raise
@@ -57,7 +66,10 @@ def session_scope():
     try:
         yield session
         session.commit()
-    except Exception:
+        connectivity.recovered("database.runtime")
+    except Exception as exc:
+        if _is_connectivity_error(exc):
+            connectivity.failure("database.runtime", exc)
         session.rollback()
         raise
     finally:
