@@ -11080,6 +11080,12 @@ async def on_app_command_error(
             result_code="failed",
             error=error,
         )
+    if qualified_name and not (qualified_name == "operator" or qualified_name.startswith("operator ")):
+        audit_command(
+            guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+            command_name=qualified_name.replace(" ", "."), command_type="slash",
+            success=False, started=time.perf_counter(), result_code="unhandled_error", error=error,
+        )
     log.error(
         "Slash command error guild=%s channel=%s user=%s command=%s error=%s message=%r",
         getattr(interaction.guild, "id", None),
