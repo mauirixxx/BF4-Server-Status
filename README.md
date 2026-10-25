@@ -50,6 +50,10 @@ BF4 Server Watcher is designed to make it easier for Battlefield 4 communities t
 
 Server and player information is collected from Battlefield 4-related services and presented directly inside Discord.
 
+## Current release: v3.2.1
+
+v3.2.1 restores the Mobile and Wide `/status server` player rosters, improves command auditing and database connectivity diagnostics, and limits repetitive permission warnings for command-audit delivery. It requires **no database schema migration** beyond v3.2.0's `0023_v3_2_0_server_lifecycle` revision. See [v3.2.1 release notes](RELEASE-v3.2.1.md) and [changelog](CHANGELOG.md).
+
 ## Optional components
 
 ### BF4 Status Web Dashboard
