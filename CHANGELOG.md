@@ -4,6 +4,16 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.2.1] - 2026-10-24
+
+- Restored Mobile and Wide player-roster rendering for `/status server`, including safe message splitting and empty-team handling.
+- Added rate-limited database disconnect, retry and confirmed-recovery transition logs.
+- Rate-limited command-audit Discord permission warnings without silently disabling configured channels.
+- Improved failed-command audit targets for server status and rename commands, and captured unhandled non-operator slash-command failures.
+- Added unit/integration regression tests (59 passing in isolated checkout) and fixed Docker packaging for new modules.
+- Live single-node Discord smoke test confirmed by operator, followed by successful ten-node v3.2.1 rollout; no schema migration.
+- Known follow-up: announcement/player-display `403 Missing Access` warnings from inaccessible guild channels are not covered by command-audit warning suppression.
+
 ## [v3.2.0] - 2026-10-01
 
 - Added permanent DISCOVERED/CONFIRMED/GRACE/STALE/RETIRED server lifecycle management with ordered Keeper evidence.

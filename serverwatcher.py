@@ -26,6 +26,8 @@ from dotenv import load_dotenv
 from sqlalchemy import delete, func, or_, select, text
 
 from db import SessionLocal, wait_for_database
+from scoreboard import mobile_scoreboard_messages, wide_scoreboard_messages
+from permission_logging import PermissionWarningLimiter
 from control_plane import (
     WORKER_ID, RuntimeSettingsCache, heartbeat_loop, register_worker,
     set_worker_status, set_worker_draining, list_workers, validate_worker_id, ensure_new_worker_standby,
@@ -62,7 +64,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.2.0"
+BOT_VERSION = "v3.2.1"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -1330,6 +1332,9 @@ def command_audit_discord_text(row: CommandAudit) -> str:
     return "\n".join(lines)[:1900]
 
 
+audit_permission_warnings = PermissionWarningLimiter(log)
+
+
 async def deliver_command_audit_to_discord(row: CommandAudit):
     if row.guild_id is None:
         return
@@ -1353,6 +1358,9 @@ async def deliver_command_audit_to_discord(row: CommandAudit):
                 continue
             try:
                 await channel.send(text_value, suppress_embeds=True)
+                audit_permission_warnings.success(row.guild_id, channel_id, "command_audit")
+            except discord.Forbidden as exc:
+                audit_permission_warnings.failure(row.guild_id, channel_id, "command_audit", exc)
             except Exception as exc:
                 log.warning(
                     "Command audit Discord delivery failed guild=%s channel=%s error=%s message=%r",
@@ -7489,7 +7497,7 @@ async def status_server(interaction: discord.Interaction, server: str, players: 
             await send_clean_chunks(interaction, chunks)
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=True, started=started, result_code="ok", target_type="server", target_id=server, target_name=display_name, metadata={"players": players, "layout": layout})
     except Exception as exc:
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="status.server", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server, target_name=locals().get("display_name"))
         await interaction.followup.send(f"⚠️ Status failed: `{type(exc).__name__}`", ephemeral=True)
 
 
@@ -8734,7 +8742,7 @@ async def renameserver(interaction: discord.Interaction, server: str, new_name: 
         audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=True, started=started, result_code="renamed", target_type="server", target_id=server, target_name=cleaned)
     except Exception as exc:
         await interaction.followup.send("⚠️ Rename failed.", ephemeral=True)
-        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server)
+        audit_command(guild=interaction.guild, channel=interaction.channel, user=interaction.user, command_name="renameserver", command_type="slash", success=False, started=started, result_code="failed", error=exc, target_type="server", target_id=server, target_name=locals().get("old"))
 
 
 @renameserver.autocomplete("server")
@@ -11071,6 +11079,12 @@ async def on_app_command_error(
             success=False,
             result_code="failed",
             error=error,
+        )
+    if qualified_name and not (qualified_name == "operator" or qualified_name.startswith("operator ")):
+        audit_command(
+            guild=interaction.guild, channel=interaction.channel, user=interaction.user,
+            command_name=qualified_name.replace(" ", "."), command_type="slash",
+            success=False, started=time.perf_counter(), result_code="unhandled_error", error=error,
         )
     log.error(
         "Slash command error guild=%s channel=%s user=%s command=%s error=%s message=%r",
