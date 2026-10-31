@@ -4,6 +4,16 @@ All notable changes to BF4 Server Watcher are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning-style `v1.x.x` release numbers.
 
+## [v3.2.2] - 2026-10-30
+
+- Added daily GameTools console server discovery for PlayStation (`ps4` → `PS4/5`) and Xbox (`xboxone` → `XBox`) to the Discord-leader-owned 09:30 HST discovery loop.
+- Preserved the existing BFLIST PC discovery behavior and independent PC completion checkpoint.
+- Added independent per-console-platform success checkpoints, bounded API requests, validation, and 30-minute failure retry backoff.
+- Unknown console GUIDs enter the permanent catalog as `DISCOVERED` with initial name history; Keeper remains authoritative for confirmation and lifecycle.
+- Added `run_console_discovery(platform, force=True)` for controlled manual runs, with GUID deduplication.
+- Live manual canary on mak-03 admitted eight PlayStation and six Xbox GUIDs; repeated runs admitted zero duplicates. The daily scheduler and fleet rollout still require validation.
+- No database schema migration or Keeper rate-budget change.
+
 ## [v3.2.1] - 2026-10-24
 
 - Restored Mobile and Wide player-roster rendering for `/status server`, including safe message splitting and empty-team handling.
