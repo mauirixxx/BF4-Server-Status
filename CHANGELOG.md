@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Added `run_console_discovery(platform, force=True)` for controlled manual runs, with GUID deduplication.
 - Live manual canary on mak-03 admitted eight PlayStation and six Xbox GUIDs; repeated runs admitted zero duplicates. The daily scheduler and fleet rollout still require validation.
 - No database schema migration or Keeper rate-budget change.
+- Rolled out sequentially to all ten production workers, with targeted Discord leadership handoff to mak-03; final fleet verification 10/10 online, all v3.2.2, none draining. Full suite: 63 tests passed.
 
 ## [v3.2.1] - 2026-10-24
 
