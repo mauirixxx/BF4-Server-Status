@@ -30,6 +30,17 @@ v3.2.2 extends the existing Discord-leader-owned BFLIST PC discovery process wit
 6. Upgrade the former leader last; verify daily discovery checkpoints, no duplicate GUIDs, and Keeper promotion of DISCOVERED servers.
 7. If any node fails health checks, roll back that node's image and resume only after verifying state.
 
+## Production rollout confirmation — 2026-10-30 HST
+
+- GitHub PR #26 merged to `main` (commit `b48e603`).
+- v3.2.2 built from `main` and deployed one worker at a time to mak-03, mak-02, mak-01, mak-04, mak-05, hnl-01, hnl-02, hnl-03, kah-01, and rnt-01.
+- Each worker was drained, upgraded, and resumed; the active Discord leader was upgraded last.
+- Targeted Discord leadership handoff request #11 moved leadership from rnt-01 to mak-03, generation 201 → 202, and completed successfully.
+- Final database verification: **10/10 workers online**, **10/10 v3.2.2**, **0 draining**; Discord leader mak-03.
+- All **63 unit tests passed** using the v3.2.2 Docker image on mak-03.
+- Previously admitted GameTools servers progressed under Keeper: PS4/5 3 CONFIRMED / 4 GRACE / 1 STALE; XBox 1 CONFIRMED / 4 GRACE / 1 STALE.
+- Per-platform successful discovery checkpoints dated 2026-10-30 HST. Next scheduled day has not yet been observed.
+
 ## Limitations
 
 GameTools pagination was inconsistent during early tests. v3.2.2 uses one bounded API snapshot per platform; it does not claim exhaustive console inventory. GameTools can return 403. Battlelog fallback is not included in this release.
