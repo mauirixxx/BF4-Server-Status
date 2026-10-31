@@ -1274,7 +1274,9 @@ def mark_bflist_discovery_completed(run_date: str) -> None:
 async def bflist_pc_discovery_loop() -> None:
     """Discord-leader-only daily PC discovery at 09:30 Pacific/Honolulu."""
     hst = ZoneInfo("Pacific/Honolulu")
+    console_next_attempt = {platform: 0.0 for platform, _ in CONSOLE_DISCOVERY_PLATFORMS}
     while True:
+        due = False
         try:
             now = datetime.now(hst)
             run_date = now.date().isoformat()
@@ -1299,6 +1301,9 @@ async def bflist_pc_discovery_loop() -> None:
         # Independent console checkpoints: a GameTools failure cannot affect PC discovery.
         if due:
             for platform, _ in CONSOLE_DISCOVERY_PLATFORMS:
+                if time.monotonic() < console_next_attempt[platform]:
+                    continue
+                console_next_attempt[platform] = time.monotonic() + 1800  # retry failures no faster than 30 minutes
                 try:
                     await asyncio.to_thread(run_console_discovery, platform)
                 except asyncio.CancelledError:
