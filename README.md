@@ -4,6 +4,12 @@ BF4 Server Watcher is a Discord bot for **Battlefield 4 communities** that provi
 
 The bot can monitor specific BF4 servers and keep your Discord community informed as server activity changes. Supports PC as well as both Xbox and PlayStation console based servers.
 
+## Automated server discovery
+
+The Discord leader performs a daily server-discovery sweep at **09:30 Hawaii time**. PC servers come from BFLIST; PlayStation and Xbox server GUIDs come from GameTools. Previously unknown GUIDs enter the permanent catalog as `DISCOVERED` and are subsequently verified by Keeper. Existing servers are never marked offline merely because a discovery provider omitted them.
+
+GameTools console discovery has independent per-platform completion checkpoints and retries failed requests no more frequently than every 30 minutes while the leader is running. Operators can invoke `run_console_discovery("ps4", force=True)` or `run_console_discovery("xboxone", force=True)` from an appropriately configured BF4SW runtime to force a one-off sweep. This manual entry point is not a Discord command. A Battlelog fallback is planned but not part of v3.2.2.
+
 ## Features
 
 - **BF4 server tracking** — Monitor specific Battlefield 4 servers and display current server information.

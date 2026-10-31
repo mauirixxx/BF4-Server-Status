@@ -64,7 +64,7 @@ from models import (
     PlayerPersonaEnrichmentState,
 )
 
-BOT_VERSION = "v3.2.1"
+BOT_VERSION = "v3.2.2"
 GITHUB_REPOSITORY = "mauirixxx/BF4-Server-Status"
 VERSION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 AAA_GUID = "28773abe-e620-4d36-9512-c6f4b128f0ad"
@@ -1154,6 +1154,101 @@ def persist_bflist_pc_discovery(servers: list[dict]) -> dict[str, int]:
     return {"discovered": discovered, "known": already_known, "invalid": invalid}
 
 
+CONSOLE_DISCOVERY_PLATFORMS = (("ps4", "PS4/5"), ("xboxone", "XBox"))
+
+
+def get_gametools_console_servers(platform: str) -> list[dict]:
+    """Bounded GameTools snapshot. Offsets are deliberately NOT trusted."""
+    if platform not in ("ps4", "xboxone"):
+        raise ValueError("unsupported console platform")
+    response = requests.get(
+        "https://api.gametools.network/bf4/servers/",
+        params={"platform": platform, "name": "", "limit": 100},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    servers = payload.get("servers") if isinstance(payload, dict) else None
+    if not isinstance(servers, list) or not servers:
+        raise ValueError("GameTools console response missing nonempty servers list")
+    return servers
+
+
+def persist_gametools_console_discovery(platform: str, servers: list[dict]) -> dict[str, int]:
+    """Admit only previously unknown GUIDs; Keeper owns lifecycle verification."""
+    platform_label = dict(CONSOLE_DISCOVERY_PLATFORMS).get(platform)
+    if not platform_label:
+        raise ValueError("unsupported console platform")
+    discovered = known_count = invalid = 0
+    now = utcnow()
+    with SessionLocal.begin() as session:
+        known = set(session.scalars(select(BF4Server.server_guid)))
+        for item in servers:
+            if not isinstance(item, dict):
+                invalid += 1
+                continue
+            guid = str(item.get("serverId") or "").strip().lower()
+            if not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", guid
+            ):
+                invalid += 1
+                continue
+            if guid in known:
+                known_count += 1
+                continue
+            name = str(item.get("prefix") or guid).strip()[:255] or guid
+            session.add(BF4Server(
+                server_guid=guid, server_name=name, platform=platform_label,
+                platform_source="gametools_discovery", lifecycle_state="DISCOVERED",
+            ))
+            session.add(BF4ServerNameHistory(
+                server_guid=guid, server_name=name, first_seen_at=now, last_seen_at=None,
+            ))
+            known.add(guid)
+            discovered += 1
+    return {"discovered": discovered, "known": known_count, "invalid": invalid}
+
+
+def console_discovery_completed_for_date(platform: str, run_date: str) -> bool:
+    with SessionLocal() as session:
+        value = session.scalar(text(
+            "SELECT setting_value FROM cluster_runtime_settings "
+            "WHERE setting_key=:key AND scope_type='global' AND scope_name='' LIMIT 1"
+        ), {"key": f"discovery.gametools_{platform}_last_success_hst"})
+    return str(value or "") == run_date
+
+
+def mark_console_discovery_completed(platform: str, run_date: str) -> None:
+    with SessionLocal.begin() as session:
+        session.execute(text(
+            "INSERT INTO cluster_runtime_settings "
+            "(setting_key,scope_type,scope_name,setting_value,value_type,description,updated_by,created_at,updated_at) "
+            "VALUES (:key,'global','',:run_date,'string',:description,:worker,now(),now()) "
+            "ON CONFLICT (setting_key,scope_type,scope_name) DO UPDATE SET "
+            "setting_value=EXCLUDED.setting_value,updated_by=EXCLUDED.updated_by,updated_at=now()"
+        ), {"key": f"discovery.gametools_{platform}_last_success_hst",
+            "run_date": run_date, "description": f"Last successful GameTools {platform} server discovery (HST)",
+            "worker": WORKER_ID})
+
+
+def run_console_discovery(platform: str, *, force: bool = False) -> dict[str, int] | None:
+    """Run one platform now; force bypasses date check, never bypasses GUID deduplication."""
+    if platform not in dict(CONSOLE_DISCOVERY_PLATFORMS):
+        raise ValueError("unsupported console platform")
+    run_date = datetime.now(ZoneInfo("Pacific/Honolulu")).date().isoformat()
+    if not force and console_discovery_completed_for_date(platform, run_date):
+        return None
+    servers = get_gametools_console_servers(platform)
+    result = persist_gametools_console_discovery(platform, servers)
+    mark_console_discovery_completed(platform, run_date)
+    log.info(
+        "GameTools console discovery complete worker_id=%s platform=%s date_hst=%s seen=%s discovered=%s known=%s invalid=%s",
+        WORKER_ID, platform, run_date, len(servers),
+        result["discovered"], result["known"], result["invalid"],
+    )
+    return {"seen": len(servers), **result}
+
+
 def bflist_discovery_completed_for_date(run_date: str) -> bool:
     with SessionLocal() as session:
         value = session.scalar(text(
@@ -1179,7 +1274,9 @@ def mark_bflist_discovery_completed(run_date: str) -> None:
 async def bflist_pc_discovery_loop() -> None:
     """Discord-leader-only daily PC discovery at 09:30 Pacific/Honolulu."""
     hst = ZoneInfo("Pacific/Honolulu")
+    console_next_attempt = {platform: 0.0 for platform, _ in CONSOLE_DISCOVERY_PLATFORMS}
     while True:
+        due = False
         try:
             now = datetime.now(hst)
             run_date = now.date().isoformat()
@@ -1201,6 +1298,21 @@ async def bflist_pc_discovery_loop() -> None:
                 "BFLIST daily PC discovery failed worker_id=%s error=%s message=%r",
                 WORKER_ID, type(exc).__name__, str(exc),
             )
+        # Independent console checkpoints: a GameTools failure cannot affect PC discovery.
+        if due:
+            for platform, _ in CONSOLE_DISCOVERY_PLATFORMS:
+                if time.monotonic() < console_next_attempt[platform]:
+                    continue
+                console_next_attempt[platform] = time.monotonic() + 1800  # retry failures no faster than 30 minutes
+                try:
+                    await asyncio.to_thread(run_console_discovery, platform)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "GameTools console discovery failed worker_id=%s platform=%s error=%s message=%r",
+                        WORKER_ID, platform, type(exc).__name__, str(exc),
+                    )
         await asyncio.sleep(30)
 
 
