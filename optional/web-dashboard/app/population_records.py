@@ -23,7 +23,8 @@ SELECT
   (SELECT players FROM totals ORDER BY players DESC, sampled_at ASC LIMIT 1) AS peak_players,
   (SELECT sampled_at FROM totals ORDER BY players DESC, sampled_at ASC LIMIT 1) AS peak_at,
   (SELECT ROUND(AVG(peak))::bigint FROM daily) AS average_daily_peak,
-  (SELECT COUNT(*) FROM daily) AS completed_days
+  (SELECT COUNT(*) FROM daily) AS completed_days,
+  (SELECT MIN(sampled_at) FROM dashboard_population_samples) AS monitoring_started_at
 """
 _lock = Lock()
 _cached = None
@@ -41,6 +42,7 @@ def get_population_records():
             'peak_at': row['peak_at'].isoformat() if row.get('peak_at') else None,
             'average_daily_peak': row.get('average_daily_peak'),
             'completed_days': row.get('completed_days') or 0,
+            'monitoring_started_at': row['monitoring_started_at'].isoformat() if row.get('monitoring_started_at') else None,
         }
         _cached = result
         _expires = monotonic() + 300

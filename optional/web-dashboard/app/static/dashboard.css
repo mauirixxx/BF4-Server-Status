@@ -34,3 +34,6 @@ main>.chart-card{margin-top:0}.chart-card .chart-wrap{height:430px}.chart-card+.
 @media(min-width:561px){.topbar .header-actions{justify-content:flex-end;gap:28px}}
 
 .population-records{display:flex;gap:24px;align-items:flex-start;margin-left:auto;margin-right:20px;flex-wrap:wrap}.population-records>div{display:flex;flex-direction:column;gap:4px;min-width:160px}.population-records span{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:#9cabbc;font-weight:700}.population-records strong{font-size:1.4rem;line-height:1.2;color:#f4f7fc}.population-records small{font-size:.76rem;color:#a7b5c4}.chart-card .section-head{gap:18px}@media(max-width:1050px){.population-records{margin-left:0;margin-right:0;order:3;width:100%}}
+
+/* Population records: centered figures and Battle Report-inspired pink accent. */
+.population-records{justify-content:center;align-items:center;text-align:center}.population-records>div{align-items:center;min-width:220px}.population-records strong{color:#ff69b4}.population-records small{white-space:nowrap}
