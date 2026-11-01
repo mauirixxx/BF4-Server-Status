@@ -81,11 +81,29 @@ def get_snapshot_health():
         if isinstance(result.get(k),Decimal): result[k]=float(result[k])
     result["adaptive_health_state"]="healthy" if float(result.get("adaptive_coverage_pct") or 0)>=settings.presence_healthy_coverage_pct else "below-target"; result["available"]=True; return result
 
-def get_population_history(range_name="24h"):
-    from .history_queries import HISTORY_SQL,HISTORY_STARTED_SQL
-    ranges={"24h":("24 hours","5 minutes"),"7d":("7 days","30 minutes"),"30d":("30 days","1 hour")}; range_name=range_name if range_name in ranges else "24h"; duration,bucket=ranges[range_name]
+def get_population_history(range_name="24h", start=None, end=None):
+    from .history_queries import HISTORY_SQL,HISTORY_STARTED_SQL,HISTORY_CUSTOM_SQL,HISTORY_ALL_SQL
+    ranges={"24h":("24 hours","5 minutes"),"7d":("7 days","30 minutes"),"30d":("30 days","1 hour")}; range_name=range_name if range_name in (*ranges,"custom","all") else "24h"
+    if range_name=="custom":
+        from datetime import datetime,timedelta,timezone
+        try:
+            begin=datetime.fromisoformat(start.replace("Z","+00:00"));finish=datetime.fromisoformat(end.replace("Z","+00:00"))
+            if begin.tzinfo is None or finish.tzinfo is None or finish<=begin or finish>datetime.now(timezone.utc)+timedelta(days=1) or finish-begin>timedelta(days=367):raise ValueError()
+        except (AttributeError,TypeError,ValueError):raise ValueError("Invalid time range (maximum 367 days)")
+        bucket="5 minutes" if finish-begin<=timedelta(hours=24) else "1 hour"
+        params={"start":begin,"end":finish,"bucket":bucket};sql=HISTORY_CUSTOM_SQL
+    elif range_name=="all":
+        bucket="1 day";params={"bucket":bucket};sql=HISTORY_ALL_SQL
+    else:
+        duration,bucket=ranges[range_name];params={"duration":duration,"bucket":bucket};sql=HISTORY_SQL
     try:
-        with db_connection() as conn: started=conn.execute(HISTORY_STARTED_SQL).fetchone(); rows=[dict(r) for r in conn.execute(HISTORY_SQL,{"duration":duration,"bucket":bucket}).fetchall()]
+        with db_connection() as conn:
+            started=conn.execute(HISTORY_STARTED_SQL).fetchone()
+            first=started.get("collection_started_at") if started else None
+            if range_name=="custom" and first and begin<first:
+                raise ValueError("Selected start precedes first recorded population sample: "+first.isoformat())
+            rows=[dict(r) for r in conn.execute(sql,params).fetchall()]
+    except ValueError: raise
     except Exception as exc: return {"available":False,"range":range_name,"bucket":bucket,"collection_started_at":None,"adaptive_started_at":None,"series":[],"reason":f"Population history unavailable: {type(exc).__name__}"}
     platforms={name:[] for name in ("PC","Xbox","PlayStation")}
     for row in rows:

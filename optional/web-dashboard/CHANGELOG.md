@@ -1,3 +1,11 @@
+## v0.5.9 — Population history range controls
+
+- Add Custom Date, single-day Custom Time, Browser Local/UTC selection, and full-history All view.
+- Bound custom queries to available sample history, with API validation and browser date constraints.
+- Label full-history daily aggregates by UTC calendar day and daily average population.
+- Preserve the existing 24h/7d/30d presets and platform toggles.
+- Include lifecycle server details already deployed in the runtime dashboard.
+
 # BF4 Status Web Dashboard changelog
 
 ## v0.5.7

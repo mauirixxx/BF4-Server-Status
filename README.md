@@ -64,7 +64,7 @@ v3.2.1 restores the Mobile and Wide `/status server` player rosters, improves co
 
 ### BF4 Status Web Dashboard
 
-The repository includes the optional **BF4 Status Web Dashboard v0.5.5 Phase 2** under `optional/web-dashboard/`. It provides a standalone FastAPI/Uvicorn web view of BF4SW population, snapshot freshness, population history, and optional worker/lease telemetry.
+The repository includes the optional **BF4 Status Web Dashboard v0.5.9** under `optional/web-dashboard/`. It provides a standalone FastAPI/Uvicorn web view of BF4SW population, snapshot freshness, population history, and optional worker/lease telemetry.
 
 The dashboard is independently deployable and is **not required** by the Discord bot or worker fleet. It uses dedicated PostgreSQL credentials, with a SELECT-only web login and a narrowly privileged sampler login for dashboard-owned history/cache tables. See `optional/web-dashboard/README.md` for installation and database setup.
 

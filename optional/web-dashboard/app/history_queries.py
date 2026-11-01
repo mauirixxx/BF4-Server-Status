@@ -66,3 +66,7 @@ SELECT
     MIN(sampled_at) FILTER (WHERE adaptive_player_count IS NOT NULL) AS adaptive_started_at
 FROM dashboard_population_samples
 """
+
+HISTORY_CUSTOM_SQL = HISTORY_SQL.replace("sampled_at >= NOW() - %(duration)s::interval", "sampled_at >= %(start)s::timestamptz AND sampled_at < %(end)s::timestamptz")
+
+HISTORY_ALL_SQL = HISTORY_SQL.replace("WHERE sampled_at >= NOW() - %(duration)s::interval", "WHERE sampled_at >= (SELECT MIN(sampled_at) FROM dashboard_population_samples)")

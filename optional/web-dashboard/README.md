@@ -109,3 +109,11 @@ DNS_NODES=site-a=dns-01.example.com,site-b=dns-02.example.com
 Database probes reuse the dashboard read-only PostgreSQL credential and identify each reachable node as primary or replica using `pg_is_in_recovery()`. DNS availability uses a short TCP/53 connection probe. The panel also reports current database size, the PostgreSQL transaction counter, and an average transactions/day calculated since PostgreSQL statistics were last reset.
 
 Infrastructure hostnames are intentionally deployment configuration, not hard-coded BF4SW topology. Leave the panel disabled or either node list empty when those probes are not wanted.
+
+## Population history controls (v0.5.9)
+
+The chart supports 24 Hours (five-minute buckets), 7 Days (30-minute buckets), 30 Days (hourly buckets), and **All** (UTC-day average buckets). The All tooltip shows the UTC calendar day rather than a browser-local time-of-day, and the chart caption identifies the metric as a daily average. The All view is deliberately daily-aggregated to keep long-term history responsive.
+
+**Custom Date** selects inclusive calendar dates from midnight to midnight; **Custom Time** selects a single day and start/end times, with five-minute buckets for windows of up to 24 hours. Choose Browser Local or UTC to determine the custom-range boundaries and chart timezone. Date inputs are constrained to the first recorded population sample, and the API rejects custom requests that start before that timestamp. Browser-native date pickers may still show earlier years in their navigation, but invalid dates cannot be submitted. The earliest available sample is derived from the database, not hardcoded.
+
+Population history uses read-only queries against the dashboard's existing aggregate samples; no database migration is required. A CSV/JSON download endpoint is **not yet implemented**.
