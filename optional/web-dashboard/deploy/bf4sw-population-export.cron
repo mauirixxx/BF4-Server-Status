@@ -1,0 +1,3 @@
+# Check hourly, export only at 00:00 UTC on the first UTC day of the month.
+# This works regardless of the host timezone or cron implementation.
+0 * * * * bf4dashboard /usr/bin/flock -n /var/lib/bf4-status-dashboard/export.lock /bin/sh -c '. /etc/bf4-status-dashboard/export.env; cd /opt/bf4-status-dashboard && exec .venv/bin/python -m app.export_population --scheduled' >> /var/log/bf4sw-population-export.log 2>&1

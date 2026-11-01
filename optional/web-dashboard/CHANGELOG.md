@@ -42,3 +42,9 @@
 - Added database size and PostgreSQL transaction-counter facts.
 - Infrastructure topology is configured by environment variables and is not hard-coded into the public repository.
 - Release builder now produces the dashboard ZIP automatically using the dashboard's own VERSION file.
+
+## Population export archival job
+
+- Added read-only monthly/yearly raw five-minute sample exports in CSV and JSON, gzip compressed.
+- Added timezone-independent UTC-month-boundary cron, validation, file-size and SHA-256 logging.
+- Backfilled September and October 2026 on tcou; public download interface is not yet implemented.
