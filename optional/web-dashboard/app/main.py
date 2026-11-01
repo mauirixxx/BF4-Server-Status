@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -132,3 +132,28 @@ def api_population_history(range: str = "24h", start: str | None = None, end: st
 @app.get("/api/population")
 def api_population(range: str = "24h"):
     return get_population_history(range)
+
+
+ARCHIVE_DIR = Path('/var/lib/bf4-status-dashboard/exports')
+
+@app.get('/api/population-archives')
+def population_archives():
+    import re
+    archives = {}
+    for path in ARCHIVE_DIR.glob('population-*.*.gz'):
+        match = re.fullmatch(r'population-(\d{4}(?:-\d{2})?)\.(csv|json)\.gz', path.name)
+        if not match or not path.is_file():
+            continue
+        period, fmt = match.groups()
+        archives.setdefault(period, {'period': period, 'files': {}})['files'][fmt] = {'bytes': path.stat().st_size, 'url': '/api/population-archives/' + path.name}
+    return {'archives': sorted(archives.values(), key=lambda x:x['period'], reverse=True)}
+
+@app.get('/api/population-archives/{filename}')
+def download_population_archive(filename: str):
+    import re
+    if not re.fullmatch(r'population-\d{4}(?:-\d{2})?\.(?:csv|json)\.gz', filename):
+        return JSONResponse(status_code=404, content={'detail':'Archive not found'})
+    path = ARCHIVE_DIR / filename
+    if not path.is_file():
+        return JSONResponse(status_code=404, content={'detail':'Archive not found'})
+    return FileResponse(path, media_type='application/gzip', filename=filename)
