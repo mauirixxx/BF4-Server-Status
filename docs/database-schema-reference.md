@@ -27,3 +27,7 @@ Geo enrichment must be independent of the frequent Keeper poll, deduplicated by 
 ## Geography worker (staged, not production enabled)
 
 `geography_worker.py` selects due or never-checked servers, holds PostgreSQL advisory lock `44240024` on a dedicated connection, fetches Battlelog server-detail HTML at a minimum ten-second interval, and commits country/ping-site/region metadata to the shared catalog. A failed ordinary lookup is retried after 24 hours; 403/429/5xx stops the batch without advancing the failing server. Successful metadata refresh is scheduled after 30 days. `location` stays NULL because Battlelog server pages did not provide a reliable location string. `region` preserves the numeric Battlelog region code as text. Start with `--limit 3 --delay 10`, inspect records, then schedule bounded batches. Do not start the worker until migration 0024 is applied. No automatic systemd service is installed by this change.
+
+## Geographic request gate — revision 0025 (v3.2.3)
+
+`bf4_geography_request_gate` is a singleton row (`id` integer primary key, CHECK id = 1) with nullable timezone-aware `next_request_at` and `blocked_until`. Under the dedicated PostgreSQL advisory lock, the worker reserves `next_request_at` **before** each network attempt, surviving crashes and leader changes. HTTP 403, 429, and 5xx set a durable one-hour `blocked_until`; subsequent workers honor the later of both deadlines. A failed request may not be retried until its per-server `geo_next_check_at`. Do not start the worker without applying migrations 0024 and 0025.

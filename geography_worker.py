@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from sqlalchemy import select, text, or_, func
 from db import SessionLocal, engine
-from models import BF4Server
+from models import BF4Server, BF4GeographyRequestGate
 from server_geography import parse_battlelog_geography
 
 log = logging.getLogger('bf4sw.geography')
@@ -57,14 +57,28 @@ def run(limit, delay, dry_run=False):
             return 0
         try:
             while limit == 0 or processed < limit:
-                # Enforce pacing across worker restarts, not only inside one run.
-                # Read the shared last-attempt timestamp under the fleet lock.
-                with SessionLocal() as pace_session:
-                    last_attempt = pace_session.scalar(select(func.max(BF4Server.geo_checked_at)))
-                if last_attempt is not None and not dry_run:
-                    wait = delay - (utcnow() - last_attempt).total_seconds()
-                    if wait > 0:
-                        time.sleep(wait)
+                # Reserve a request slot durably before network I/O. The
+                # advisory lock serializes owners; DB state survives crashes.
+                with SessionLocal() as due_session:
+                    has_due = due_session.scalar(select(BF4Server.server_guid).where(or_(
+                        BF4Server.geo_next_check_at <= utcnow(),
+                        BF4Server.geo_next_check_at.is_(None)
+                    )).limit(1))
+                if has_due is None:
+                    break
+                if not dry_run:
+                    with SessionLocal() as gate_session:
+                        gate = gate_session.get(BF4GeographyRequestGate, 1)
+                        if gate is None:
+                            raise RuntimeError('Geography gate missing: apply Alembic 0025')
+                        ready = max((v for v in (gate.next_request_at, gate.blocked_until)
+                                     if v is not None), default=None)
+                        if ready is not None:
+                            wait = (ready - utcnow()).total_seconds()
+                            if wait > 0:
+                                time.sleep(wait)
+                        gate.next_request_at = utcnow() + timedelta(seconds=delay)
+                        gate_session.commit()
                 with SessionLocal() as session:
                     server = session.scalars(select(BF4Server).where(or_(BF4Server.geo_next_check_at <= utcnow(), BF4Server.geo_next_check_at.is_(None))).order_by(BF4Server.geo_next_check_at.asc().nullsfirst(), BF4Server.server_guid).limit(1)).first()
                     if server is None:
@@ -83,6 +97,10 @@ def run(limit, delay, dry_run=False):
                             server.geo_checked_at = utcnow()
                             server.geo_next_check_at = utcnow() + timedelta(hours=1)
                             session.commit()
+                            with SessionLocal() as gate_session:
+                                gate = gate_session.get(BF4GeographyRequestGate, 1)
+                                gate.blocked_until = utcnow() + timedelta(hours=1)
+                                gate_session.commit()
                             break
                         server.geo_checked_at = utcnow()
                         server.geo_next_check_at = utcnow() + timedelta(days=1)

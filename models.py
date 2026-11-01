@@ -109,6 +109,13 @@ class BF4Server(Base):
     geo_next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class BF4GeographyRequestGate(Base):
+    __tablename__ = "bf4_geography_request_gate"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class BF4ServerNameHistory(Base):
     __tablename__ = "bf4_server_name_history"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
