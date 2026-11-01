@@ -10,6 +10,7 @@ from .config import get_settings
 from .database_facts import get_database_facts
 from .db import close_pool, open_pool
 from .lifecycle import get_lifecycle_servers
+from .population_records import get_population_records
 from .repository import (
     get_cluster_health,
     get_database_nodes,
@@ -79,6 +80,11 @@ def dashboard(request: Request):
             "asset_version": APP_VERSION,
         },
     )
+
+
+@app.get("/api/population-records")
+def api_population_records():
+    return get_population_records()
 
 
 @app.get("/api/summary")
