@@ -8303,6 +8303,10 @@ async def addserver(interaction: discord.Interaction, server_urls: str, make_def
                         global_server.platform_source = "battlelog_url"
                     if global_server.tick_rate_hz is None and tick_rate_hz is not None:
                         global_server.tick_rate_hz = tick_rate_hz
+                # /addserver requests enrichment even for an existing shared GUID.
+                # A separate globally fenced worker performs the paced fetch.
+                if global_server.geo_checked_at is None:
+                    global_server.geo_next_check_at = utcnow()
                 gs = session.get(GuildServer, (interaction.guild.id, guid))
                 if gs is None:
                     session.add(GuildServer(

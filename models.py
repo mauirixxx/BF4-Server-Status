@@ -99,6 +99,14 @@ class BF4Server(Base):
     last_keeper_result_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_lifecycle_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    ping_site: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    geo_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    geo_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    geo_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    geo_next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class BF4ServerNameHistory(Base):
