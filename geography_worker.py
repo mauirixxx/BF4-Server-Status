@@ -1,7 +1,7 @@
 """Single-owner, paced Battlelog geographic enrichment for BF4SW.
 
 Run one instance per fleet; PostgreSQL advisory lock prevents concurrent owners.
-Requires Alembic 0024. No writes to Keeper or guild tables.
+Requires Alembic 0024 and 0025. No writes to Keeper or guild tables.
 """
 import argparse
 import logging
@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from sqlalchemy import select, text, or_, func
+from sqlalchemy import select, text, or_
 from db import SessionLocal, engine
 from models import BF4Server, BF4GeographyRequestGate
 from server_geography import parse_battlelog_geography
