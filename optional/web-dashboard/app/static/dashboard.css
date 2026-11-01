@@ -30,3 +30,5 @@ main>.chart-card{margin-top:0}.chart-card .chart-wrap{height:430px}.chart-card+.
 /* Keep status above; place the smaller download action at the header's original lower-right position. */
 @media(min-width:561px){.topbar .header-actions{align-self:stretch;justify-content:space-between;align-items:flex-end;gap:12px}.topbar .archive-open{font-size:.8rem;padding:10px 14px;line-height:1.35;white-space:nowrap}}
 @media(max-width:560px){.topbar .archive-open{font-size:.8rem;padding:10px 14px}}
+/* Match the vertical space between status/download to the download/divider gap. */
+@media(min-width:561px){.topbar .header-actions{justify-content:flex-end;gap:28px}}
