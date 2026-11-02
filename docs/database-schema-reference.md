@@ -31,3 +31,7 @@ Geo enrichment must be independent of the frequent Keeper poll, deduplicated by 
 ## Geographic request gate — revision 0025 (v3.2.3)
 
 `bf4_geography_request_gate` is a singleton row (`id` integer primary key, CHECK id = 1) with nullable timezone-aware `next_request_at` and `blocked_until`. Under the dedicated PostgreSQL advisory lock, the worker reserves `next_request_at` **before** each network attempt, surviving crashes and leader changes. HTTP 403, 429, and 5xx set a durable one-hour `blocked_until`; subsequent workers honor the later of both deadlines. A failed request may not be retried until its per-server `geo_next_check_at`. Do not start the worker without applying migrations 0024 and 0025.
+
+### Battlelog HTML missing-page classification (v3.2.3)
+
+Some unavailable Battlelog server-detail URLs return HTTP 200 with an HTML title containing `404 That page doesn't exist`. The geography worker classifies these as `server_page_unavailable`, leaves geography unset, and retries after 24 hours. Other parser failures remain distinct; successful enrichment retains the 30-day refresh. No schema migration is required.
