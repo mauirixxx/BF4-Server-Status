@@ -21,6 +21,24 @@ class GeographyParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):parse_battlelog_geography(f'"guid":"{A}"',A)
 
 class EnrichmentTests(unittest.TestCase):
+    def test_battlelog_html_404_is_classified(self):
+        from geography_worker import enrich_one, ServerPageUnavailable
+        server=SimpleNamespace(server_guid=A,platform='PC',battlelog_url=None)
+        page="<html><title>404 That page doesn't exist Battlelog / Battlefield 4</title></html>"
+        response=SimpleNamespace(text=page,raise_for_status=lambda:None)
+        with patch('geography_worker.requests.get',return_value=response):
+            with self.assertRaisesRegex(ServerPageUnavailable,'server_page_unavailable'):
+                enrich_one(None,server)
+
+    def test_normal_page_without_geography_is_not_html_404(self):
+        from geography_worker import enrich_one, ServerPageUnavailable
+        server=SimpleNamespace(server_guid=A,platform='PC',battlelog_url=None)
+        response=SimpleNamespace(text='<title>Real server - Battlelog</title>',raise_for_status=lambda:None)
+        with patch('geography_worker.requests.get',return_value=response):
+            with self.assertRaises(ValueError) as caught:
+                enrich_one(None,server)
+        self.assertNotIsInstance(caught.exception,ServerPageUnavailable)
+
     def test_enrich_one(self):
         from geography_worker import enrich_one
         server=SimpleNamespace(server_guid=A,platform='PC',battlelog_url=None,country_code=None,ping_site=None,region=None,location=None,geo_source=None,geo_checked_at=None,geo_updated_at=None,geo_next_check_at=None)
