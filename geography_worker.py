@@ -16,6 +16,20 @@ from models import BF4Server, BF4GeographyRequestGate
 from server_geography import parse_battlelog_geography
 
 log = logging.getLogger('bf4sw.geography')
+
+
+class ServerPageUnavailable(ValueError):
+    """Battlelog returned its HTML missing-page response with HTTP 200."""
+
+
+def is_missing_server_page(html):
+    import re
+    import html as html_module
+    title = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+    if not title:
+        return False
+    title_text = html_module.unescape(title.group(1))
+    return bool(re.search(r"404\s+That page doesn't exist", title_text, re.I))
 LOCK_ID = 44240024
 PLATFORM_PATH = {'PC':'pc', 'PS4/5':'ps4', 'XBox':'xboxone'}
 
@@ -31,6 +45,8 @@ def enrich_one(session, server, *, timeout=12):
     url = server.battlelog_url or f'https://battlelog.battlefield.com/bf4/servers/show/{path}/{server.server_guid}/'
     response = requests.get(url, headers={'User-Agent':'BF4-Server-Watcher/geography'}, timeout=timeout)
     response.raise_for_status()
+    if is_missing_server_page(response.text):
+        raise ServerPageUnavailable("server_page_unavailable")
     values = parse_battlelog_geography(response.text, server.server_guid)
     changed = any(getattr(server, key) != val for key, val in values.items())
     for key, val in values.items():
@@ -105,6 +121,10 @@ def run(limit, delay, dry_run=False):
                         server.geo_checked_at = utcnow()
                         server.geo_next_check_at = utcnow() + timedelta(days=1)
                         log.warning('HTTP %s for %s; retry in 24h', code, guid)
+                    except ServerPageUnavailable:
+                        server.geo_checked_at = utcnow()
+                        server.geo_next_check_at = utcnow() + timedelta(days=1)
+                        log.warning('server_page_unavailable server=%s retry_in=24h', guid)
                     except (requests.RequestException, ValueError) as exc:
                         server.geo_checked_at = utcnow()
                         server.geo_next_check_at = utcnow() + timedelta(days=1)
